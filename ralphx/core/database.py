@@ -1,0 +1,1661 @@
+"""SQLite database layer for RalphX.
+
+Implements:
+- WAL mode for concurrent reads
+- Single writer, multiple readers
+- All 8 tables from DESIGN.md Section 10.3
+- CRUD operations for each entity
+- Daily backup functionality
+- Migration support
+"""
+
+import json
+import os
+import shutil
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterator, Optional
+
+from ralphx.core.workspace import get_backups_path, get_database_path
+
+
+# Schema version for migrations
+SCHEMA_VERSION = 4
+
+# SQL schema
+SCHEMA_SQL = """
+-- Projects table
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    slug TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    design_doc TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Loops table
+CREATE TABLE IF NOT EXISTS loops (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    config_yaml TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, name)
+);
+
+-- Runs table
+CREATE TABLE IF NOT EXISTS runs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    loop_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    iterations_completed INTEGER DEFAULT 0,
+    items_generated INTEGER DEFAULT 0,
+    error_message TEXT
+);
+
+-- Sessions table
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    iteration INTEGER NOT NULL,
+    mode TEXT,
+    started_at TIMESTAMP,
+    duration_seconds REAL,
+    status TEXT,
+    items_added TEXT
+);
+
+-- Work items table
+CREATE TABLE IF NOT EXISTS work_items (
+    id TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    priority INTEGER,
+    content TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    category TEXT,
+    tags TEXT,
+    metadata TEXT,
+    source_loop TEXT,
+    item_type TEXT DEFAULT 'item',
+    claimed_by TEXT,
+    claimed_at TIMESTAMP,
+    processed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (project_id, id)
+);
+
+-- Checkpoints table
+CREATE TABLE IF NOT EXISTS checkpoints (
+    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    run_id TEXT,
+    loop_name TEXT,
+    iteration INTEGER,
+    status TEXT,
+    data TEXT,
+    created_at TIMESTAMP
+);
+
+-- Guardrails metadata table
+CREATE TABLE IF NOT EXISTS guardrails (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    source TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_mtime REAL,
+    file_size INTEGER,
+    enabled BOOLEAN DEFAULT TRUE,
+    loops TEXT,
+    modes TEXT,
+    position TEXT DEFAULT 'after_design_doc',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, category, filename)
+);
+
+-- Execution logs table
+CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL,
+    metadata TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Schema version tracking
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- OAuth credentials table
+CREATE TABLE IF NOT EXISTS credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,  -- 'global' or 'project'
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    expires_at INTEGER NOT NULL,  -- Unix timestamp (seconds)
+    email TEXT,  -- User's email address from profile
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(scope, project_id)  -- One credential per scope/project
+);
+"""
+
+# Indexes for common queries
+INDEXES_SQL = """
+CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_category ON work_items(project_id, category);
+CREATE INDEX IF NOT EXISTS idx_work_items_priority ON work_items(project_id, priority);
+CREATE INDEX IF NOT EXISTS idx_work_items_created ON work_items(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_items_source_loop ON work_items(project_id, source_loop, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_claimed ON work_items(project_id, claimed_by, claimed_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_run ON sessions(run_id);
+CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_guardrails_project ON guardrails(project_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_guardrails_source ON guardrails(source);
+CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(project_id, level, timestamp);
+"""
+
+
+class Database:
+    """SQLite database manager with WAL mode and connection pooling.
+
+    Provides:
+    - Single writer lock for atomic writes
+    - Multiple concurrent readers via WAL mode
+    - CRUD operations for all tables
+    - Automatic schema creation and migration
+    """
+
+    def __init__(self, db_path: Optional[str] = None):
+        """Initialize database connection.
+
+        Args:
+            db_path: Path to SQLite database file. Defaults to ~/.ralphx/ralphx.db.
+                     Use ":memory:" for in-memory testing.
+        """
+        if db_path is None:
+            db_path = str(get_database_path())
+
+        self.db_path = db_path
+        self._write_lock = threading.Lock()
+        self._local = threading.local()
+
+        # Create database with proper permissions if it doesn't exist
+        if db_path != ":memory:" and not Path(db_path).exists():
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+            # Create file with 0600 permissions
+            Path(db_path).touch(mode=0o600)
+
+        # Initialize schema
+        self._init_schema()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a thread-local database connection."""
+        if not hasattr(self._local, "connection") or self._local.connection is None:
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=30.0,
+                check_same_thread=False,
+            )
+            # Enable WAL mode for concurrent reads
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Enable foreign keys
+            conn.execute("PRAGMA foreign_keys=ON")
+            # Row factory for dict-like access
+            conn.row_factory = sqlite3.Row
+            self._local.connection = conn
+        return self._local.connection
+
+    @contextmanager
+    def _writer(self) -> Iterator[sqlite3.Connection]:
+        """Context manager for write operations with locking."""
+        with self._write_lock:
+            conn = self._get_connection()
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    @contextmanager
+    def _reader(self) -> Iterator[sqlite3.Connection]:
+        """Context manager for read operations (no locking needed with WAL)."""
+        yield self._get_connection()
+
+    def _init_schema(self) -> None:
+        """Initialize database schema and run any pending migrations."""
+        with self._writer() as conn:
+            # Create tables first (IF NOT EXISTS leaves existing tables alone)
+            conn.executescript(SCHEMA_SQL)
+
+            # Check/set schema version for new databases
+            cursor = conn.execute(
+                "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+            )
+            row = cursor.fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?)",
+                    (SCHEMA_VERSION,),
+                )
+
+        # Run any pending migrations for existing databases
+        # This adds new columns before we create indexes on them
+        self.migrate()
+
+        # Now create indexes (after migrations ensure columns exist)
+        with self._writer() as conn:
+            conn.executescript(INDEXES_SQL)
+
+    def close(self) -> None:
+        """Close the database connection."""
+        if hasattr(self._local, "connection") and self._local.connection:
+            self._local.connection.close()
+            self._local.connection = None
+
+    # =========================================================================
+    # Project Operations
+    # =========================================================================
+
+    def create_project(
+        self,
+        id: str,
+        slug: str,
+        name: str,
+        path: str,
+        design_doc: Optional[str] = None,
+    ) -> str:
+        """Create a new project.
+
+        Returns:
+            The project ID.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            conn.execute(
+                """
+                INSERT INTO projects (id, slug, name, path, design_doc, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (id, slug, name, path, design_doc, now, now),
+            )
+        return id
+
+    def get_project(self, slug: str) -> Optional[dict]:
+        """Get a project by slug."""
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM projects WHERE slug = ?", (slug,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_project_by_id(self, id: str) -> Optional[dict]:
+        """Get a project by ID."""
+        with self._reader() as conn:
+            cursor = conn.execute("SELECT * FROM projects WHERE id = ?", (id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def list_projects(self) -> list[dict]:
+        """List all projects."""
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM projects ORDER BY created_at DESC"
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    # Allowed columns for update operations (security: prevents SQL injection via column names)
+    _PROJECT_UPDATE_COLS = frozenset({"name", "path", "design_doc", "updated_at"})
+
+    def update_project(self, slug: str, **kwargs) -> bool:
+        """Update a project.
+
+        Returns:
+            True if project was updated, False if not found.
+
+        Raises:
+            ValueError: If invalid column names are provided.
+        """
+        if not kwargs:
+            return False
+
+        # Security: validate column names against whitelist
+        invalid_cols = set(kwargs.keys()) - self._PROJECT_UPDATE_COLS - {"updated_at"}
+        if invalid_cols:
+            raise ValueError(f"Invalid columns for project update: {invalid_cols}")
+
+        kwargs["updated_at"] = datetime.utcnow().isoformat()
+        set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
+        values = list(kwargs.values()) + [slug]
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE projects SET {set_clause} WHERE slug = ?", values
+            )
+            return cursor.rowcount > 0
+
+    def delete_project(self, slug: str) -> bool:
+        """Delete a project and all related data (CASCADE).
+
+        Returns:
+            True if project was deleted, False if not found.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute("DELETE FROM projects WHERE slug = ?", (slug,))
+            return cursor.rowcount > 0
+
+    # =========================================================================
+    # Loop Operations
+    # =========================================================================
+
+    def create_loop(
+        self,
+        id: str,
+        project_id: str,
+        name: str,
+        config_yaml: str,
+    ) -> str:
+        """Create a new loop configuration."""
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            conn.execute(
+                """
+                INSERT INTO loops (id, project_id, name, config_yaml, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (id, project_id, name, config_yaml, now, now),
+            )
+        return id
+
+    def get_loop(self, project_id: str, name: str) -> Optional[dict]:
+        """Get a loop by project and name."""
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM loops WHERE project_id = ? AND name = ?",
+                (project_id, name),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def list_loops(self, project_id: str) -> list[dict]:
+        """List all loops for a project."""
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM loops WHERE project_id = ? ORDER BY name",
+                (project_id,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    # Allowed columns for loop update operations
+    _LOOP_UPDATE_COLS = frozenset({"config_yaml", "updated_at"})
+
+    def update_loop(self, project_id: str, name: str, **kwargs) -> bool:
+        """Update a loop configuration.
+
+        Raises:
+            ValueError: If invalid column names are provided.
+        """
+        if not kwargs:
+            return False
+
+        # Security: validate column names against whitelist
+        invalid_cols = set(kwargs.keys()) - self._LOOP_UPDATE_COLS - {"updated_at"}
+        if invalid_cols:
+            raise ValueError(f"Invalid columns for loop update: {invalid_cols}")
+
+        kwargs["updated_at"] = datetime.utcnow().isoformat()
+        set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
+        values = list(kwargs.values()) + [project_id, name]
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE loops SET {set_clause} WHERE project_id = ? AND name = ?",
+                values,
+            )
+            return cursor.rowcount > 0
+
+    def delete_loop(self, project_id: str, name: str) -> bool:
+        """Delete a loop."""
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "DELETE FROM loops WHERE project_id = ? AND name = ?",
+                (project_id, name),
+            )
+            return cursor.rowcount > 0
+
+    # =========================================================================
+    # Run Operations
+    # =========================================================================
+
+    def create_run(
+        self,
+        id: str,
+        project_id: str,
+        loop_name: str,
+        status: str = "active",
+    ) -> str:
+        """Create a new run."""
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            conn.execute(
+                """
+                INSERT INTO runs (id, project_id, loop_name, status, started_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (id, project_id, loop_name, status, now),
+            )
+        return id
+
+    def get_run(self, id: str) -> Optional[dict]:
+        """Get a run by ID."""
+        with self._reader() as conn:
+            cursor = conn.execute("SELECT * FROM runs WHERE id = ?", (id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def list_runs(
+        self, project_id: str, status: Optional[str] = None, limit: int = 100
+    ) -> list[dict]:
+        """List runs for a project, optionally filtered by status."""
+        with self._reader() as conn:
+            if status:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM runs
+                    WHERE project_id = ? AND status = ?
+                    ORDER BY started_at DESC LIMIT ?
+                    """,
+                    (project_id, status, limit),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM runs
+                    WHERE project_id = ?
+                    ORDER BY started_at DESC LIMIT ?
+                    """,
+                    (project_id, limit),
+                )
+            return [dict(row) for row in cursor.fetchall()]
+
+    # Allowed columns for run update operations
+    _RUN_UPDATE_COLS = frozenset({
+        "status", "completed_at", "iterations_completed",
+        "items_generated", "error_message"
+    })
+
+    def update_run(self, id: str, **kwargs) -> bool:
+        """Update a run.
+
+        Raises:
+            ValueError: If invalid column names are provided.
+        """
+        if not kwargs:
+            return False
+
+        # Security: validate column names against whitelist
+        invalid_cols = set(kwargs.keys()) - self._RUN_UPDATE_COLS
+        if invalid_cols:
+            raise ValueError(f"Invalid columns for run update: {invalid_cols}")
+
+        set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
+        values = list(kwargs.values()) + [id]
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE runs SET {set_clause} WHERE id = ?", values
+            )
+            return cursor.rowcount > 0
+
+    def complete_run(
+        self, id: str, status: str = "completed", error_message: Optional[str] = None
+    ) -> bool:
+        """Mark a run as complete."""
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE runs SET status = ?, completed_at = ?, error_message = ?
+                WHERE id = ?
+                """,
+                (status, now, error_message, id),
+            )
+            return cursor.rowcount > 0
+
+    def increment_run_counters(
+        self, id: str, iterations: int = 0, items: int = 0
+    ) -> bool:
+        """Increment run iteration and item counters."""
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE runs SET
+                    iterations_completed = iterations_completed + ?,
+                    items_generated = items_generated + ?
+                WHERE id = ?
+                """,
+                (iterations, items, id),
+            )
+            return cursor.rowcount > 0
+
+    # =========================================================================
+    # Session Operations
+    # =========================================================================
+
+    def create_session(
+        self,
+        session_id: str,
+        project_id: str,
+        iteration: int,
+        run_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> str:
+        """Create a new session record."""
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            conn.execute(
+                """
+                INSERT INTO sessions
+                (session_id, run_id, project_id, iteration, mode, started_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, run_id, project_id, iteration, mode, now, status),
+            )
+        return session_id
+
+    def get_session(self, session_id: str) -> Optional[dict]:
+        """Get a session by ID."""
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def list_sessions(
+        self,
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """List sessions with optional filters.
+
+        Args:
+            project_id: Filter by project ID.
+            run_id: Filter by run ID.
+            limit: Max sessions to return.
+
+        Returns:
+            List of session dictionaries.
+        """
+        conditions = []
+        params = []
+
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if run_id:
+            conditions.append("run_id = ?")
+            params.append(run_id)
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+
+        with self._reader() as conn:
+            cursor = conn.execute(
+                f"SELECT * FROM sessions {where} ORDER BY started_at DESC LIMIT ?",
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    # Allowed columns for session update operations
+    _SESSION_UPDATE_COLS = frozenset({
+        "status", "duration_seconds", "items_added"
+    })
+
+    def update_session(self, session_id: str, **kwargs) -> bool:
+        """Update a session.
+
+        Raises:
+            ValueError: If invalid column names are provided.
+        """
+        if not kwargs:
+            return False
+
+        # Security: validate column names against whitelist
+        invalid_cols = set(kwargs.keys()) - self._SESSION_UPDATE_COLS
+        if invalid_cols:
+            raise ValueError(f"Invalid columns for session update: {invalid_cols}")
+
+        # Handle items_added as JSON
+        if "items_added" in kwargs and isinstance(kwargs["items_added"], list):
+            kwargs["items_added"] = json.dumps(kwargs["items_added"])
+
+        set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
+        values = list(kwargs.values()) + [session_id]
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE sessions SET {set_clause} WHERE session_id = ?", values
+            )
+            return cursor.rowcount > 0
+
+    # =========================================================================
+    # Work Item Operations
+    # =========================================================================
+
+    def create_work_item(
+        self,
+        id: str,
+        project_id: str,
+        content: str,
+        priority: Optional[int] = None,
+        status: str = "pending",
+        category: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        metadata: Optional[dict] = None,
+        source_loop: Optional[str] = None,
+        item_type: Optional[str] = None,
+    ) -> str:
+        """Create a new work item.
+
+        Args:
+            id: Unique identifier for the item.
+            project_id: Project this item belongs to.
+            content: Item content.
+            priority: Optional priority (lower = higher priority).
+            status: Item status (pending, in_progress, completed, processed, failed).
+            category: Optional category.
+            tags: Optional list of tags.
+            metadata: Optional metadata dictionary.
+            source_loop: Name of the loop that created this item.
+            item_type: Semantic type from the loop's item_types.output.singular.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            conn.execute(
+                """
+                INSERT INTO work_items
+                (id, project_id, priority, content, status, category, tags, metadata,
+                 source_loop, item_type, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    id,
+                    project_id,
+                    priority,
+                    content,
+                    status,
+                    category,
+                    json.dumps(tags) if tags else None,
+                    json.dumps(metadata) if metadata else None,
+                    source_loop,
+                    item_type or "item",
+                    now,
+                    now,
+                ),
+            )
+        return id
+
+    def get_work_item(self, project_id: str, id: str) -> Optional[dict]:
+        """Get a work item."""
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM work_items WHERE project_id = ? AND id = ?",
+                (project_id, id),
+            )
+            row = cursor.fetchone()
+            if row:
+                result = dict(row)
+                # Parse JSON fields
+                if result.get("tags"):
+                    result["tags"] = json.loads(result["tags"])
+                if result.get("metadata"):
+                    result["metadata"] = json.loads(result["metadata"])
+                return result
+            return None
+
+    def list_work_items(
+        self,
+        project_id: str,
+        status: Optional[str] = None,
+        category: Optional[str] = None,
+        source_loop: Optional[str] = None,
+        claimed_by: Optional[str] = None,
+        unclaimed_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """List work items with optional filters.
+
+        Args:
+            project_id: Filter by project.
+            status: Filter by status.
+            category: Filter by category.
+            source_loop: Filter by source loop name.
+            claimed_by: Filter by claiming loop.
+            unclaimed_only: If True, only return items where claimed_by is NULL.
+            limit: Max items to return.
+            offset: Pagination offset.
+        """
+        conditions = ["project_id = ?"]
+        params: list[Any] = [project_id]
+
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if category:
+            conditions.append("category = ?")
+            params.append(category)
+        if source_loop:
+            conditions.append("source_loop = ?")
+            params.append(source_loop)
+        if claimed_by:
+            conditions.append("claimed_by = ?")
+            params.append(claimed_by)
+        if unclaimed_only:
+            conditions.append("claimed_by IS NULL")
+
+        where_clause = " AND ".join(conditions)
+        params.extend([limit, offset])
+
+        with self._reader() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT * FROM work_items
+                WHERE {where_clause}
+                ORDER BY priority ASC, created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            )
+            results = []
+            for row in cursor.fetchall():
+                item = dict(row)
+                if item.get("tags"):
+                    item["tags"] = json.loads(item["tags"])
+                if item.get("metadata"):
+                    item["metadata"] = json.loads(item["metadata"])
+                results.append(item)
+            return results
+
+    def count_work_items(
+        self,
+        project_id: str,
+        status: Optional[str] = None,
+        category: Optional[str] = None,
+        source_loop: Optional[str] = None,
+    ) -> int:
+        """Count work items with optional filters."""
+        conditions = ["project_id = ?"]
+        params: list[Any] = [project_id]
+
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if category:
+            conditions.append("category = ?")
+            params.append(category)
+        if source_loop:
+            conditions.append("source_loop = ?")
+            params.append(source_loop)
+
+        where_clause = " AND ".join(conditions)
+
+        with self._reader() as conn:
+            cursor = conn.execute(
+                f"SELECT COUNT(*) FROM work_items WHERE {where_clause}",
+                params,
+            )
+            return cursor.fetchone()[0]
+
+    # Allowed columns for work item update operations
+    _WORK_ITEM_UPDATE_COLS = frozenset({
+        "priority", "content", "status", "category", "tags", "metadata", "updated_at",
+        "source_loop", "item_type", "claimed_by", "claimed_at", "processed_at"
+    })
+
+    def update_work_item(self, project_id: str, id: str, **kwargs) -> bool:
+        """Update a work item.
+
+        Raises:
+            ValueError: If invalid column names are provided.
+        """
+        if not kwargs:
+            return False
+
+        # Security: validate column names against whitelist
+        invalid_cols = set(kwargs.keys()) - self._WORK_ITEM_UPDATE_COLS - {"updated_at"}
+        if invalid_cols:
+            raise ValueError(f"Invalid columns for work item update: {invalid_cols}")
+
+        kwargs["updated_at"] = datetime.utcnow().isoformat()
+
+        # Handle JSON fields
+        if "tags" in kwargs and isinstance(kwargs["tags"], list):
+            kwargs["tags"] = json.dumps(kwargs["tags"])
+        if "metadata" in kwargs and isinstance(kwargs["metadata"], dict):
+            kwargs["metadata"] = json.dumps(kwargs["metadata"])
+
+        set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
+        values = list(kwargs.values()) + [project_id, id]
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE work_items SET {set_clause} WHERE project_id = ? AND id = ?",
+                values,
+            )
+            return cursor.rowcount > 0
+
+    def delete_work_item(self, project_id: str, id: str) -> bool:
+        """Delete a work item."""
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "DELETE FROM work_items WHERE project_id = ? AND id = ?",
+                (project_id, id),
+            )
+            return cursor.rowcount > 0
+
+    def get_work_item_stats(self, project_id: str) -> dict:
+        """Get work item statistics for a project."""
+        with self._reader() as conn:
+            # Count by status
+            cursor = conn.execute(
+                """
+                SELECT status, COUNT(*) as count
+                FROM work_items WHERE project_id = ?
+                GROUP BY status
+                """,
+                (project_id,),
+            )
+            by_status = {row["status"]: row["count"] for row in cursor.fetchall()}
+
+            # Count by category
+            cursor = conn.execute(
+                """
+                SELECT category, COUNT(*) as count
+                FROM work_items WHERE project_id = ?
+                GROUP BY category
+                """,
+                (project_id,),
+            )
+            by_category = {
+                row["category"] or "uncategorized": row["count"]
+                for row in cursor.fetchall()
+            }
+
+            # Total count
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM work_items WHERE project_id = ?",
+                (project_id,),
+            )
+            total = cursor.fetchone()[0]
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "by_category": by_category,
+            }
+
+    def claim_work_item(
+        self,
+        project_id: str,
+        id: str,
+        claimed_by: str,
+    ) -> bool:
+        """Atomically claim a work item.
+
+        Uses UPDATE...WHERE to prevent race conditions.
+
+        Args:
+            project_id: Project ID.
+            id: Work item ID.
+            claimed_by: Name of the claiming loop.
+
+        Returns:
+            True if claim succeeded, False if item doesn't exist or already claimed.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE work_items
+                SET claimed_by = ?, claimed_at = ?, updated_at = ?
+                WHERE project_id = ? AND id = ? AND claimed_by IS NULL
+                """,
+                (claimed_by, now, now, project_id, id),
+            )
+            return cursor.rowcount > 0
+
+    def release_work_item_claim(
+        self,
+        project_id: str,
+        id: str,
+        claimed_by: Optional[str] = None,
+    ) -> bool:
+        """Release a claim on a work item.
+
+        Args:
+            project_id: Project ID.
+            id: Work item ID.
+            claimed_by: If provided, only release if claimed by this loop (ownership check).
+
+        Returns:
+            True if claim was released, False otherwise.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            if claimed_by:
+                # Ownership check
+                cursor = conn.execute(
+                    """
+                    UPDATE work_items
+                    SET claimed_by = NULL, claimed_at = NULL, updated_at = ?
+                    WHERE project_id = ? AND id = ? AND claimed_by = ?
+                    """,
+                    (now, project_id, id, claimed_by),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE work_items
+                    SET claimed_by = NULL, claimed_at = NULL, updated_at = ?
+                    WHERE project_id = ? AND id = ?
+                    """,
+                    (now, project_id, id),
+                )
+            return cursor.rowcount > 0
+
+    def mark_work_item_processed(
+        self,
+        project_id: str,
+        id: str,
+        claimed_by: str,
+    ) -> bool:
+        """Mark a work item as processed.
+
+        Only succeeds if the item is claimed by the specified loop.
+
+        Args:
+            project_id: Project ID.
+            id: Work item ID.
+            claimed_by: Name of the loop that claimed this item (ownership check).
+
+        Returns:
+            True if item was marked processed, False otherwise.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE work_items
+                SET status = 'processed', processed_at = ?, updated_at = ?
+                WHERE project_id = ? AND id = ? AND claimed_by = ?
+                """,
+                (now, now, project_id, id, claimed_by),
+            )
+            return cursor.rowcount > 0
+
+    def get_source_item_counts(self, project_id: str) -> dict[str, int]:
+        """Get counts of completed items grouped by source_loop.
+
+        Used for dashboard to show available items per producer loop.
+
+        Returns:
+            Dict mapping source_loop name to count of completed items.
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """
+                SELECT source_loop, COUNT(*) as count
+                FROM work_items
+                WHERE project_id = ?
+                  AND source_loop IS NOT NULL
+                  AND status = 'completed'
+                  AND claimed_by IS NULL
+                GROUP BY source_loop
+                """,
+                (project_id,),
+            )
+            return {row["source_loop"]: row["count"] for row in cursor.fetchall()}
+
+    def release_stale_claims(
+        self,
+        project_id: str,
+        max_age_minutes: int = 30,
+    ) -> int:
+        """Release claims that have been held too long (likely crashed consumer).
+
+        Args:
+            project_id: Project ID.
+            max_age_minutes: Claims older than this are released.
+
+        Returns:
+            Number of claims released.
+        """
+        from datetime import timedelta
+
+        cutoff = (datetime.utcnow() - timedelta(minutes=max_age_minutes)).isoformat()
+        now = datetime.utcnow().isoformat()
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE work_items
+                SET claimed_by = NULL, claimed_at = NULL, updated_at = ?
+                WHERE project_id = ?
+                  AND claimed_at < ?
+                  AND claimed_by IS NOT NULL
+                """,
+                (now, project_id, cutoff),
+            )
+            return cursor.rowcount
+
+    def release_claims_by_loop(
+        self,
+        project_id: str,
+        loop_name: str,
+    ) -> int:
+        """Release all claims held by a specific loop.
+
+        Used when deleting a loop to prevent orphaned claims.
+
+        Args:
+            project_id: Project ID.
+            loop_name: Name of the loop whose claims should be released.
+
+        Returns:
+            Number of claims released.
+        """
+        now = datetime.utcnow().isoformat()
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE work_items
+                SET claimed_by = NULL, claimed_at = NULL, updated_at = ?
+                WHERE project_id = ?
+                  AND claimed_by = ?
+                """,
+                (now, project_id, loop_name),
+            )
+            return cursor.rowcount
+
+    # =========================================================================
+    # Checkpoint Operations
+    # =========================================================================
+
+    def save_checkpoint(
+        self,
+        project_id: str,
+        run_id: str,
+        loop_name: str,
+        iteration: int,
+        status: str,
+        data: Optional[dict] = None,
+    ) -> None:
+        """Save or update a checkpoint."""
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO checkpoints
+                (project_id, run_id, loop_name, iteration, status, data, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    run_id,
+                    loop_name,
+                    iteration,
+                    status,
+                    json.dumps(data) if data else None,
+                    now,
+                ),
+            )
+
+    def get_checkpoint(self, project_id: str) -> Optional[dict]:
+        """Get the checkpoint for a project."""
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM checkpoints WHERE project_id = ?", (project_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                result = dict(row)
+                if result.get("data"):
+                    result["data"] = json.loads(result["data"])
+                return result
+            return None
+
+    def clear_checkpoint(self, project_id: str) -> bool:
+        """Clear the checkpoint for a project."""
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "DELETE FROM checkpoints WHERE project_id = ?", (project_id,)
+            )
+            return cursor.rowcount > 0
+
+    # =========================================================================
+    # Guardrail Operations
+    # =========================================================================
+
+    def create_guardrail(
+        self,
+        category: str,
+        filename: str,
+        source: str,
+        file_path: str,
+        project_id: Optional[str] = None,
+        file_mtime: Optional[float] = None,
+        file_size: Optional[int] = None,
+        enabled: bool = True,
+        loops: Optional[list[str]] = None,
+        modes: Optional[list[str]] = None,
+        position: str = "after_design_doc",
+    ) -> int:
+        """Create a guardrail metadata record."""
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO guardrails
+                (project_id, category, filename, source, file_path, file_mtime,
+                 file_size, enabled, loops, modes, position)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    category,
+                    filename,
+                    source,
+                    file_path,
+                    file_mtime,
+                    file_size,
+                    enabled,
+                    json.dumps(loops) if loops else None,
+                    json.dumps(modes) if modes else None,
+                    position,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_guardrail(self, id: int) -> Optional[dict]:
+        """Get a guardrail by ID."""
+        with self._reader() as conn:
+            cursor = conn.execute("SELECT * FROM guardrails WHERE id = ?", (id,))
+            row = cursor.fetchone()
+            if row:
+                result = dict(row)
+                if result.get("loops"):
+                    result["loops"] = json.loads(result["loops"])
+                if result.get("modes"):
+                    result["modes"] = json.loads(result["modes"])
+                return result
+            return None
+
+    def list_guardrails(
+        self,
+        project_id: Optional[str] = None,
+        category: Optional[str] = None,
+        source: Optional[str] = None,
+        enabled_only: bool = True,
+    ) -> list[dict]:
+        """List guardrails with optional filters."""
+        conditions = []
+        params: list[Any] = []
+
+        if project_id is not None:
+            conditions.append("(project_id = ? OR project_id IS NULL)")
+            params.append(project_id)
+        if category:
+            conditions.append("category = ?")
+            params.append(category)
+        if source:
+            conditions.append("source = ?")
+            params.append(source)
+        if enabled_only:
+            conditions.append("enabled = 1")
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        with self._reader() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT * FROM guardrails
+                WHERE {where_clause}
+                ORDER BY category, filename
+                """,
+                params,
+            )
+            results = []
+            for row in cursor.fetchall():
+                item = dict(row)
+                if item.get("loops"):
+                    item["loops"] = json.loads(item["loops"])
+                if item.get("modes"):
+                    item["modes"] = json.loads(item["modes"])
+                results.append(item)
+            return results
+
+    # Allowed columns for guardrail update operations
+    _GUARDRAIL_UPDATE_COLS = frozenset({
+        "file_mtime", "file_size", "enabled", "loops", "modes", "position"
+    })
+
+    def update_guardrail(self, id: int, **kwargs) -> bool:
+        """Update a guardrail.
+
+        Raises:
+            ValueError: If invalid column names are provided.
+        """
+        if not kwargs:
+            return False
+
+        # Security: validate column names against whitelist
+        invalid_cols = set(kwargs.keys()) - self._GUARDRAIL_UPDATE_COLS
+        if invalid_cols:
+            raise ValueError(f"Invalid columns for guardrail update: {invalid_cols}")
+
+        # Handle JSON fields
+        if "loops" in kwargs and isinstance(kwargs["loops"], list):
+            kwargs["loops"] = json.dumps(kwargs["loops"])
+        if "modes" in kwargs and isinstance(kwargs["modes"], list):
+            kwargs["modes"] = json.dumps(kwargs["modes"])
+
+        set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
+        values = list(kwargs.values()) + [id]
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE guardrails SET {set_clause} WHERE id = ?", values
+            )
+            return cursor.rowcount > 0
+
+    def delete_guardrail(self, id: int) -> bool:
+        """Delete a guardrail."""
+        with self._writer() as conn:
+            cursor = conn.execute("DELETE FROM guardrails WHERE id = ?", (id,))
+            return cursor.rowcount > 0
+
+    # =========================================================================
+    # Log Operations
+    # =========================================================================
+
+    def log(
+        self,
+        level: str,
+        message: str,
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> int:
+        """Write a log entry."""
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO logs (project_id, run_id, level, message, metadata)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    run_id,
+                    level,
+                    message,
+                    json.dumps(metadata) if metadata else None,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_logs(
+        self,
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        level: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Get log entries with optional filters."""
+        conditions = []
+        params: list[Any] = []
+
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if run_id:
+            conditions.append("run_id = ?")
+            params.append(run_id)
+        if level:
+            conditions.append("level = ?")
+            params.append(level)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.extend([limit, offset])
+
+        with self._reader() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT * FROM logs
+                WHERE {where_clause}
+                ORDER BY timestamp DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            )
+            results = []
+            for row in cursor.fetchall():
+                item = dict(row)
+                if item.get("metadata"):
+                    item["metadata"] = json.loads(item["metadata"])
+                results.append(item)
+            return results
+
+    # =========================================================================
+    # Credential Operations
+    # =========================================================================
+
+    def store_credentials(
+        self,
+        scope: str,
+        access_token: str,
+        expires_at: int,
+        refresh_token: Optional[str] = None,
+        project_id: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> int:
+        """Store or update OAuth credentials.
+
+        Args:
+            scope: 'global' or 'project'
+            access_token: OAuth access token
+            expires_at: Unix timestamp (seconds) when token expires
+            refresh_token: Optional refresh token
+            project_id: Project ID for project-scoped credentials
+            email: User's email address from profile
+
+        Returns:
+            Credential record ID
+        """
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            # Check for existing credential - handle NULL project_id explicitly
+            # (SQLite's ON CONFLICT doesn't work with NULL values)
+            if project_id is None:
+                cursor = conn.execute(
+                    "SELECT id FROM credentials WHERE scope = ? AND project_id IS NULL",
+                    (scope,),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT id FROM credentials WHERE scope = ? AND project_id = ?",
+                    (scope, project_id),
+                )
+            existing = cursor.fetchone()
+
+            if existing:
+                # Update existing credential
+                conn.execute(
+                    """
+                    UPDATE credentials SET
+                        access_token = ?, refresh_token = ?, expires_at = ?,
+                        email = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (access_token, refresh_token, expires_at, email, now, existing[0]),
+                )
+                return existing[0]
+            else:
+                # Insert new credential
+                cursor = conn.execute(
+                    """
+                    INSERT INTO credentials
+                    (scope, project_id, access_token, refresh_token, expires_at, email, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (scope, project_id, access_token, refresh_token, expires_at, email, now, now),
+                )
+                return cursor.lastrowid or 0
+
+    def get_credentials(self, project_id: Optional[str] = None) -> Optional[dict]:
+        """Get credentials, checking project-specific first then global.
+
+        Args:
+            project_id: Optional project ID to check for project-scoped creds first
+
+        Returns:
+            Credential dict or None if not found
+        """
+        with self._reader() as conn:
+            # Check project-specific first if project_id provided
+            if project_id:
+                cursor = conn.execute(
+                    "SELECT * FROM credentials WHERE scope = 'project' AND project_id = ?",
+                    (project_id,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return dict(row)
+
+            # Fall back to global
+            cursor = conn.execute(
+                "SELECT * FROM credentials WHERE scope = 'global' AND project_id IS NULL"
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_credentials_by_scope(
+        self, scope: str, project_id: Optional[str] = None
+    ) -> Optional[dict]:
+        """Get credentials for exact scope match (no fallback).
+
+        Unlike get_credentials(), this returns only the exact scope requested
+        without falling back to global credentials.
+
+        Args:
+            scope: 'global' or 'project'
+            project_id: Project ID (required if scope is 'project')
+
+        Returns:
+            Credential dict or None if not found for this exact scope
+        """
+        with self._reader() as conn:
+            if scope == "project" and project_id:
+                cursor = conn.execute(
+                    "SELECT * FROM credentials WHERE scope = 'project' AND project_id = ?",
+                    (project_id,),
+                )
+            elif scope == "global":
+                cursor = conn.execute(
+                    "SELECT * FROM credentials WHERE scope = 'global' AND project_id IS NULL"
+                )
+            else:
+                return None
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_credentials_by_id(self, id: int) -> Optional[dict]:
+        """Get credentials by ID."""
+        with self._reader() as conn:
+            cursor = conn.execute("SELECT * FROM credentials WHERE id = ?", (id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    # Allowed columns for credential update operations
+    _CREDENTIAL_UPDATE_COLS = frozenset({
+        "access_token", "refresh_token", "expires_at", "updated_at", "email"
+    })
+
+    def update_credentials(self, id: int, **kwargs) -> bool:
+        """Update credentials by ID.
+
+        Raises:
+            ValueError: If invalid column names are provided.
+        """
+        if not kwargs:
+            return False
+
+        # Security: validate column names against whitelist
+        invalid_cols = set(kwargs.keys()) - self._CREDENTIAL_UPDATE_COLS - {"updated_at"}
+        if invalid_cols:
+            raise ValueError(f"Invalid columns for credential update: {invalid_cols}")
+
+        kwargs["updated_at"] = datetime.utcnow().isoformat()
+        set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
+        values = list(kwargs.values()) + [id]
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE credentials SET {set_clause} WHERE id = ?", values
+            )
+            return cursor.rowcount > 0
+
+    def delete_credentials(
+        self, scope: str, project_id: Optional[str] = None
+    ) -> bool:
+        """Delete credentials for a scope.
+
+        Args:
+            scope: 'global' or 'project'
+            project_id: Project ID for project-scoped credentials
+
+        Returns:
+            True if deleted, False if not found
+        """
+        with self._writer() as conn:
+            if scope == "project" and project_id:
+                cursor = conn.execute(
+                    "DELETE FROM credentials WHERE scope = 'project' AND project_id = ?",
+                    (project_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM credentials WHERE scope = 'global' AND project_id IS NULL"
+                )
+            return cursor.rowcount > 0
+
+    # =========================================================================
+    # Backup Operations
+    # =========================================================================
+
+    def backup(self, backup_path: Optional[str] = None) -> Path:
+        """Create a backup of the database.
+
+        Args:
+            backup_path: Custom backup path. Defaults to ~/.ralphx/backups/
+
+        Returns:
+            Path to the backup file.
+        """
+        if backup_path is None:
+            backup_dir = get_backups_path()
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            backup_path = str(backup_dir / f"ralphx_{timestamp}.db")
+
+        # Use SQLite backup API for consistent backup
+        with self._reader() as conn:
+            backup_conn = sqlite3.connect(backup_path)
+            conn.backup(backup_conn)
+            backup_conn.close()
+
+        # Set restrictive permissions on backup
+        os.chmod(backup_path, 0o600)
+
+        return Path(backup_path)
+
+    def vacuum(self) -> None:
+        """Vacuum the database to reclaim space."""
+        with self._writer() as conn:
+            conn.execute("VACUUM")
+
+    # =========================================================================
+    # Migration Support
+    # =========================================================================
+
+    def get_schema_version(self) -> int:
+        """Get the current schema version."""
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+            )
+            row = cursor.fetchone()
+            return row[0] if row else 0
+
+    def migrate(self) -> None:
+        """Run any pending migrations."""
+        current_version = self.get_schema_version()
+
+        # Define migrations as (version, sql) tuples
+        migrations: list[tuple[int, str]] = [
+            # Migration to v2: Add item provenance and claiming columns
+            (2, """
+                -- Add item provenance tracking
+                ALTER TABLE work_items ADD COLUMN source_loop TEXT;
+                ALTER TABLE work_items ADD COLUMN item_type TEXT DEFAULT 'item';
+                ALTER TABLE work_items ADD COLUMN claimed_by TEXT;
+                ALTER TABLE work_items ADD COLUMN claimed_at TIMESTAMP;
+                ALTER TABLE work_items ADD COLUMN processed_at TIMESTAMP;
+
+                -- Index for consumer loop queries
+                CREATE INDEX IF NOT EXISTS idx_work_items_source_loop
+                    ON work_items(project_id, source_loop, status);
+                CREATE INDEX IF NOT EXISTS idx_work_items_claimed
+                    ON work_items(project_id, claimed_by, claimed_at);
+
+                -- Backfill source_loop from session's loop name where determinable
+                UPDATE work_items
+                SET source_loop = (
+                    SELECT l.name FROM sessions s
+                    JOIN loops l ON l.project_id = s.project_id
+                    WHERE s.project_id = work_items.project_id
+                    LIMIT 1
+                )
+                WHERE source_loop IS NULL;
+            """),
+            # Migration to v3: Add OAuth credentials table
+            (3, """
+                CREATE TABLE IF NOT EXISTS credentials (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope TEXT NOT NULL,
+                    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT,
+                    expires_at INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(scope, project_id)
+                );
+            """),
+            # Migration to v4: Add email column to credentials
+            (4, """
+                ALTER TABLE credentials ADD COLUMN email TEXT;
+            """),
+        ]
+
+        with self._writer() as conn:
+            for version, sql in migrations:
+                if version > current_version:
+                    conn.executescript(sql)
+                    conn.execute(
+                        "INSERT INTO schema_version (version) VALUES (?)",
+                        (version,),
+                    )
