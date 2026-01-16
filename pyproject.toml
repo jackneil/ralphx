@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ralphx"
-version = "0.1.0"
+version = "0.1.1"
 description = "Generic agent loop orchestration system with web dashboard"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "Jack", email = "jack@example.com" }
+    { name = "Jack Neil", email = "jack@jackmd.com" }
 ]
 keywords = [
     "ai",
