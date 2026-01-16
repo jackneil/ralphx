@@ -5,11 +5,9 @@ Spawns Claude CLI as a subprocess and captures output via stream-json format.
 
 import asyncio
 import json
-import os
-import signal
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import AsyncIterator, Optional
 
 from ralphx.adapters.base import (
     AdapterEvent,
@@ -98,6 +96,7 @@ class ClaudeCLIAdapter(LLMAdapter):
         cmd = [
             "claude",
             "-p",  # Print mode (non-interactive)
+            "--verbose",  # Required when using -p with stream-json
             "--model", full_model,
             "--output-format", "stream-json",  # For session tracking
         ]
@@ -186,11 +185,12 @@ class ClaudeCLIAdapter(LLMAdapter):
         Yields:
             StreamEvent objects as execution progresses.
         """
-        # Refresh token if needed (before spawning)
-        if not await refresh_token_if_needed(self._project_id):
+        # Validate and refresh token if needed (before spawning)
+        # Use validate=True to actually test the token works
+        if not await refresh_token_if_needed(self._project_id, validate=True):
             yield StreamEvent(
                 type=AdapterEvent.ERROR,
-                error_message="No valid credentials. Please login via Settings.",
+                error_message="No valid credentials. Token may be expired - please re-login via Settings.",
                 error_code="AUTH_REQUIRED",
             )
             return
@@ -224,11 +224,38 @@ class ClaudeCLIAdapter(LLMAdapter):
                 await self._process.stdin.wait_closed()
 
             # Read output with timeout
+            # Note: We read stderr concurrently with stdout to avoid deadlock
+            # if stderr buffer fills before stdout completes
+            stderr_content = []
+            stderr_task = None
+
+            async def drain_stderr():
+                """Read stderr in background to prevent buffer deadlock."""
+                chunks = []
+                if self._process and self._process.stderr:
+                    # Read in chunks with a max total size limit (1MB)
+                    max_size = 1024 * 1024
+                    total = 0
+                    while total < max_size:
+                        chunk = await self._process.stderr.read(8192)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total += len(chunk)
+                return b"".join(chunks)
+
             try:
                 async with asyncio.timeout(timeout):
+                    # Start stderr drain early to prevent buffer deadlock
+                    if self._process.stderr:
+                        stderr_task = asyncio.create_task(drain_stderr())
+
                     if self._process.stdout:
                         async for line in self._process.stdout:
-                            line_text = line.decode().strip()
+                            try:
+                                line_text = line.decode(errors="replace").strip()
+                            except Exception:
+                                continue  # Skip lines that can't be decoded
                             if not line_text:
                                 continue
 
@@ -247,7 +274,20 @@ class ClaudeCLIAdapter(LLMAdapter):
                     # Wait for process to complete
                     await self._process.wait()
 
+                    # Collect stderr result
+                    if stderr_task:
+                        stderr_data = await stderr_task
+                        if stderr_data:
+                            stderr_content.append(stderr_data.decode(errors="replace").strip())
+
             except asyncio.TimeoutError:
+                # Cancel stderr task if still running
+                if stderr_task and not stderr_task.done():
+                    stderr_task.cancel()
+                    try:
+                        await stderr_task
+                    except asyncio.CancelledError:
+                        pass
                 yield StreamEvent(
                     type=AdapterEvent.ERROR,
                     error_message=f"Timeout after {timeout}s",
@@ -256,8 +296,24 @@ class ClaudeCLIAdapter(LLMAdapter):
                 await self.stop()
                 raise
 
-            # Emit completion event
+            # Emit error if non-zero exit code or stderr content
             exit_code = self._process.returncode or 0
+            if exit_code != 0 or stderr_content:
+                stderr_text = "\n".join(stderr_content)
+                error_msg = f"Claude CLI error (exit {exit_code})"
+                if stderr_text:
+                    # Truncate stderr to 500 chars with indicator
+                    truncated = stderr_text[:500]
+                    if len(stderr_text) > 500:
+                        truncated += "... [truncated]"
+                    error_msg = f"{error_msg}: {truncated}"
+                yield StreamEvent(
+                    type=AdapterEvent.ERROR,
+                    error_message=error_msg,
+                    error_code=f"EXIT_{exit_code}",
+                )
+
+            # Emit completion event
             yield StreamEvent(
                 type=AdapterEvent.COMPLETE,
                 data={"exit_code": exit_code, "session_id": self._session_id},

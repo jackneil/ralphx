@@ -10,8 +10,11 @@ from pydantic import BaseModel
 from ralphx.core.auth import (
     AuthStatus,
     clear_credentials,
+    force_refresh_token,
     get_auth_status,
+    refresh_token_if_needed,
     store_oauth_tokens,
+    validate_token_health,
 )
 from ralphx.core.database import Database
 from ralphx.core.oauth import OAuthFlow
@@ -48,8 +51,17 @@ async def get_status(
         None, description="Project path for scoped credentials"
     ),
 ) -> AuthStatus:
-    """Get authentication status from database (project-specific, then global)."""
+    """Get authentication status, refreshing if close to expiry.
+
+    Proactively refreshes tokens when within 5 minutes of expiry,
+    keeping tokens fresh when dashboard is being monitored.
+    Note: Background task also refreshes tokens within 2 hours of expiry.
+    """
     project_id = _get_project_id(project_path)
+
+    # Proactively refresh if close to expiry (within 5 min)
+    await refresh_token_if_needed(project_id)
+
     return get_auth_status(project_id)
 
 
@@ -116,3 +128,99 @@ async def logout(request: LoginRequest):
     project_id = _get_project_id(request.project_path)
     clear_credentials(request.scope, project_id)
     return {"success": True}
+
+
+@router.post("/refresh")
+async def refresh_token(request: LoginRequest):
+    """Manually refresh the OAuth token.
+
+    Forces a token refresh regardless of expiry time.
+    Useful when users want to ensure they have a fresh token.
+    """
+    project_id = _get_project_id(request.project_path)
+    result = await force_refresh_token(project_id)
+    return result
+
+
+@router.get("/validate")
+async def validate_credentials(
+    project_path: Optional[str] = Query(
+        None, description="Project path for scoped credentials"
+    ),
+):
+    """Validate that stored credentials are actually working.
+
+    This actually attempts to refresh the OAuth token to verify
+    the refresh_token is still valid. Unlike /status which just
+    checks the stored expiry timestamp, this makes a real API call.
+
+    Use this when:
+    - Troubleshooting authentication issues
+    - Verifying credentials after they might have been revoked
+    - Before starting a long-running loop
+    """
+    project_id = _get_project_id(project_path)
+    db = Database()
+    creds = db.get_credentials(project_id)
+
+    if not creds:
+        return {
+            "valid": False,
+            "error": "No credentials found",
+            "scope": None,
+        }
+
+    is_valid, error = await validate_token_health(creds)
+
+    return {
+        "valid": is_valid,
+        "error": error if not is_valid else None,
+        "scope": creds.get("scope"),
+        "email": creds.get("email"),
+        "refreshed": is_valid,  # If valid, we also refreshed the token
+    }
+
+
+@router.get("/credentials/export")
+async def export_credentials(
+    scope: Literal["project", "global"] = Query("global"),
+    project_path: Optional[str] = Query(None),
+):
+    """Export credentials in Claude Code JSON format.
+
+    Returns credentials in the format used by ~/.claude/.credentials.json
+    so users can copy them for use elsewhere.
+    """
+    project_id = _get_project_id(project_path)
+    db = Database()
+
+    # Get credentials for the specified scope
+    if scope == "project" and project_id:
+        creds = db.get_credentials_by_scope("project", project_id)
+    else:
+        creds = db.get_credentials_by_scope("global", None)
+
+    if not creds:
+        return {
+            "success": False,
+            "error": f"No {scope} credentials found",
+            "credentials": None,
+        }
+
+    # Format as Claude Code expects (matching ~/.claude/.credentials.json)
+    credentials_json = {
+        "claudeAiOauth": {
+            "accessToken": creds["access_token"],
+            "refreshToken": creds["refresh_token"],
+            "expiresAt": creds["expires_at"] * 1000,  # Convert to milliseconds
+            "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"],
+            "email": creds.get("email"),
+        }
+    }
+
+    return {
+        "success": True,
+        "scope": creds["scope"],
+        "email": creds.get("email"),
+        "credentials": credentials_json,
+    }

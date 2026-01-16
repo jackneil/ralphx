@@ -14,6 +14,7 @@ from ralphx.core.loop import LoopLoader
 from ralphx.core.project import ProjectManager
 from ralphx.models.loop import LoopConfig, LoopType, ModeSelectionStrategy, ItemTypes
 from ralphx.models.run import Run, RunStatus
+from ralphx.core.logger import loop_log
 
 router = APIRouter()
 
@@ -266,9 +267,9 @@ async def get_loop_status(slug: str, loop_name: str):
         return LoopStatus(
             loop_name=loop_name,
             is_running=True,
-            current_run_id=executor._current_run.id if executor._current_run else None,
+            current_run_id=executor._run.id if executor._run else None,
             current_iteration=executor._iteration,
-            current_mode=executor._current_mode,
+            current_mode=None,  # Mode is per-iteration, not tracked as state
             items_generated=executor._items_generated,
         )
 
@@ -352,14 +353,14 @@ async def start_loop(
         finally:
             _running_loops.pop(key, None)
 
-    background_tasks.add_task(asyncio.create_task, run_and_cleanup())
+    background_tasks.add_task(run_and_cleanup)
 
     # Return initial run info
     # Wait briefly for run to be created
     await asyncio.sleep(0.1)
 
-    if executor._current_run:
-        return RunResponse.from_run(executor._current_run)
+    if executor._run:
+        return RunResponse.from_run(executor._run)
 
     # Return placeholder
     return RunResponse(
@@ -497,6 +498,13 @@ async def delete_loop(slug: str, loop_name: str):
     # Remove from database
     project_db.delete_loop(loop_name)
 
+    loop_log.info(
+        "deleted",
+        f"Loop deleted: {loop_name}",
+        project_id=project.id,
+        loop_name=loop_name,
+    )
+
     return None
 
 
@@ -629,6 +637,13 @@ async def create_loop(slug: str, request: CreateLoopRequest):
 
     # Sync to reload into database
     loader.sync_loops(project)
+
+    loop_log.info(
+        "created",
+        f"Loop created: {request.name}",
+        project_id=project.id,
+        loop_name=request.name,
+    )
 
     return {
         "message": f"Loop '{request.name}' created successfully",

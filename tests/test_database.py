@@ -502,7 +502,9 @@ class TestLogOperations:
     def test_log_entry(self, db, project):
         """Test writing a log entry."""
         log_id = db.log(
-            level="info",
+            level="INFO",
+            category="system",
+            event="test",
             message="Test message",
             project_id=project,
             metadata={"key": "value"},
@@ -511,14 +513,14 @@ class TestLogOperations:
 
     def test_get_logs(self, db, project):
         """Test getting logs."""
-        db.log("info", "Message 1", project_id=project)
-        db.log("error", "Message 2", project_id=project)
-        db.log("info", "Message 3", project_id=project)
+        db.log("INFO", "system", "test", "Message 1", project_id=project)
+        db.log("ERROR", "system", "test", "Message 2", project_id=project)
+        db.log("INFO", "system", "test", "Message 3", project_id=project)
 
         all_logs = db.get_logs(project_id=project)
         assert len(all_logs) == 3
 
-        error_logs = db.get_logs(project_id=project, level="error")
+        error_logs = db.get_logs(project_id=project, level="ERROR")
         assert len(error_logs) == 1
 
 

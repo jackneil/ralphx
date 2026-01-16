@@ -60,9 +60,9 @@ mcp = [
 ralphx = "ralphx.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/jackmd/ralphx"
-Repository = "https://github.com/jackmd/ralphx"
-Documentation = "https://github.com/jackmd/ralphx#readme"
+Homepage = "https://github.com/jackneil/ralphx"
+Repository = "https://github.com/jackneil/ralphx"
+Documentation = "https://github.com/jackneil/ralphx#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ralphx"]

@@ -93,6 +93,7 @@ class SessionManager:
             run_id=run_id,
             iteration=iteration,
             mode=mode,
+            status=status,
         )
 
         return Session(

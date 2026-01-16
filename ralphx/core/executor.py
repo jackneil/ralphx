@@ -30,6 +30,7 @@ from ralphx.core.workspace import get_loop_settings_path
 from ralphx.models.loop import LoopConfig, Mode, ModeSelectionStrategy
 from ralphx.models.project import Project
 from ralphx.models.run import Run, RunStatus
+from ralphx.core.logger import run_log, iteration_log
 
 
 class ExecutorEvent(str, Enum):
@@ -237,6 +238,88 @@ class LoopExecutor:
                 handler(event_data)
             except Exception:
                 pass  # Don't let handler errors affect execution
+
+        # Log significant events to database
+        self._log_event(event, message, data)
+
+    def _log_event(
+        self,
+        event: ExecutorEvent,
+        message: Optional[str],
+        data: dict,
+    ) -> None:
+        """Log significant events to database.
+
+        Only logs run-level and iteration-level events, not low-level ones.
+        """
+        # Common context for all logs
+        ctx = {
+            "project_id": self.project.id,
+            "run_id": self.run_id,
+            "loop_name": self.config.name,
+        }
+
+        if event == ExecutorEvent.RUN_STARTED:
+            run_log.info(
+                "started",
+                f"Run started: {self.config.name}",
+                **ctx,
+            )
+        elif event == ExecutorEvent.RUN_COMPLETED:
+            run_log.info(
+                "completed",
+                message or f"Run completed: {self.config.name}",
+                iterations=self._iteration,
+                items_generated=data.get("items_generated", 0),
+                **ctx,
+            )
+        elif event == ExecutorEvent.RUN_ABORTED:
+            run_log.warning(
+                "aborted",
+                message or f"Run aborted: {self.config.name}",
+                iterations=self._iteration,
+                **ctx,
+            )
+        elif event == ExecutorEvent.RUN_PAUSED:
+            run_log.info(
+                "paused",
+                message or f"Run paused: {self.config.name}",
+                iterations=self._iteration,
+                **ctx,
+            )
+        elif event == ExecutorEvent.RUN_RESUMED:
+            run_log.info(
+                "resumed",
+                message or f"Run resumed: {self.config.name}",
+                iterations=self._iteration,
+                **ctx,
+            )
+        elif event == ExecutorEvent.ITERATION_STARTED:
+            iteration_log.info(
+                "started",
+                f"Iteration {self._iteration} started",
+                iteration_num=self._iteration,
+                mode=data.get("mode"),
+                **ctx,
+            )
+        elif event == ExecutorEvent.ITERATION_COMPLETED:
+            iteration_log.info(
+                "completed",
+                f"Iteration {self._iteration} completed",
+                iteration_num=self._iteration,
+                mode=data.get("mode"),
+                items_added=data.get("items_added", 0),
+                duration_seconds=data.get("duration_seconds"),
+                **ctx,
+            )
+        elif event == ExecutorEvent.ERROR:
+            run_log.error(
+                "error",
+                message or "Run error",
+                error=message,
+                **ctx,
+            )
+        # Note: ITEM_ADDED, WARNING, HEARTBEAT are not logged to reduce noise
 
     def select_mode(self) -> tuple[str, Mode]:
         """Select a mode based on the selection strategy.

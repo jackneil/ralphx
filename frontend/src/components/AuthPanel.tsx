@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
-import { getAuthStatus, startLogin, logoutAuth, AuthStatus } from '../api'
+import { getAuthStatus, startLogin, logoutAuth, refreshAuthToken, exportCredentials, AuthStatus, CredentialsExport, AuthValidationResult } from '../api'
 
 interface AuthPanelProps {
   projectPath?: string  // If provided, shows project-scoped auth
+  validationResult?: AuthValidationResult | null  // Result from /validate endpoint
+  onLoginSuccess?: () => void  // Called when login completes successfully
 }
 
-export default function AuthPanel({ projectPath }: AuthPanelProps) {
+export default function AuthPanel({ projectPath, validationResult, onLoginSuccess }: AuthPanelProps) {
   const [status, setStatus] = useState<AuthStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [loginPending, setLoginPending] = useState(false)
@@ -13,6 +15,10 @@ export default function AuthPanel({ projectPath }: AuthPanelProps) {
   const [selectedScope, setSelectedScope] = useState<'project' | 'global'>(
     projectPath ? 'project' : 'global'
   )
+  const [showCredentials, setShowCredentials] = useState(false)
+  const [credentialsData, setCredentialsData] = useState<CredentialsExport | null>(null)
+  const [loadingCredentials, setLoadingCredentials] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
   const pollRef = useRef<number | null>(null)
   const timeoutRef = useRef<number | null>(null)
 
@@ -61,6 +67,8 @@ export default function AuthPanel({ projectPath }: AuthPanelProps) {
             if (pollRef.current) clearInterval(pollRef.current)
             if (timeoutRef.current) clearTimeout(timeoutRef.current)
             setLoginPending(false)
+            // Notify parent that login succeeded so it can re-validate
+            onLoginSuccess?.()
           }
         } catch {
           // Ignore polling errors
@@ -87,6 +95,60 @@ export default function AuthPanel({ projectPath }: AuthPanelProps) {
     } catch {
       setError('Failed to logout')
     }
+  }
+
+  const handleRefreshToken = async () => {
+    setRefreshing(true)
+    setError(null)
+    try {
+      const scope = status?.scope || 'global'
+      const result = await refreshAuthToken({ scope, project_path: projectPath })
+      if (result.success) {
+        await loadStatus() // Reload to get updated expiry
+      } else if (result.needs_relogin) {
+        setError('Session expired. Please click "Re-login" to authenticate again.')
+      } else {
+        setError(result.error || 'Failed to refresh token')
+      }
+    } catch {
+      setError('Failed to refresh token')
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  const handleViewCredentials = async () => {
+    setLoadingCredentials(true)
+    try {
+      const scope = status?.scope || 'global'
+      const data = await exportCredentials(scope, projectPath)
+      setCredentialsData(data)
+      setShowCredentials(true)
+    } catch {
+      setError('Failed to export credentials')
+    } finally {
+      setLoadingCredentials(false)
+    }
+  }
+
+  const handleDownloadCredentials = () => {
+    if (!credentialsData?.credentials) return
+    const json = JSON.stringify(credentialsData.credentials, null, 2)
+    const blob = new Blob([json], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `credentials-${credentialsData.scope || 'global'}.json`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
+
+  const handleCopyCredentials = () => {
+    if (!credentialsData?.credentials) return
+    const json = JSON.stringify(credentialsData.credentials, null, 2)
+    navigator.clipboard.writeText(json)
   }
 
   const formatExpiry = (seconds?: number): string => {
@@ -125,18 +187,40 @@ export default function AuthPanel({ projectPath }: AuthPanelProps) {
             </p>
           )}
 
-          {/* Connection status with fallback indicator */}
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 bg-green-500 rounded-full" />
-            <span className="text-green-400">Connected</span>
-            {status.using_global_fallback ? (
-              <span className="text-yellow-400 text-sm">(Using Global Account)</span>
-            ) : (
-              <span className="text-gray-500 text-sm">
-                ({status.scope === 'project' ? 'Project' : 'Global'})
-              </span>
-            )}
-          </div>
+          {/* Connection status - shows validation state if available */}
+          {validationResult && !validationResult.valid ? (
+            // Token validation failed - show error state
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 bg-yellow-500 rounded-full" />
+                <span className="text-yellow-400">Token Invalid</span>
+                <span className="text-gray-500 text-sm">
+                  ({status.scope === 'project' ? 'Project' : 'Global'})
+                </span>
+              </div>
+              <div className="bg-yellow-500/10 border border-yellow-500 rounded p-3">
+                <p className="text-yellow-300/80 text-sm">
+                  {validationResult.error || 'Token validation failed'}
+                </p>
+                <p className="text-gray-400 text-sm mt-1">
+                  Please re-login to get fresh credentials.
+                </p>
+              </div>
+            </div>
+          ) : (
+            // Connected state
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 bg-green-500 rounded-full" />
+              <span className="text-green-400">Connected</span>
+              {status.using_global_fallback ? (
+                <span className="text-yellow-400 text-sm">(Using Global Account)</span>
+              ) : (
+                <span className="text-gray-500 text-sm">
+                  ({status.scope === 'project' ? 'Project' : 'Global'})
+                </span>
+              )}
+            </div>
+          )}
 
           {/* Override button when using global fallback on a project */}
           {status.using_global_fallback && projectPath && (
@@ -157,37 +241,130 @@ export default function AuthPanel({ projectPath }: AuthPanelProps) {
             </div>
           )}
 
-          {status.subscription_type && (
-            <p className="text-gray-400 text-sm">
-              Plan: <span className="text-white capitalize">{status.subscription_type}</span>
-            </p>
+          {/* Only show plan/tier/expiry info when token is valid */}
+          {(!validationResult || validationResult.valid) && (
+            <>
+              {status.subscription_type && (
+                <p className="text-gray-400 text-sm">
+                  Plan: <span className="text-white capitalize">{status.subscription_type}</span>
+                </p>
+              )}
+
+              {status.rate_limit_tier && (
+                <p className="text-gray-400 text-sm">
+                  Tier: <span className="text-white">{status.rate_limit_tier}</span>
+                </p>
+              )}
+
+              {/* Token expiry and auto-refresh info */}
+              <div className="space-y-1">
+                <p className="text-gray-400 text-sm">
+                  Expires in: <span className="text-white">{formatExpiry(status.expires_in_seconds)}</span>
+                </p>
+                <p className="text-gray-500 text-xs">
+                  Auto-refreshes every 30 min when less than 4 hours remain
+                </p>
+              </div>
+            </>
           )}
 
-          {status.rate_limit_tier && (
-            <p className="text-gray-400 text-sm">
-              Tier: <span className="text-white">{status.rate_limit_tier}</span>
-            </p>
-          )}
-
-          <p className="text-gray-400 text-sm">
-            Expires in: <span className="text-white">{formatExpiry(status.expires_in_seconds)}</span>
-          </p>
-
-          <div className="flex gap-2 pt-2">
-            <button
-              onClick={handleLogin}
-              className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded transition-colors disabled:opacity-50"
-              disabled={loginPending}
-            >
-              {loginPending ? 'Waiting...' : 'Re-login'}
-            </button>
-            <button
-              onClick={handleLogout}
-              className="px-3 py-1.5 bg-red-900/50 hover:bg-red-800/50 text-red-200 text-sm rounded transition-colors"
-            >
-              Logout
-            </button>
+          <div className="flex gap-2 pt-2 flex-wrap">
+            {/* When token is invalid, make Re-login primary and hide Refresh Token */}
+            {validationResult && !validationResult.valid ? (
+              <>
+                <button
+                  onClick={handleLogin}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors disabled:opacity-50"
+                  disabled={loginPending}
+                >
+                  {loginPending ? 'Waiting...' : 'Re-login'}
+                </button>
+                <button
+                  onClick={handleLogout}
+                  className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded transition-colors"
+                >
+                  Logout
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={handleRefreshToken}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors disabled:opacity-50"
+                  disabled={refreshing}
+                  title="Get a fresh token now"
+                >
+                  {refreshing ? 'Refreshing...' : 'Refresh Token'}
+                </button>
+                <button
+                  onClick={handleLogin}
+                  className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded transition-colors disabled:opacity-50"
+                  disabled={loginPending}
+                >
+                  {loginPending ? 'Waiting...' : 'Re-login'}
+                </button>
+                <button
+                  onClick={handleViewCredentials}
+                  className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded transition-colors disabled:opacity-50"
+                  disabled={loadingCredentials}
+                >
+                  {loadingCredentials ? 'Loading...' : 'View Credentials'}
+                </button>
+                <button
+                  onClick={handleLogout}
+                  className="px-3 py-1.5 bg-red-900/50 hover:bg-red-800/50 text-red-200 text-sm rounded transition-colors"
+                >
+                  Logout
+                </button>
+              </>
+            )}
           </div>
+
+          {/* Credentials Panel */}
+          {showCredentials && credentialsData && (
+            <div className="mt-4 p-4 bg-gray-900 rounded-lg border border-gray-700">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="text-sm font-medium text-gray-300">
+                  Credentials JSON ({credentialsData.scope})
+                  {credentialsData.email && (
+                    <span className="text-gray-500 ml-2">- {credentialsData.email}</span>
+                  )}
+                </h4>
+                <button
+                  onClick={() => setShowCredentials(false)}
+                  className="text-gray-500 hover:text-gray-300 text-lg leading-none"
+                >
+                  &times;
+                </button>
+              </div>
+              {credentialsData.success && credentialsData.credentials ? (
+                <>
+                  <pre className="text-xs text-gray-400 bg-gray-950 p-3 rounded overflow-x-auto max-h-64 overflow-y-auto">
+                    {JSON.stringify(credentialsData.credentials, null, 2)}
+                  </pre>
+                  <div className="flex gap-2 mt-3">
+                    <button
+                      onClick={handleCopyCredentials}
+                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition-colors"
+                    >
+                      Copy to Clipboard
+                    </button>
+                    <button
+                      onClick={handleDownloadCredentials}
+                      className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded transition-colors"
+                    >
+                      Download JSON
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-2">
+                    Save to ~/.claude/.credentials.json for use with Claude CLI
+                  </p>
+                </>
+              ) : (
+                <p className="text-red-400 text-sm">{credentialsData.error || 'No credentials found'}</p>
+              )}
+            </div>
+          )}
         </div>
       ) : (
         <div className="space-y-4">

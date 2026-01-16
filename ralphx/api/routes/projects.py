@@ -182,6 +182,7 @@ class CleanupResponse(BaseModel):
     """Response model for cleanup operation."""
 
     deleted: list[str] = Field(default_factory=list)
+    failed: list[str] = Field(default_factory=list, description="Slugs that failed to delete")
     dry_run: bool
 
 
@@ -192,6 +193,9 @@ async def cleanup_projects(data: CleanupRequest):
     Used to remove orphaned test projects (e2e-test-*, e2e-loop-*, etc.).
     By default runs in dry_run mode to preview deletions.
     """
+    import logging
+    logger = logging.getLogger("ralphx.api.projects")
+
     manager = get_manager()
     projects = manager.list_projects()
 
@@ -207,16 +211,19 @@ async def cleanup_projects(data: CleanupRequest):
     # Find matching projects
     matching = [p for p in projects if pattern.match(p.slug)]
     deleted_slugs = []
+    failed_slugs = []
 
     if not data.dry_run:
         for project in matching:
             try:
-                manager.remove_project(project.slug, delete_workspace=False)
+                manager.remove_project(project.slug, delete_local_data=False)
                 deleted_slugs.append(project.slug)
-            except Exception:
-                # Continue even if one fails
-                pass
+                logger.info(f"Cleanup: deleted project '{project.slug}'")
+            except Exception as e:
+                # Log the actual error instead of silently swallowing it
+                logger.error(f"Cleanup: failed to delete '{project.slug}': {e}")
+                failed_slugs.append(project.slug)
     else:
         deleted_slugs = [p.slug for p in matching]
 
-    return CleanupResponse(deleted=deleted_slugs, dry_run=data.dry_run)
+    return CleanupResponse(deleted=deleted_slugs, failed=failed_slugs, dry_run=data.dry_run)

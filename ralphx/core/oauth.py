@@ -12,7 +12,10 @@ from aiohttp import web
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 AUTH_URL = "https://claude.ai/oauth/authorize"
-TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+API_KEY_URL = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key"
+
+# Need org:create_api_key scope to call the create_api_key endpoint
 SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code"
 
 
@@ -63,6 +66,10 @@ class OAuthFlow:
 
         self._redirect_uri = f"http://localhost:{port}/callback"
 
+        import logging
+        logger = logging.getLogger("ralphx.oauth")
+        logger.info(f"OAuth callback server started on port {port}, redirect_uri={self._redirect_uri}")
+
         # Build auth URL - note: code=true is required!
         params = {
             "code": "true",
@@ -89,6 +96,10 @@ class OAuthFlow:
 
     async def _handle_callback(self, request: web.Request) -> web.Response:
         """Handle OAuth callback."""
+        import logging
+        logger = logging.getLogger("ralphx.oauth")
+        logger.info(f"OAuth callback received! Query params: {dict(request.query)}")
+
         code = request.query.get("code")
         state = request.query.get("state")
         error = request.query.get("error")
@@ -112,9 +123,16 @@ class OAuthFlow:
 
         if code:
             try:
+                import logging
+                logger = logging.getLogger("ralphx.oauth")
+                logger.info(f"Callback received with code, exchanging...")
                 tokens = await self._exchange_code(code)
+                logger.info(f"Token exchange successful! expires_in={tokens.get('expires_in')}")
                 self._result = {"success": True, "tokens": tokens}
             except Exception as e:
+                import logging
+                logger = logging.getLogger("ralphx.oauth")
+                logger.error(f"Token exchange FAILED: {e}")
                 self._result = {"error": str(e)}
 
         self._event.set()
@@ -124,14 +142,21 @@ class OAuthFlow:
         )
 
     async def _exchange_code(self, code: str) -> dict:
-        """Exchange authorization code for tokens.
+        """Exchange authorization code for tokens, then create long-lived API key.
 
-        The token response includes account info with email_address.
+        Flow:
+        1. Exchange code for short-lived OAuth token
+        2. Use that token to call create_api_key endpoint
+        3. Return the long-lived API key
         """
+        import logging
+        logger = logging.getLogger("ralphx.oauth")
+
         async with httpx.AsyncClient() as client:
+            # Step 1: Exchange code for OAuth token
             resp = await client.post(
                 TOKEN_URL,
-                json={  # Must be JSON, not form data!
+                json={
                     "grant_type": "authorization_code",
                     "code": code,
                     "state": self._state,
@@ -139,15 +164,50 @@ class OAuthFlow:
                     "code_verifier": self._verifier,
                     "redirect_uri": self._redirect_uri,
                 },
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-beta": "oauth-2025-04-20",
+                },
             )
-            resp.raise_for_status()
-            tokens = resp.json()
+            if resp.status_code != 200:
+                logger.error(f"Token exchange HTTP {resp.status_code}: {resp.text}")
+                resp.raise_for_status()
 
-            # Extract email from account field in token response
-            # Response format: {"account": {"uuid": "...", "email_address": "..."}, ...}
+            tokens = resp.json()
+            logger.info(f"OAuth token received: expires_in={tokens.get('expires_in')}s, scopes={tokens.get('scope')}")
+
+            # Extract email from account field
             account = tokens.get("account", {})
             if account.get("email_address"):
                 tokens["email"] = account["email_address"]
+
+            # Step 2: Try to create long-lived API key using the OAuth token
+            access_token = tokens.get("access_token")
+            if access_token and "org:create_api_key" in tokens.get("scope", ""):
+                logger.info("Attempting to create long-lived API key...")
+                try:
+                    api_key_resp = await client.post(
+                        API_KEY_URL,
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json",
+                        },
+                        json={},
+                    )
+                    if api_key_resp.status_code == 200:
+                        api_key_data = api_key_resp.json()
+                        logger.info(f"Long-lived API key created! Response keys: {list(api_key_data.keys())}")
+                        # The API key becomes our new access token
+                        if api_key_data.get("api_key"):
+                            tokens["access_token"] = api_key_data["api_key"]
+                            tokens["expires_in"] = 31536000  # 1 year
+                            tokens["refresh_token"] = None  # API keys don't have refresh tokens
+                            logger.info("Replaced OAuth token with long-lived API key (1 year)")
+                    else:
+                        logger.warning(f"create_api_key HTTP {api_key_resp.status_code}: {api_key_resp.text}")
+                except Exception as e:
+                    logger.warning(f"create_api_key failed: {e} - falling back to short-lived token")
+            else:
+                logger.info("No org:create_api_key scope - using short-lived token")
 
             return tokens

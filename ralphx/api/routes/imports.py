@@ -65,6 +65,14 @@ class InputFileInfo(BaseModel):
     tag: Optional[str] = None
 
 
+class ValidationResult(BaseModel):
+    """Result of input validation."""
+
+    valid: bool
+    missing_tags: list[str]
+    warnings: list[str]
+
+
 # Validate loop name
 LOOP_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -264,6 +272,22 @@ async def import_jsonl(slug: str, loop_name: str, file: UploadFile = File(...)):
         tmp_path.unlink(missing_ok=True)
 
 
+@router.get("/{slug}/loops/{loop_name}/inputs/validate", response_model=ValidationResult)
+async def validate_inputs(slug: str, loop_name: str, loop_type: str):
+    """Validate that a loop has required inputs for its type.
+
+    Args:
+        loop_type: Loop type ('planning' or 'implementation').
+    """
+    validate_loop_name(loop_name)
+    project, import_manager = get_project_and_manager(slug)
+
+    inputs = import_manager.list_inputs(loop_name)
+    result = validate_loop_inputs(inputs, loop_type)
+
+    return ValidationResult(**result)
+
+
 @router.get("/{slug}/loops/{loop_name}/inputs/{filename}")
 async def get_input_content(slug: str, loop_name: str, filename: str):
     """Get the content of an input file."""
@@ -333,14 +357,6 @@ class UpdateInputTagRequest(BaseModel):
     """Request to update an input file's tag."""
 
     tag: Optional[str] = Field(None, description="New tag for the input file")
-
-
-class ValidationResult(BaseModel):
-    """Result of input validation."""
-
-    valid: bool
-    missing_tags: list[str]
-    warnings: list[str]
 
 
 @router.get("/input-templates", response_model=list[InputTemplateInfo])
@@ -427,22 +443,6 @@ async def apply_template(slug: str, loop_name: str, request: ApplyTemplateReques
         errors=result.errors,
         paths=[str(p) for p in result.paths],
     )
-
-
-@router.get("/{slug}/loops/{loop_name}/inputs/validate", response_model=ValidationResult)
-async def validate_inputs(slug: str, loop_name: str, loop_type: str):
-    """Validate that a loop has required inputs for its type.
-
-    Args:
-        loop_type: Loop type ('planning' or 'implementation').
-    """
-    validate_loop_name(loop_name)
-    project, import_manager = get_project_and_manager(slug)
-
-    inputs = import_manager.list_inputs(loop_name)
-    result = validate_loop_inputs(inputs, loop_type)
-
-    return ValidationResult(**result)
 
 
 @router.patch("/{slug}/loops/{loop_name}/inputs/{filename}")

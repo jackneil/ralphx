@@ -227,31 +227,7 @@ export default function LoopDetail() {
     return () => document.removeEventListener('keydown', handleEscape)
   }, [showImportModal, importing])
 
-  if (loadError) {
-    return (
-      <div className="p-6">
-        <div className="card bg-red-900/20 border border-red-800">
-          <h2 className="text-lg font-semibold text-red-400 mb-2">Error</h2>
-          <p className="text-gray-300 mb-4">{loadError}</p>
-          <Link to={slug ? `/projects/${slug}` : '/'} className="btn-secondary inline-block">
-            Back to {slug ? 'Project' : 'Dashboard'}
-          </Link>
-        </div>
-      </div>
-    )
-  }
-
-  if (!loop || !selectedProject) {
-    return (
-      <div className="p-6">
-        <div className="text-gray-400">Loading...</div>
-      </div>
-    )
-  }
-
-  const isRunning = status?.is_running || false
-  const isPaused = status?.status === 'paused'
-
+  // These callbacks must be before early returns to avoid hooks order violation
   const handleEditConfig = useCallback(async () => {
     if (!slug || !loopName) return
     setActionError(null)
@@ -277,6 +253,31 @@ export default function LoopDetail() {
     setLoop(loopDetail)
     setShowLoopBuilder(false)
   }, [slug, loopName])
+
+  if (loadError) {
+    return (
+      <div className="p-6">
+        <div className="card bg-red-900/20 border border-red-800">
+          <h2 className="text-lg font-semibold text-red-400 mb-2">Error</h2>
+          <p className="text-gray-300 mb-4">{loadError}</p>
+          <Link to={slug ? `/projects/${slug}` : '/'} className="btn-secondary inline-block">
+            Back to {slug ? 'Project' : 'Dashboard'}
+          </Link>
+        </div>
+      </div>
+    )
+  }
+
+  if (!loop || !selectedProject) {
+    return (
+      <div className="p-6">
+        <div className="text-gray-400">Loading...</div>
+      </div>
+    )
+  }
+
+  const isRunning = status?.is_running || false
+  const isPaused = status?.status === 'paused'
 
   return (
     <div className="p-6">

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getHealth, listProjects, deleteProject, cleanupProjects } from '../api'
+import { getHealth, listProjects, deleteProject, cleanupProjects, validateAuth, AuthValidationResult } from '../api'
 import { useDashboardStore } from '../stores/dashboard'
 import AuthPanel from '../components/AuthPanel'
 
@@ -19,8 +19,9 @@ export default function Settings() {
   const [loading, setLoading] = useState(true)
   const [deletingSlug, setDeletingSlug] = useState<string | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
-  const [cleanupResult, setCleanupResult] = useState<{ deleted: string[]; dry_run: boolean } | null>(null)
+  const [cleanupResult, setCleanupResult] = useState<{ deleted: string[]; failed: string[]; dry_run: boolean } | null>(null)
   const [cleaningUp, setCleaningUp] = useState(false)
+  const [validationResult, setValidationResult] = useState<AuthValidationResult | null>(null)
 
   useEffect(() => {
     async function load() {
@@ -37,6 +38,21 @@ export default function Settings() {
       }
     }
     load()
+  }, [])
+
+  // Validate credentials (called on mount and after login success)
+  const validateCredentials = async () => {
+    try {
+      const result = await validateAuth()
+      setValidationResult(result)
+    } catch {
+      setValidationResult({ valid: false, error: 'Failed to validate credentials' })
+    }
+  }
+
+  // Validate credentials on mount
+  useEffect(() => {
+    validateCredentials()
   }, [])
 
   const handleDeleteProject = async (slug: string) => {
@@ -60,12 +76,13 @@ export default function Settings() {
   const handleCleanup = async (dryRun: boolean) => {
     setCleaningUp(true)
     setCleanupResult(null)
+    setDeleteError(null)
     try {
       const result = await cleanupProjects('^e2e-', dryRun)
       setCleanupResult(result)
 
-      if (!dryRun && result.deleted.length > 0) {
-        // Refresh projects list
+      // Refresh projects list if any deletions occurred (success or failure means state changed)
+      if (!dryRun && (result.deleted.length > 0 || result.failed.length > 0)) {
         const projectData = await listProjects().catch(() => [])
         setProjects(projectData)
         loadProjects() // Refresh sidebar
@@ -122,7 +139,7 @@ export default function Settings() {
           </div>
 
           {/* Claude Authentication */}
-          <AuthPanel />
+          <AuthPanel validationResult={validationResult} onLoginSuccess={validateCredentials} />
 
           {/* Cleanup Test Data */}
           <div className="card">
@@ -147,18 +164,40 @@ export default function Settings() {
               </button>
             </div>
             {cleanupResult && (
-              <div className={`mt-4 p-3 rounded ${cleanupResult.dry_run ? 'bg-yellow-900/30 border border-yellow-800' : 'bg-green-900/30 border border-green-800'}`}>
-                <div className={`text-sm font-medium ${cleanupResult.dry_run ? 'text-yellow-400' : 'text-green-400'}`}>
-                  {cleanupResult.dry_run ? 'Preview (no changes made):' : 'Deleted:'}
-                </div>
-                {cleanupResult.deleted.length === 0 ? (
-                  <p className="text-gray-400 text-sm mt-1">No matching projects found</p>
-                ) : (
-                  <ul className="text-gray-300 text-sm mt-1 font-mono">
-                    {cleanupResult.deleted.map(slug => (
-                      <li key={slug}>{slug}</li>
-                    ))}
-                  </ul>
+              <div className="mt-4 space-y-2">
+                {/* Preview or Deleted */}
+                {cleanupResult.deleted.length > 0 && (
+                  <div className={`p-3 rounded ${cleanupResult.dry_run ? 'bg-yellow-900/30 border border-yellow-800' : 'bg-green-900/30 border border-green-800'}`}>
+                    <div className={`text-sm font-medium ${cleanupResult.dry_run ? 'text-yellow-400' : 'text-green-400'}`}>
+                      {cleanupResult.dry_run ? 'Preview (will be deleted):' : 'Deleted:'}
+                    </div>
+                    <ul className="text-gray-300 text-sm mt-1 font-mono">
+                      {cleanupResult.deleted.map(slug => (
+                        <li key={slug}>{slug}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* Failed deletions */}
+                {cleanupResult.failed && cleanupResult.failed.length > 0 && (
+                  <div className="p-3 rounded bg-red-900/30 border border-red-800">
+                    <div className="text-sm font-medium text-red-400">
+                      Failed to delete (check server logs):
+                    </div>
+                    <ul className="text-gray-300 text-sm mt-1 font-mono">
+                      {cleanupResult.failed.map(slug => (
+                        <li key={slug}>{slug}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* No matches at all */}
+                {cleanupResult.deleted.length === 0 && (!cleanupResult.failed || cleanupResult.failed.length === 0) && (
+                  <div className="p-3 rounded bg-gray-800 border border-gray-700">
+                    <p className="text-gray-400 text-sm">No matching projects found</p>
+                  </div>
                 )}
               </div>
             )}
@@ -229,8 +268,11 @@ export default function Settings() {
               <div>
                 <h3 className="text-gray-300 font-medium">MCP Integration</h3>
                 <p className="text-gray-400 mt-1">
-                  Add RalphX to Claude Code with:
+                  Add RalphX to Claude Code:
                 </p>
+                <code className="block mt-1 px-3 py-2 bg-gray-700 rounded text-xs font-mono text-gray-300">
+                  pip install ralphx
+                </code>
                 <code className="block mt-1 px-3 py-2 bg-gray-700 rounded text-xs font-mono text-gray-300">
                   claude mcp add ralphx -- ralphx mcp
                 </code>

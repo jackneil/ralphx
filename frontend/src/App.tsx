@@ -6,6 +6,7 @@ import LoopDetail from './pages/LoopDetail'
 import WorkItems from './pages/WorkItems'
 import RunHistory from './pages/RunHistory'
 import Settings from './pages/Settings'
+import Logs from './pages/Logs'
 
 function App() {
   return (
@@ -16,6 +17,7 @@ function App() {
         <Route path="projects/:slug/items" element={<WorkItems />} />
         <Route path="projects/:slug/runs" element={<RunHistory />} />
         <Route path="projects/:slug/loops/:loopName" element={<LoopDetail />} />
+        <Route path="logs" element={<Logs />} />
         <Route path="settings" element={<Settings />} />
       </Route>
     </Routes>

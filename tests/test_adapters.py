@@ -205,8 +205,13 @@ class TestClaudeCLIAdapter:
             b'{"type": "message_stop"}\n',
         ]
 
+        # Mock stderr to return empty bytes
+        mock_stderr = AsyncMock()
+        mock_stderr.read = AsyncMock(return_value=b"")
+
         mock_process = MagicMock()
         mock_process.stdout = mock_stdout
+        mock_process.stderr = mock_stderr
         mock_process.stdin = AsyncMock()
         mock_process.stdin.write = MagicMock()
         mock_process.stdin.drain = AsyncMock()
@@ -215,8 +220,15 @@ class TestClaudeCLIAdapter:
         mock_process.wait = AsyncMock(return_value=0)
         mock_process.returncode = 0
 
-        with patch("asyncio.create_subprocess_exec", return_value=mock_process):
-            result = await adapter.execute("Test prompt", timeout=10)
+        # Mock auth functions
+        with patch("ralphx.adapters.claude_cli.refresh_token_if_needed", new_callable=AsyncMock, return_value=True):
+            with patch("ralphx.adapters.claude_cli.swap_credentials_for_loop") as mock_swap:
+                # Create a context manager mock that yields True
+                mock_swap.return_value.__enter__ = MagicMock(return_value=True)
+                mock_swap.return_value.__exit__ = MagicMock(return_value=False)
+
+                with patch("asyncio.create_subprocess_exec", return_value=mock_process):
+                    result = await adapter.execute("Test prompt", timeout=10)
 
         assert result.session_id == "test-123"
         assert "Hello" in result.text_output

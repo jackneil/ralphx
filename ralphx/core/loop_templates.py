@@ -16,8 +16,8 @@ import yaml
 def generate_loop_id(loop_type: str, existing_names: list[str] | None = None) -> str:
     """Generate a unique loop ID with daily counter.
 
-    Format: {type}-{YYYYMMDD}_{n}
-    Example: planning-20260115_1, implementation-20260115_2
+    Format: {type}_{YYYYMMDD}_{n}
+    Example: planning_20260115_1, implementation_20260115_2
 
     The counter `n` starts at 1 for each day and auto-increments
     if a loop with that ID already exists.
@@ -30,7 +30,7 @@ def generate_loop_id(loop_type: str, existing_names: list[str] | None = None) ->
         Unique loop identifier string.
     """
     today = datetime.now().strftime("%Y%m%d")
-    prefix = f"{loop_type}-{today}_"
+    prefix = f"{loop_type}_{today}_"
 
     if not existing_names:
         return f"{prefix}1"

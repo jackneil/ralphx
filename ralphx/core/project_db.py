@@ -430,16 +430,25 @@ class ProjectDatabase:
         run_id: Optional[str],
         iteration: int,
         mode: Optional[str] = None,
+        status: str = "running",
     ) -> dict:
-        """Create a new session."""
+        """Create a new session.
+
+        Args:
+            session_id: Unique session identifier.
+            run_id: Associated run ID.
+            iteration: Iteration number.
+            mode: Mode name for this session.
+            status: Session status (running, completed, error).
+        """
         with self._writer() as conn:
             now = datetime.utcnow().isoformat()
             conn.execute(
                 """
                 INSERT INTO sessions (session_id, run_id, iteration, mode, started_at, status)
-                VALUES (?, ?, ?, ?, ?, 'running')
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, run_id, iteration, mode, now),
+                (session_id, run_id, iteration, mode, now, status),
             )
         return self.get_session(session_id)
 

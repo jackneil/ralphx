@@ -1,31 +1,98 @@
 """FastAPI application for RalphX API server."""
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request, status
+
+logger = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ralphx import __version__
-from ralphx.api.routes import auth, files, filesystem, imports, items, loops, projects, resources, runs, stream, templates
+from ralphx.api.routes import auth, files, filesystem, imports, items, logs, loops, projects, resources, runs, stream, templates
 from ralphx.core.workspace import ensure_workspace
 
 # Frontend dist directory (relative to this file)
 FRONTEND_DIR = Path(__file__).parent.parent.parent / "frontend" / "dist"
 
+# Token refresh interval: 30 minutes (aggressive to keep tokens fresh)
+TOKEN_REFRESH_INTERVAL = 1800
+
+# Log cleanup interval: 24 hours
+LOG_CLEANUP_INTERVAL = 86400
+
+
+async def _token_refresh_loop():
+    """Background task to refresh tokens every 30 minutes."""
+    while True:
+        await asyncio.sleep(TOKEN_REFRESH_INTERVAL)
+        try:
+            from ralphx.core.auth import refresh_all_expiring_tokens
+
+            # Refresh tokens within 4 hours of expiry (more aggressive)
+            result = await refresh_all_expiring_tokens(buffer_seconds=14400)
+            if result["refreshed"] > 0 or result["failed"] > 0:
+                logger.info(
+                    f"Token refresh: checked={result['checked']}, "
+                    f"refreshed={result['refreshed']}, failed={result['failed']}"
+                )
+        except Exception as e:
+            logger.warning(f"Token refresh error: {e}")
+
+
+async def _log_cleanup_loop():
+    """Background task to clean up old logs daily."""
+    from ralphx.core.database import Database
+
+    while True:
+        await asyncio.sleep(LOG_CLEANUP_INTERVAL)
+        try:
+            db = Database()
+            deleted = db.cleanup_old_logs(days=30)
+            if deleted > 0:
+                logger.info(f"Log cleanup: deleted {deleted} entries older than 30 days")
+        except Exception as e:
+            logger.warning(f"Log cleanup error: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
+    from ralphx.core.logger import system_log
+
     # Startup
     ensure_workspace()
+
+    # Start background tasks
+    refresh_task = asyncio.create_task(_token_refresh_loop())
+    cleanup_task = asyncio.create_task(_log_cleanup_loop())
+    logger.info("Started background tasks (token refresh, log cleanup)")
+
+    # Log server startup
+    system_log.info("startup", f"Server started (v{__version__})")
+
     yield
-    # Shutdown
-    pass
+
+    # Log server shutdown
+    system_log.info("shutdown", "Server stopped")
+
+    # Shutdown: cancel background tasks
+    refresh_task.cancel()
+    cleanup_task.cancel()
+    try:
+        await refresh_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(
@@ -139,6 +206,7 @@ app.include_router(templates.router, prefix="/api", tags=["templates"])
 app.include_router(imports.router, prefix="/api/projects", tags=["imports"])
 app.include_router(resources.router, prefix="/api/projects", tags=["resources"])
 app.include_router(files.router, prefix="/api/projects", tags=["files"])
+app.include_router(logs.router, prefix="/api", tags=["logs"])
 
 
 # Root endpoint

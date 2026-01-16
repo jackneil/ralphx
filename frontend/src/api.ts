@@ -93,6 +93,7 @@ export async function deleteProject(slug: string) {
 export async function cleanupProjects(pattern: string = '^e2e-', dryRun: boolean = true) {
   return request<{
     deleted: string[]
+    failed: string[]
     dry_run: boolean
   }>('/projects/cleanup', {
     method: 'POST',
@@ -929,6 +930,115 @@ export async function logoutAuth(req: LoginRequest): Promise<{ success: boolean 
   return request('/auth/logout', {
     method: 'POST',
     body: JSON.stringify(req),
+  })
+}
+
+export async function refreshAuthToken(req: LoginRequest): Promise<{ success: boolean; message?: string; error?: string; needs_relogin?: boolean }> {
+  return request('/auth/refresh', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  })
+}
+
+export interface CredentialsExport {
+  success: boolean
+  error?: string
+  scope?: string
+  email?: string
+  credentials?: {
+    claudeAiOauth: {
+      accessToken: string
+      refreshToken: string
+      expiresAt: number
+    }
+  }
+}
+
+export async function exportCredentials(
+  scope: 'project' | 'global' = 'global',
+  projectPath?: string
+): Promise<CredentialsExport> {
+  const params = new URLSearchParams({ scope })
+  if (projectPath) params.set('project_path', projectPath)
+  return request<CredentialsExport>(`/auth/credentials/export?${params}`)
+}
+
+export interface AuthValidationResult {
+  valid: boolean
+  error?: string
+  scope?: string
+  email?: string
+  refreshed?: boolean
+}
+
+export async function validateAuth(projectPath?: string): Promise<AuthValidationResult> {
+  const params = projectPath ? `?project_path=${encodeURIComponent(projectPath)}` : ''
+  return request<AuthValidationResult>(`/auth/validate${params}`)
+}
+
+// ============================================================================
+// Logs API
+// ============================================================================
+
+export interface LogEntry {
+  id: number
+  level: string
+  category: string | null
+  event: string | null
+  message: string
+  project_id: string | null
+  run_id: string | null
+  metadata: Record<string, unknown> | null
+  timestamp: string
+}
+
+export interface LogsResponse {
+  logs: LogEntry[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface LogStats {
+  total: number
+  by_level: Record<string, number>
+  by_category: Record<string, number>
+  recent_errors_24h: number
+}
+
+export interface LogFilters {
+  level?: string
+  category?: string
+  event?: string
+  project_id?: string
+  run_id?: string
+  since?: string
+  until?: string
+  limit?: number
+  offset?: number
+}
+
+export async function getLogs(filters: LogFilters = {}): Promise<LogsResponse> {
+  const params = new URLSearchParams()
+  if (filters.level) params.set('level', filters.level)
+  if (filters.category) params.set('category', filters.category)
+  if (filters.event) params.set('event', filters.event)
+  if (filters.project_id) params.set('project_id', filters.project_id)
+  if (filters.run_id) params.set('run_id', filters.run_id)
+  if (filters.since) params.set('since', filters.since)
+  if (filters.until) params.set('until', filters.until)
+  if (filters.limit) params.set('limit', String(filters.limit))
+  if (filters.offset) params.set('offset', String(filters.offset))
+  return request<LogsResponse>(`/logs?${params}`)
+}
+
+export async function getLogStats(): Promise<LogStats> {
+  return request<LogStats>('/logs/stats')
+}
+
+export async function cleanupLogs(days: number = 30): Promise<{ deleted: number; days: number }> {
+  return request<{ deleted: number; days: number }>(`/logs?days=${days}`, {
+    method: 'DELETE',
   })
 }
 

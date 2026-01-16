@@ -23,7 +23,7 @@ from ralphx.core.workspace import get_backups_path, get_database_path
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # SQL schema
 SCHEMA_SQL = """
@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS logs (
     project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
     run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
     level TEXT NOT NULL,
+    category TEXT DEFAULT 'system',
+    event TEXT DEFAULT 'log',
     message TEXT NOT NULL,
     metadata TEXT,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1298,78 +1300,6 @@ class Database:
             return cursor.rowcount > 0
 
     # =========================================================================
-    # Log Operations
-    # =========================================================================
-
-    def log(
-        self,
-        level: str,
-        message: str,
-        project_id: Optional[str] = None,
-        run_id: Optional[str] = None,
-        metadata: Optional[dict] = None,
-    ) -> int:
-        """Write a log entry."""
-        with self._writer() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO logs (project_id, run_id, level, message, metadata)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    project_id,
-                    run_id,
-                    level,
-                    message,
-                    json.dumps(metadata) if metadata else None,
-                ),
-            )
-            return cursor.lastrowid
-
-    def get_logs(
-        self,
-        project_id: Optional[str] = None,
-        run_id: Optional[str] = None,
-        level: Optional[str] = None,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[dict]:
-        """Get log entries with optional filters."""
-        conditions = []
-        params: list[Any] = []
-
-        if project_id:
-            conditions.append("project_id = ?")
-            params.append(project_id)
-        if run_id:
-            conditions.append("run_id = ?")
-            params.append(run_id)
-        if level:
-            conditions.append("level = ?")
-            params.append(level)
-
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-        params.extend([limit, offset])
-
-        with self._reader() as conn:
-            cursor = conn.execute(
-                f"""
-                SELECT * FROM logs
-                WHERE {where_clause}
-                ORDER BY timestamp DESC
-                LIMIT ? OFFSET ?
-                """,
-                params,
-            )
-            results = []
-            for row in cursor.fetchall():
-                item = dict(row)
-                if item.get("metadata"):
-                    item["metadata"] = json.loads(item["metadata"])
-                results.append(item)
-            return results
-
-    # =========================================================================
     # Credential Operations
     # =========================================================================
 
@@ -1499,6 +1429,19 @@ class Database:
             row = cursor.fetchone()
             return dict(row) if row else None
 
+    def get_all_credentials(self) -> list[dict]:
+        """Get all stored credentials (global + all projects).
+
+        Used by background token refresh task to check all credentials.
+
+        Returns:
+            List of credential dicts
+        """
+        with self._reader() as conn:
+            cursor = conn.execute("SELECT * FROM credentials")
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
     # Allowed columns for credential update operations
     _CREDENTIAL_UPDATE_COLS = frozenset({
         "access_token", "refresh_token", "expires_at", "updated_at", "email"
@@ -1551,6 +1494,244 @@ class Database:
                     "DELETE FROM credentials WHERE scope = 'global' AND project_id IS NULL"
                 )
             return cursor.rowcount > 0
+
+    # =========================================================================
+    # Log Operations
+    # =========================================================================
+
+    def log(
+        self,
+        level: str,
+        category: str,
+        event: str,
+        message: str,
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> int:
+        """Insert a log entry.
+
+        Args:
+            level: Log level (DEBUG, INFO, WARNING, ERROR)
+            category: Event category (auth, loop, run, iteration, system)
+            event: Specific event (login, created, started, completed, failed, etc.)
+            message: Human-readable log message
+            project_id: Associated project ID (optional)
+            run_id: Associated run ID (optional)
+            metadata: Additional structured data as dict (optional)
+
+        Returns:
+            The ID of the inserted log entry
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """INSERT INTO logs (level, category, event, message, project_id, run_id, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    level,
+                    category,
+                    event,
+                    message,
+                    project_id,
+                    run_id,
+                    json.dumps(metadata) if metadata else None,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_logs(
+        self,
+        level: Optional[str] = None,
+        category: Optional[str] = None,
+        event: Optional[str] = None,
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Query logs with filters. Returns newest first.
+
+        Args:
+            level: Filter by log level
+            category: Filter by category
+            event: Filter by event type
+            project_id: Filter by project
+            run_id: Filter by run
+            since: Only logs after this timestamp
+            until: Only logs before this timestamp
+            limit: Max rows to return (default 100)
+            offset: Rows to skip for pagination
+
+        Returns:
+            List of log entry dicts
+        """
+        conditions = []
+        params: list[Any] = []
+
+        if level:
+            conditions.append("level = ?")
+            params.append(level)
+        if category:
+            conditions.append("category = ?")
+            params.append(category)
+        if event:
+            conditions.append("event = ?")
+            params.append(event)
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if run_id:
+            conditions.append("run_id = ?")
+            params.append(run_id)
+        if since:
+            conditions.append("timestamp >= ?")
+            params.append(since.isoformat() if isinstance(since, datetime) else since)
+        if until:
+            conditions.append("timestamp <= ?")
+            params.append(until.isoformat() if isinstance(until, datetime) else until)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.extend([limit, offset])
+
+        with self._reader() as conn:
+            cursor = conn.execute(
+                f"""SELECT id, level, category, event, message, project_id, run_id,
+                           metadata, timestamp
+                    FROM logs
+                    WHERE {where_clause}
+                    ORDER BY timestamp DESC
+                    LIMIT ? OFFSET ?""",
+                params,
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": row[0],
+                    "level": row[1],
+                    "category": row[2],
+                    "event": row[3],
+                    "message": row[4],
+                    "project_id": row[5],
+                    "run_id": row[6],
+                    "metadata": json.loads(row[7]) if row[7] else None,
+                    "timestamp": row[8],
+                }
+                for row in rows
+            ]
+
+    def get_log_stats(self) -> dict:
+        """Get log statistics.
+
+        Returns:
+            Dict with counts by level, category, and recent error count
+        """
+        with self._reader() as conn:
+            # Count by level
+            cursor = conn.execute(
+                "SELECT level, COUNT(*) FROM logs GROUP BY level"
+            )
+            by_level = {row[0]: row[1] for row in cursor.fetchall()}
+
+            # Count by category
+            cursor = conn.execute(
+                "SELECT category, COUNT(*) FROM logs GROUP BY category"
+            )
+            by_category = {row[0]: row[1] for row in cursor.fetchall()}
+
+            # Recent errors (last 24 hours)
+            cursor = conn.execute(
+                """SELECT COUNT(*) FROM logs
+                   WHERE level = 'ERROR'
+                   AND timestamp >= datetime('now', '-1 day')"""
+            )
+            recent_errors = cursor.fetchone()[0]
+
+            # Total count
+            cursor = conn.execute("SELECT COUNT(*) FROM logs")
+            total = cursor.fetchone()[0]
+
+            return {
+                "total": total,
+                "by_level": by_level,
+                "by_category": by_category,
+                "recent_errors_24h": recent_errors,
+            }
+
+    def count_logs(
+        self,
+        level: Optional[str] = None,
+        category: Optional[str] = None,
+        event: Optional[str] = None,
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+    ) -> int:
+        """Count logs matching the given filters.
+
+        Args:
+            level: Filter by log level
+            category: Filter by category
+            event: Filter by event type
+            project_id: Filter by project
+            run_id: Filter by run
+            since: Only logs after this timestamp
+            until: Only logs before this timestamp
+
+        Returns:
+            Count of matching log entries
+        """
+        conditions = []
+        params: list[Any] = []
+
+        if level:
+            conditions.append("level = ?")
+            params.append(level)
+        if category:
+            conditions.append("category = ?")
+            params.append(category)
+        if event:
+            conditions.append("event = ?")
+            params.append(event)
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if run_id:
+            conditions.append("run_id = ?")
+            params.append(run_id)
+        if since:
+            conditions.append("timestamp >= ?")
+            params.append(since.isoformat() if isinstance(since, datetime) else since)
+        if until:
+            conditions.append("timestamp <= ?")
+            params.append(until.isoformat() if isinstance(until, datetime) else until)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        with self._reader() as conn:
+            cursor = conn.execute(
+                f"SELECT COUNT(*) FROM logs WHERE {where_clause}",
+                params,
+            )
+            return cursor.fetchone()[0]
+
+    def cleanup_old_logs(self, days: int = 30) -> int:
+        """Delete logs older than N days.
+
+        Args:
+            days: Delete logs older than this many days (default 30)
+
+        Returns:
+            Number of rows deleted
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "DELETE FROM logs WHERE timestamp < datetime('now', ?)",
+                (f"-{days} days",),
+            )
+            return cursor.rowcount
 
     # =========================================================================
     # Backup Operations
@@ -1648,6 +1829,23 @@ class Database:
             # Migration to v4: Add email column to credentials
             (4, """
                 ALTER TABLE credentials ADD COLUMN email TEXT;
+            """),
+            # Migration to v5: Add category and event columns to logs for structured logging
+            (5, """
+                -- Add category and event columns for structured logging
+                ALTER TABLE logs ADD COLUMN category TEXT DEFAULT 'system';
+                ALTER TABLE logs ADD COLUMN event TEXT DEFAULT 'log';
+
+                -- Indexes for common query patterns
+                CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_logs_category ON logs(category);
+                CREATE INDEX IF NOT EXISTS idx_logs_project ON logs(project_id);
+
+                -- Composite index for category+event queries (e.g., all auth.login events)
+                CREATE INDEX IF NOT EXISTS idx_logs_cat_event ON logs(category, event, timestamp DESC);
+
+                -- Composite index for run drilldown (all logs for a run, ordered)
+                CREATE INDEX IF NOT EXISTS idx_logs_run_time ON logs(run_id, timestamp);
             """),
         ]
 
