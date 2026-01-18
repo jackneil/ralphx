@@ -73,7 +73,7 @@ export default function PhaseProgress({
     )
   }
 
-  if (!phaseInfo || !phaseInfo.source_loop) {
+  if (!phaseInfo || !phaseInfo.source_step_id) {
     return (
       <div className="bg-gray-800 rounded-lg p-4 text-gray-400">
         Not a consumer loop - no phases to display
@@ -84,7 +84,7 @@ export default function PhaseProgress({
   if (phaseInfo.total_items === 0) {
     return (
       <div className="bg-gray-800 rounded-lg p-4 text-gray-400">
-        No items found from source loop: {phaseInfo.source_loop}
+        No items found from source step
       </div>
     )
   }
@@ -101,7 +101,7 @@ export default function PhaseProgress({
           Phase Progress
         </h3>
         <span className="text-sm text-gray-400">
-          Source: {phaseInfo.source_loop}
+          Step {phaseInfo.source_step_id}
         </span>
       </div>
 

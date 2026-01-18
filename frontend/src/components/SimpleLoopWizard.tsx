@@ -1,9 +1,15 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { createSimpleLoop, browseProjectFiles, readProjectFile, type SimpleLoopRequest } from '../api'
 
+interface LoopInfo {
+  name: string
+  display_name: string
+}
+
 interface SimpleLoopWizardProps {
   projectSlug: string
   availableLoops: string[]
+  existingLoopInfo?: LoopInfo[]  // Full loop info for duplicate name detection
   onClose: () => void
   onCreated: (loopName: string) => void
   onAdvanced: () => void
@@ -19,6 +25,7 @@ interface FileSelection {
 export default function SimpleLoopWizard({
   projectSlug,
   availableLoops,
+  existingLoopInfo = [],
   onClose,
   onCreated,
   onAdvanced,
@@ -28,6 +35,12 @@ export default function SimpleLoopWizard({
   const [displayName, setDisplayName] = useState('')
   const [description, setDescription] = useState('')
   const [error, setError] = useState<string | null>(null)
+
+  // Check if display name is a duplicate
+  const duplicateLoops = existingLoopInfo.filter(
+    loop => loop.display_name.toLowerCase() === displayName.toLowerCase()
+  )
+  const hasDuplicateName = duplicateLoops.length > 0
 
   // Planning state
   const [designDoc, setDesignDoc] = useState<FileSelection | null>(null)
@@ -356,9 +369,17 @@ export default function SimpleLoopWizard({
                   type="text"
                   value={displayName}
                   onChange={(e) => setDisplayName(e.target.value)}
-                  className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white"
+                  className={`w-full px-3 py-2 bg-gray-700 border rounded text-white ${
+                    hasDuplicateName ? 'border-yellow-500' : 'border-gray-600'
+                  }`}
                   placeholder="Planning"
                 />
+                {hasDuplicateName && (
+                  <p className="mt-1 text-xs text-yellow-400">
+                    Another loop uses this name ({duplicateLoops.map(l => l.name).join(', ')}).
+                    Consider a unique name to avoid confusion.
+                  </p>
+                )}
               </div>
 
               <div>
@@ -445,9 +466,17 @@ export default function SimpleLoopWizard({
                   type="text"
                   value={displayName}
                   onChange={(e) => setDisplayName(e.target.value)}
-                  className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white"
+                  className={`w-full px-3 py-2 bg-gray-700 border rounded text-white ${
+                    hasDuplicateName ? 'border-yellow-500' : 'border-gray-600'
+                  }`}
                   placeholder="Implementation"
                 />
+                {hasDuplicateName && (
+                  <p className="mt-1 text-xs text-yellow-400">
+                    Another loop uses this name ({duplicateLoops.map(l => l.name).join(', ')}).
+                    Consider a unique name to avoid confusion.
+                  </p>
+                )}
               </div>
 
               <div>

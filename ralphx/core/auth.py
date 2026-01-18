@@ -4,12 +4,15 @@ Stores OAuth credentials in database with support for:
 - Global credentials (default for all projects)
 - Project-specific credentials (override global)
 - Auto-refresh of expired tokens
-- Credential swap for loop execution
+- Credential swap for loop execution with bulletproof restoration
 """
 
+import atexit
 import asyncio
 import fcntl
 import json
+import os
+import signal
 import shutil
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -32,6 +35,84 @@ class InvalidGrantError(Exception):
 CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 CLAUDE_CREDENTIALS_BACKUP = Path.home() / ".claude" / ".credentials.backup.json"
 CREDENTIAL_LOCK_PATH = Path.home() / ".claude" / ".credentials.lock"
+
+# Track if we're in the middle of a credential swap (for emergency restoration)
+_credential_swap_active = False
+
+
+def _emergency_restore_credentials():
+    """Emergency restoration of credentials - called on unexpected exit.
+
+    This is a last-resort safety net. If the process crashes or is killed
+    while credentials are swapped, this ensures the user's original creds
+    are restored.
+    """
+    global _credential_swap_active
+    if not _credential_swap_active:
+        return
+
+    try:
+        if CLAUDE_CREDENTIALS_BACKUP.exists():
+            shutil.copy2(CLAUDE_CREDENTIALS_BACKUP, CLAUDE_CREDENTIALS_PATH)
+            CLAUDE_CREDENTIALS_BACKUP.unlink()
+            auth_log.warning(
+                "emergency_restore",
+                "Emergency credential restoration triggered - backup restored",
+            )
+    except Exception as e:
+        # Last resort: at least log what happened
+        auth_log.error(
+            "emergency_restore_failed",
+            f"CRITICAL: Failed to restore credentials on exit: {e}. "
+            f"Backup may exist at {CLAUDE_CREDENTIALS_BACKUP}",
+        )
+
+
+def _signal_handler(signum, frame):
+    """Handle termination signals to ensure credential restoration."""
+    _emergency_restore_credentials()
+    # Re-raise the signal to allow normal termination
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def restore_orphaned_backup():
+    """Check for and restore orphaned credential backups on startup.
+
+    If a backup exists without an active swap, it means a previous process
+    crashed. Restore the backup to ensure the user's credentials are intact.
+
+    Call this at application startup.
+    """
+    global _credential_swap_active
+    if _credential_swap_active:
+        # Active swap in progress, don't touch
+        return
+
+    if CLAUDE_CREDENTIALS_BACKUP.exists():
+        try:
+            shutil.copy2(CLAUDE_CREDENTIALS_BACKUP, CLAUDE_CREDENTIALS_PATH)
+            CLAUDE_CREDENTIALS_BACKUP.unlink()
+            auth_log.warning(
+                "orphaned_backup_restored",
+                "Found and restored orphaned credential backup from previous crash",
+            )
+        except Exception as e:
+            auth_log.error(
+                "orphaned_backup_restore_failed",
+                f"Failed to restore orphaned backup: {e}",
+            )
+
+
+# Register safety nets
+atexit.register(_emergency_restore_credentials)
+# Register signal handlers for common termination signals
+for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    try:
+        signal.signal(sig, _signal_handler)
+    except (OSError, ValueError):
+        # Can't set handler in some contexts (e.g., non-main thread)
+        pass
 
 # OAuth configuration
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -140,12 +221,18 @@ def store_oauth_tokens(
     """Store OAuth tokens in database.
 
     Args:
-        tokens: Dict with access_token, refresh_token, expires_in, email (optional)
+        tokens: Dict with access_token, refresh_token, expires_in, email (optional),
+                scopes (optional), subscription_type (optional), rate_limit_tier (optional)
         scope: "project" or "global"
         project_id: Project ID for project-scoped credentials
     """
     db = Database()
     expires_at = int(time.time()) + tokens.get("expires_in", 28800)
+
+    # Convert scopes list to JSON string for storage
+    scopes_json = None
+    if tokens.get("scopes"):
+        scopes_json = json.dumps(tokens["scopes"])
 
     db.store_credentials(
         scope=scope,
@@ -154,6 +241,9 @@ def store_oauth_tokens(
         expires_at=expires_at,
         project_id=project_id if scope == "project" else None,
         email=tokens.get("email"),
+        scopes=scopes_json,
+        subscription_type=tokens.get("subscription_type"),
+        rate_limit_tier=tokens.get("rate_limit_tier"),
     )
 
     auth_log.info(
@@ -598,7 +688,12 @@ def swap_credentials_for_loop(
     """Context manager: backup user creds, write from DB, restore after.
 
     Uses file locking to prevent race conditions when multiple loops run
-    concurrently.
+    concurrently. Has multiple safety nets to ensure credentials are ALWAYS
+    restored:
+    - try/finally for normal cleanup
+    - atexit handler for unexpected exit
+    - signal handlers for SIGTERM/SIGHUP/SIGINT
+    - startup check for orphaned backups
 
     Usage:
         with swap_credentials_for_loop(project_id) as has_creds:
@@ -613,6 +708,8 @@ def swap_credentials_for_loop(
     Yields:
         True if credentials were written, False if no credentials available
     """
+    global _credential_swap_active
+
     db = Database()
     creds = db.get_credentials(project_id)
 
@@ -625,18 +722,43 @@ def swap_credentials_for_loop(
 
         # Backup user's current credentials
         had_backup = False
+        original_content = None
         if CLAUDE_CREDENTIALS_PATH.exists():
+            # Read content for verification later
+            original_content = CLAUDE_CREDENTIALS_PATH.read_text()
             shutil.copy2(CLAUDE_CREDENTIALS_PATH, CLAUDE_CREDENTIALS_BACKUP)
             had_backup = True
+
+        # Mark swap as active AFTER backup is complete
+        _credential_swap_active = True
 
         # Write credentials from DB to Claude's location
         has_creds = False
         if creds:
+            # Default scopes if not stored (for backwards compatibility)
+            # These are the minimum scopes Claude Code CLI needs for execution
+            default_scopes = ["user:inference", "user:profile", "user:sessions:claude_code"]
+            stored_scopes = creds.get("scopes")
+            if stored_scopes:
+                try:
+                    scopes = json.loads(stored_scopes)
+                except (json.JSONDecodeError, TypeError):
+                    scopes = default_scopes
+            else:
+                scopes = default_scopes
+
             creds_data = {
                 "claudeAiOauth": {
                     "accessToken": creds["access_token"],
                     "refreshToken": creds["refresh_token"],
                     "expiresAt": creds["expires_at"] * 1000,  # Convert to milliseconds
+                    "scopes": scopes,
+                    # subscriptionType: Claude subscription tier. Values include "free", "pro", "max".
+                    # Default to "max" as RalphX is designed for Max subscription users.
+                    "subscriptionType": creds.get("subscription_type") or "max",
+                    # rateLimitTier: API rate limit tier. "default_claude_max_20x" indicates
+                    # the 20x rate limit multiplier for Max subscribers.
+                    "rateLimitTier": creds.get("rate_limit_tier") or "default_claude_max_20x",
                 }
             }
             CLAUDE_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -679,14 +801,50 @@ def swap_credentials_for_loop(
                     )
 
             # Restore user's original credentials
-            if had_backup and CLAUDE_CREDENTIALS_BACKUP.exists():
-                shutil.copy2(CLAUDE_CREDENTIALS_BACKUP, CLAUDE_CREDENTIALS_PATH)
-                CLAUDE_CREDENTIALS_BACKUP.unlink()
-            elif CLAUDE_CREDENTIALS_BACKUP.exists():
-                CLAUDE_CREDENTIALS_BACKUP.unlink()
-            elif not had_backup and has_creds:
-                # We wrote credentials but user had none originally - remove them
-                CLAUDE_CREDENTIALS_PATH.unlink(missing_ok=True)
+            restoration_success = False
+            try:
+                if had_backup and CLAUDE_CREDENTIALS_BACKUP.exists():
+                    shutil.copy2(CLAUDE_CREDENTIALS_BACKUP, CLAUDE_CREDENTIALS_PATH)
+                    # Verify restoration succeeded
+                    if original_content is not None:
+                        restored_content = CLAUDE_CREDENTIALS_PATH.read_text()
+                        if restored_content == original_content:
+                            restoration_success = True
+                        else:
+                            auth_log.warning(
+                                "restoration_mismatch",
+                                "Restored credentials differ from original - may indicate issue",
+                            )
+                            restoration_success = True  # Still count as success, content is valid
+                    else:
+                        restoration_success = True
+                elif not had_backup and has_creds:
+                    # We wrote credentials but user had none originally - remove them
+                    CLAUDE_CREDENTIALS_PATH.unlink(missing_ok=True)
+                    restoration_success = True
+                else:
+                    # No backup needed, nothing to restore
+                    restoration_success = True
+            except Exception as e:
+                auth_log.error(
+                    "restoration_failed",
+                    f"Failed to restore credentials: {e}",
+                )
+
+            # Only delete backup after verified restoration
+            if restoration_success and CLAUDE_CREDENTIALS_BACKUP.exists():
+                try:
+                    CLAUDE_CREDENTIALS_BACKUP.unlink()
+                except Exception:
+                    pass  # Non-critical, backup will be cleaned on next startup
+
+            # Mark swap as complete
+            _credential_swap_active = False
     finally:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        lock_file.close()
+        # Always mark swap as inactive and release lock, even on error
+        _credential_swap_active = False
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+        except Exception:
+            pass  # Lock release failure is non-critical

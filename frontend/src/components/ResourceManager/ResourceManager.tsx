@@ -14,14 +14,17 @@ interface ResourceManagerProps {
 }
 
 const RESOURCE_TYPES = [
+  { value: 'loop_template', label: 'Loop Template', description: 'Base loop instructions (main driving prompt)' },
   { value: 'design_doc', label: 'Design Document', description: 'Project design and requirements' },
   { value: 'architecture', label: 'Architecture', description: 'System architecture docs' },
   { value: 'coding_standards', label: 'Coding Standards', description: 'Coding guidelines and rules' },
   { value: 'domain_knowledge', label: 'Domain Knowledge', description: 'Domain-specific context' },
+  { value: 'guardrails', label: 'Guardrails', description: 'Quality rules and constraints' },
   { value: 'custom', label: 'Custom', description: 'Other resources' },
 ]
 
 const INJECTION_POSITIONS = [
+  { value: 'template_body', label: 'Template Body', description: 'The base template itself' },
   { value: 'before_prompt', label: 'Before Prompt', description: 'At the very start' },
   { value: 'after_design_doc', label: 'After Design Doc', description: 'After design context' },
   { value: 'before_task', label: 'Before Task', description: 'Before task instructions' },

@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
-import { listItems, getItemsStats, createItem, getProject, listLoops, Item, ItemTypes } from '../api'
+import { listItems, getItemsStats, getProject, listLoops, Item, ItemTypes } from '../api'
 import { useDashboardStore } from '../stores/dashboard'
 import WorkItemCard from '../components/WorkItemCard'
 import WorkItemFilters from '../components/WorkItemFilters'
@@ -14,7 +14,7 @@ const DEFAULT_TERMINOLOGY = {
 // Re-export as Items page (renamed from WorkItems)
 export default function Items() {
   const { slug } = useParams<{ slug: string }>()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const [searchParams] = useSearchParams()
   const { selectedProject, setSelectedProject } = useDashboardStore()
 
   const [items, setItems] = useState<Item[]>([])
@@ -22,34 +22,28 @@ export default function Items() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  // Loop terminology mapping
-  const [loopTerminology, setLoopTerminology] = useState<Map<string, ItemTypes>>(new Map())
-  const [availableLoops, setAvailableLoops] = useState<string[]>([])
+  // Loop terminology mapping (reserved for future use)
+  const [_loopTerminology, setLoopTerminology] = useState<Map<string, ItemTypes>>(new Map())
+  const [_availableLoops, setAvailableLoops] = useState<string[]>([])
 
   // Filters
   const [statusFilter, setStatusFilter] = useState('all')
   const [categoryFilter, setCategoryFilter] = useState('')
-  const sourceLoopFilter = searchParams.get('source_loop') || ''
+  const workflowIdFilter = searchParams.get('workflow_id') || ''
   const [categories, setCategories] = useState<string[]>([])
 
   // Pagination
   const [offset, setOffset] = useState(0)
   const limit = 20
 
-  // Add Item
-  const [showAddForm, setShowAddForm] = useState(false)
-  const [newContent, setNewContent] = useState('')
-  const [newCategory, setNewCategory] = useState('')
-  const [addingItem, setAddingItem] = useState(false)
+  // Add Item - Disabled in cross-workflow view (items require workflow context)
+  // Use workflow-specific /workflows/{id}/items page to add items
 
   // Get terminology for current context
   const currentTerminology = useMemo(() => {
-    if (sourceLoopFilter && loopTerminology.has(sourceLoopFilter)) {
-      const terms = loopTerminology.get(sourceLoopFilter)!
-      return terms.output || DEFAULT_TERMINOLOGY
-    }
+    // Use default terminology since we now filter by workflow, not loop
     return DEFAULT_TERMINOLOGY
-  }, [sourceLoopFilter, loopTerminology])
+  }, [])
 
   // Capitalize first letter helper
   const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
@@ -62,7 +56,7 @@ export default function Items() {
       const result = await listItems(slug, {
         status: statusFilter === 'all' ? undefined : statusFilter,
         category: categoryFilter || undefined,
-        source_loop: sourceLoopFilter || undefined,
+        workflow_id: workflowIdFilter || undefined,
         limit,
         offset,
       })
@@ -73,7 +67,7 @@ export default function Items() {
     } finally {
       setLoading(false)
     }
-  }, [slug, statusFilter, categoryFilter, sourceLoopFilter, offset])
+  }, [slug, statusFilter, categoryFilter, workflowIdFilter, offset])
 
   const loadStats = useCallback(async () => {
     if (!slug) return
@@ -125,43 +119,16 @@ export default function Items() {
     loadItems()
   }, [loadItems])
 
-  const handleSourceLoopChange = (loop: string) => {
-    setOffset(0)
-    if (loop) {
-      setSearchParams({ source_loop: loop })
-    } else {
-      setSearchParams({})
-    }
-  }
-
-  const handleAddItem = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!slug || !newContent.trim()) return
-
-    setAddingItem(true)
-    try {
-      await createItem(slug, {
-        content: newContent.trim(),
-        category: newCategory.trim() || undefined,
-      })
-      setNewContent('')
-      setNewCategory('')
-      setShowAddForm(false)
-      loadItems()
-      loadStats()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to add item')
-    } finally {
-      setAddingItem(false)
-    }
-  }
+  // NOTE: Adding items from this cross-workflow view is disabled.
+  // Work items require a workflow context (workflow_id and source_step_id).
+  // Use the workflow-specific /workflows/{id}/items page to add items.
 
   const totalPages = Math.ceil(total / limit)
   const currentPage = Math.floor(offset / limit) + 1
 
   // Dynamic page title
-  const pageTitle = sourceLoopFilter
-    ? `${capitalize(currentTerminology.plural)} from ${sourceLoopFilter}`
+  const pageTitle = workflowIdFilter
+    ? `${capitalize(currentTerminology.plural)} from workflow ${workflowIdFilter.slice(0, 8)}`
     : 'Items'
 
   return (
@@ -185,69 +152,15 @@ export default function Items() {
             {total} total {total === 1 ? currentTerminology.singular : currentTerminology.plural}
           </p>
         </div>
-        <button
-          onClick={() => setShowAddForm(true)}
-          className="flex items-center space-x-2 px-4 py-2 bg-primary-600 text-white rounded hover:bg-primary-500"
-        >
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-          </svg>
-          <span>Add {capitalize(currentTerminology.singular)}</span>
-        </button>
+        {/* Add button disabled in cross-workflow view - items require workflow context */}
+        <span className="text-sm text-gray-500" title="Use workflow-specific items page to add items">
+          Adding items requires workflow context
+        </span>
       </div>
 
-      {/* Add Item Form */}
-      {showAddForm && (
-        <div className="card mb-6">
-          <h3 className="text-lg font-semibold text-white mb-4">
-            Add New {capitalize(currentTerminology.singular)}
-          </h3>
-          <form onSubmit={handleAddItem} className="space-y-4">
-            <div>
-              <label htmlFor="new-content" className="block text-sm font-medium text-gray-300 mb-1">
-                Content
-              </label>
-              <textarea
-                id="new-content"
-                value={newContent}
-                onChange={(e) => setNewContent(e.target.value)}
-                placeholder={`${capitalize(currentTerminology.singular)} content...`}
-                rows={3}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white placeholder-gray-400 focus:outline-none focus:border-primary-500"
-              />
-            </div>
-            <div>
-              <label htmlFor="new-category" className="block text-sm font-medium text-gray-300 mb-1">
-                Category (optional)
-              </label>
-              <input
-                id="new-category"
-                type="text"
-                value={newCategory}
-                onChange={(e) => setNewCategory(e.target.value)}
-                placeholder="e.g., bug, feature, docs"
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white placeholder-gray-400 focus:outline-none focus:border-primary-500"
-              />
-            </div>
-            <div className="flex justify-end space-x-3">
-              <button
-                type="button"
-                onClick={() => setShowAddForm(false)}
-                className="px-4 py-2 text-sm rounded bg-gray-700 text-gray-300 hover:bg-gray-600"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={addingItem || !newContent.trim()}
-                className="px-4 py-2 text-sm rounded bg-primary-600 text-white hover:bg-primary-500 disabled:opacity-50"
-              >
-                {addingItem ? 'Adding...' : `Add ${capitalize(currentTerminology.singular)}`}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
+      {/* Add Item Form - Disabled in cross-workflow view
+          Work items require workflow context. Use /workflows/{id}/items to add items.
+      */}
 
       {/* Filters */}
       <div className="mb-4">
@@ -259,33 +172,7 @@ export default function Items() {
           onCategoryChange={(c) => { setCategoryFilter(c); setOffset(0) }}
         />
 
-        {/* Source Loop Filter */}
-        {availableLoops.length > 0 && (
-          <div className="mt-3 flex items-center space-x-3">
-            <label htmlFor="source-loop-filter" className="text-sm text-gray-400">
-              Source Loop:
-            </label>
-            <select
-              id="source-loop-filter"
-              value={sourceLoopFilter}
-              onChange={(e) => handleSourceLoopChange(e.target.value)}
-              className="px-3 py-1.5 text-sm bg-gray-700 border border-gray-600 rounded text-white focus:outline-none focus:border-primary-500"
-            >
-              <option value="">All Loops</option>
-              {availableLoops.map((loop) => {
-                const terms = loopTerminology.get(loop)
-                const label = terms?.output?.plural
-                  ? `${loop} (${terms.output.plural})`
-                  : loop
-                return (
-                  <option key={loop} value={loop}>
-                    {label}
-                  </option>
-                )
-              })}
-            </select>
-          </div>
-        )}
+        {/* Workflow Filter - can be added when workflows are available */}
       </div>
 
       {/* Error */}
@@ -301,7 +188,7 @@ export default function Items() {
       ) : items.length === 0 ? (
         <div className="card text-center py-8">
           <p className="text-gray-400">No {currentTerminology.plural} found</p>
-          {(statusFilter !== 'all' || categoryFilter || sourceLoopFilter) && (
+          {(statusFilter !== 'all' || categoryFilter || workflowIdFilter) && (
             <p className="text-sm text-gray-500 mt-2">
               Try changing your filters
             </p>
@@ -315,10 +202,6 @@ export default function Items() {
               projectSlug={slug!}
               item={item}
               onUpdate={loadItems}
-              terminology={item.source_loop && loopTerminology.has(item.source_loop)
-                ? loopTerminology.get(item.source_loop)!.output
-                : undefined
-              }
             />
           ))}
         </div>

@@ -380,6 +380,7 @@ class GitConfig(BaseModel):
     auto_commit: bool = False
     commit_template: Optional[str] = None
     branch: Optional[str] = None
+    fail_on_error: bool = False  # If True, fail iteration on git error
 
 
 class AuthConfig(BaseModel):

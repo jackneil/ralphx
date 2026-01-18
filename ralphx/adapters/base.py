@@ -65,6 +65,9 @@ class ExecutionResult:
     text_output: str = ""
     tool_calls: list = field(default_factory=list)
 
+    # Structured output (from --json-schema)
+    structured_output: Optional[dict] = None
+
     # Extracted items (work items parsed from output)
     items: list = field(default_factory=list)
 
@@ -96,6 +99,7 @@ class LLMAdapter(ABC):
         model: str = "sonnet",
         tools: Optional[list[str]] = None,
         timeout: int = 300,
+        json_schema: Optional[dict] = None,
     ) -> ExecutionResult:
         """Execute a prompt and return the result.
 
@@ -104,6 +108,8 @@ class LLMAdapter(ABC):
             model: Model identifier (e.g., "sonnet", "opus", "haiku").
             tools: List of tool names to enable.
             timeout: Timeout in seconds.
+            json_schema: Optional JSON schema for structured output validation.
+                        When provided, the result will include structured_output.
 
         Returns:
             ExecutionResult with session info and output.
@@ -117,6 +123,7 @@ class LLMAdapter(ABC):
         model: str = "sonnet",
         tools: Optional[list[str]] = None,
         timeout: int = 300,
+        json_schema: Optional[dict] = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream execution events.
 
@@ -125,6 +132,9 @@ class LLMAdapter(ABC):
             model: Model identifier.
             tools: List of tool names to enable.
             timeout: Timeout in seconds.
+            json_schema: Optional JSON schema for structured output.
+                        Note: streaming with json_schema uses non-streaming
+                        internally and emits result at end.
 
         Yields:
             StreamEvent objects as execution progresses.

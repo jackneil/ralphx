@@ -15,22 +15,22 @@ interface Step {
 const STEPS: Step[] = [
   {
     title: 'Create a Project',
-    description: 'Point RalphX at a directory to start managing loops for that codebase.',
+    description: 'Point RalphX at a directory to start managing workflows for that codebase.',
     icon: 'M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z',
   },
   {
-    title: 'Configure a Loop',
-    description: 'Create loops that define how your AI agent iterates - modes, limits, and item types.',
+    title: 'Create a Workflow',
+    description: 'Set up workflows that define how Claude processes your work items.',
     icon: 'M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15',
   },
   {
     title: 'Add Items',
-    description: 'Create items for your loops to process - stories, tasks, or any work units you define.',
+    description: 'Create items for your workflows to process - stories, tasks, or any work units you define.',
     icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4',
   },
   {
-    title: 'Run Your Loop',
-    description: 'Start the loop and watch as the AI agent processes items according to your configuration.',
+    title: 'Run Your Workflow',
+    description: 'Start the workflow and watch as Claude processes items according to your configuration.',
     icon: 'M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z',
   },
 ]
@@ -67,7 +67,7 @@ export default function GettingStarted({ onDismiss, storageKey = 'ralphx-onboard
         <div>
           <h2 className="text-xl font-semibold text-white mb-1">Welcome to RalphX</h2>
           <p className="text-gray-400">
-            Get started with AI-powered development loops in a few simple steps.
+            Get started with AI-powered development workflows in a few simple steps.
           </p>
         </div>
         <button

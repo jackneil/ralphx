@@ -7,7 +7,9 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
+from ralphx.core.loop import LoopLoader
 from ralphx.core.project import ProjectManager
+from ralphx.core.project_db import ProjectDatabase
 from ralphx.models.project import Project
 
 router = APIRouter()
@@ -52,6 +54,12 @@ class ProjectStats(BaseModel):
 
     total: int = 0
     by_status: dict[str, int] = Field(default_factory=dict)
+    # Frontend-friendly aliases
+    total_items: int = 0
+    pending_items: int = 0
+    completed_items: int = 0
+    loops: int = 0
+    active_runs: int = 0
 
 
 class ProjectWithStats(ProjectResponse):
@@ -125,6 +133,28 @@ async def get_project(slug: str):
 
     # Get stats
     stats_data = manager.get_project_stats(slug) or {"total": 0, "by_status": {}}
+    by_status = stats_data.get("by_status", {})
+
+    # Get loops count using LoopLoader
+    project_db = ProjectDatabase(project.path)
+    loader = LoopLoader(db=project_db)
+    loops = loader.list_loops()
+    loops_count = len(loops)
+
+    # Count active runs - check run status for each loop
+    # For now, just set to 0 since we'd need to check the runs table
+    active_runs = 0
+
+    # Build stats with frontend-friendly fields
+    stats = ProjectStats(
+        total=stats_data.get("total", 0),
+        by_status=by_status,
+        total_items=stats_data.get("total", 0),
+        pending_items=by_status.get("pending", 0),
+        completed_items=by_status.get("completed", 0),
+        loops=loops_count,
+        active_runs=active_runs,
+    )
 
     # Create base response first
     base = ProjectResponse.from_project(project)
@@ -135,7 +165,7 @@ async def get_project(slug: str):
         path=base.path,
         design_doc=base.design_doc,
         created_at=base.created_at,
-        stats=ProjectStats(**stats_data),
+        stats=stats,
     )
     return response
 

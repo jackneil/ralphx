@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -9,13 +10,25 @@ from typing import Any
 
 from fastapi import FastAPI, Request, status
 
+# Configure logging to file and console
+LOG_FILE = Path("/tmp/ralphx-server.log")
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode="a"),
+        logging.StreamHandler(sys.stderr),
+    ],
+)
 logger = logging.getLogger(__name__)
+logger.info(f"RalphX API server starting - logging to {LOG_FILE}")
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ralphx import __version__
-from ralphx.api.routes import auth, files, filesystem, imports, items, logs, loops, projects, resources, runs, stream, templates
+from ralphx.api.routes import auth, config, files, filesystem, imports, items, logs, loops, planning, projects, resources, runs, stream, templates, workflows
+from ralphx.core.auth import restore_orphaned_backup
 from ralphx.core.workspace import ensure_workspace
 
 # Frontend dist directory (relative to this file)
@@ -68,6 +81,10 @@ async def lifespan(app: FastAPI):
 
     # Startup
     ensure_workspace()
+
+    # Restore any orphaned credential backups from previous crashes
+    # This ensures user's main credentials are ALWAYS restored
+    restore_orphaned_backup()
 
     # Start background tasks
     refresh_task = asyncio.create_task(_token_refresh_loop())
@@ -207,6 +224,9 @@ app.include_router(imports.router, prefix="/api/projects", tags=["imports"])
 app.include_router(resources.router, prefix="/api/projects", tags=["resources"])
 app.include_router(files.router, prefix="/api/projects", tags=["files"])
 app.include_router(logs.router, prefix="/api", tags=["logs"])
+app.include_router(config.router, prefix="/api/projects", tags=["config"])
+app.include_router(workflows.router, prefix="/api/projects/{slug}", tags=["workflows"])
+app.include_router(planning.router, prefix="/api/projects/{slug}", tags=["planning"])
 
 
 # Root endpoint

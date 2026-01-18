@@ -403,52 +403,66 @@ After completing implementation, return a summary as JSON:
 
 IMPLEMENTATION_IMPLEMENT_PROMPT = """# Story Implementation Mode
 
-You are implementing a single user story.
+You are implementing a single user story from a backlog.
 
-## Story to Implement
+## Current Story to Implement
 
-{{story_json}}
+**Title:** {{input_item.title}}
 
-## Architecture Context
+**Content:**
+{{input_item.content}}
 
-{{architecture_context}}
+**Metadata:**
+{{input_item.metadata}}
 
-## Phase 1 Foundation
-
-The following infrastructure is already in place:
-{{phase1_summary}}
+{{implemented_summary}}
 
 ## Your Task
 
 1. Read the story and its acceptance criteria carefully
-2. Review relevant existing code
-3. Implement the story
-4. Write tests for the implementation
+2. Review relevant existing code for context and patterns
+3. Implement the feature following existing code conventions
+4. Write/update tests for your changes
 5. Verify acceptance criteria are met
-
-## Guidelines
-
-- Build on existing patterns from Phase 1
-- Follow project code conventions
-- Keep changes focused on this story
-- Run relevant tests to verify
+6. Commit your changes with a descriptive message
 
 ## Output Format
 
-After completing implementation, return a summary as JSON:
+After completing implementation, you MUST return your result as structured JSON:
+
 ```json
 {
-  "story_id": "STORY-XXX",
-  "status": "completed",
-  "files_created": [],
-  "files_modified": [],
-  "tests_added": [],
-  "acceptance_criteria_met": {
-    "criterion_1": true,
-    "criterion_2": true
-  },
-  "notes": "Any relevant observations"
+  "status": "implemented",
+  "summary": "Brief description of what was implemented",
+  "files_changed": ["path/to/file1.py", "path/to/file2.py"],
+  "tests_passed": true,
+  "reason": null
 }
+```
+
+### Status Values
+
+- **implemented**: Successfully implemented the story
+- **duplicate**: This story duplicates another (set `duplicate_of` to the original story ID)
+- **external**: Requires work in an external system (set `external_system` and `reason`)
+- **skipped**: Cannot implement for a valid reason (set `reason`)
+- **error**: Technical error prevented implementation (set `reason`)
+
+### Example Responses
+
+Implemented successfully:
+```json
+{"status": "implemented", "summary": "Added user profile page with avatar upload", "files_changed": ["src/pages/profile.tsx", "src/api/upload.ts"], "tests_passed": true}
+```
+
+Duplicate of another story:
+```json
+{"status": "duplicate", "duplicate_of": "FND-003", "reason": "This is covered by the user profile story FND-003"}
+```
+
+Requires external system:
+```json
+{"status": "external", "external_system": "Stripe Dashboard", "reason": "Webhook configuration must be done in Stripe Dashboard, not code"}
 ```
 """
 
@@ -659,7 +673,7 @@ limits:
 
 def generate_simple_implementation_config(
     name: str,
-    source_loop: Optional[str] = None,
+    namespace: Optional[str] = None,
     display_name: str = "Implementation",
     description: str = "",
 ) -> str:
@@ -667,14 +681,14 @@ def generate_simple_implementation_config(
 
     Args:
         name: Unique loop ID (auto-generated, e.g., implementation-20260115_1).
-        source_loop: Name of planning loop to consume stories from.
+        namespace: Namespace to consume stories from.
         display_name: User-facing name (can be duplicated across loops).
         description: Optional user-provided description.
 
     Returns:
         YAML configuration string.
     """
-    source_section = f"    source: {source_loop}" if source_loop else ""
+    source_section = f"    source: {namespace}" if namespace else ""
     desc_line = description if description else "Implement user stories as working code"
 
     return f"""name: {name}

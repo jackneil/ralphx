@@ -23,7 +23,9 @@ from ralphx.core.workspace import get_backups_path, get_database_path
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 5
+# NOTE: When the initial schema is updated, also update this version and ensure
+# migrations are idempotent (use IF EXISTS / IF NOT EXISTS clauses).
+SCHEMA_VERSION = 8
 
 # SQL schema
 SCHEMA_SQL = """
@@ -85,7 +87,7 @@ CREATE TABLE IF NOT EXISTS work_items (
     category TEXT,
     tags TEXT,
     metadata TEXT,
-    source_loop TEXT,
+    namespace TEXT,  -- Renamed from source_loop: groups items by domain
     item_type TEXT DEFAULT 'item',
     claimed_by TEXT,
     claimed_at TIMESTAMP,
@@ -128,7 +130,7 @@ CREATE TABLE IF NOT EXISTS guardrails (
 CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-    run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+    run_id TEXT,  -- No FK constraint; runs exist in project databases, not here
     level TEXT NOT NULL,
     category TEXT DEFAULT 'system',
     event TEXT DEFAULT 'log',
@@ -152,6 +154,9 @@ CREATE TABLE IF NOT EXISTS credentials (
     refresh_token TEXT,
     expires_at INTEGER NOT NULL,  -- Unix timestamp (seconds)
     email TEXT,  -- User's email address from profile
+    scopes TEXT,  -- JSON array of OAuth scopes (e.g., '["user:inference", "user:profile"]')
+    subscription_type TEXT,  -- Claude subscription tier ("free", "pro", "max")
+    rate_limit_tier TEXT,  -- API rate limit tier (e.g., "default_claude_max_20x")
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(scope, project_id)  -- One credential per scope/project
@@ -164,7 +169,7 @@ CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(project_id, statu
 CREATE INDEX IF NOT EXISTS idx_work_items_category ON work_items(project_id, category);
 CREATE INDEX IF NOT EXISTS idx_work_items_priority ON work_items(project_id, priority);
 CREATE INDEX IF NOT EXISTS idx_work_items_created ON work_items(project_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_work_items_source_loop ON work_items(project_id, source_loop, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_namespace ON work_items(project_id, namespace, status);
 CREATE INDEX IF NOT EXISTS idx_work_items_claimed ON work_items(project_id, claimed_by, claimed_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_run ON sessions(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, status);
@@ -676,7 +681,7 @@ class Database:
         category: Optional[str] = None,
         tags: Optional[list[str]] = None,
         metadata: Optional[dict] = None,
-        source_loop: Optional[str] = None,
+        namespace: Optional[str] = None,
         item_type: Optional[str] = None,
     ) -> str:
         """Create a new work item.
@@ -690,7 +695,7 @@ class Database:
             category: Optional category.
             tags: Optional list of tags.
             metadata: Optional metadata dictionary.
-            source_loop: Name of the loop that created this item.
+            namespace: Namespace for grouping items (typically loop name).
             item_type: Semantic type from the loop's item_types.output.singular.
         """
         now = datetime.utcnow().isoformat()
@@ -699,7 +704,7 @@ class Database:
                 """
                 INSERT INTO work_items
                 (id, project_id, priority, content, status, category, tags, metadata,
-                 source_loop, item_type, created_at, updated_at)
+                 namespace, item_type, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -711,7 +716,7 @@ class Database:
                     category,
                     json.dumps(tags) if tags else None,
                     json.dumps(metadata) if metadata else None,
-                    source_loop,
+                    namespace,
                     item_type or "item",
                     now,
                     now,
@@ -742,7 +747,7 @@ class Database:
         project_id: str,
         status: Optional[str] = None,
         category: Optional[str] = None,
-        source_loop: Optional[str] = None,
+        namespace: Optional[str] = None,
         claimed_by: Optional[str] = None,
         unclaimed_only: bool = False,
         limit: int = 100,
@@ -754,7 +759,7 @@ class Database:
             project_id: Filter by project.
             status: Filter by status.
             category: Filter by category.
-            source_loop: Filter by source loop name.
+            namespace: Filter by namespace.
             claimed_by: Filter by claiming loop.
             unclaimed_only: If True, only return items where claimed_by is NULL.
             limit: Max items to return.
@@ -769,9 +774,9 @@ class Database:
         if category:
             conditions.append("category = ?")
             params.append(category)
-        if source_loop:
-            conditions.append("source_loop = ?")
-            params.append(source_loop)
+        if namespace:
+            conditions.append("namespace = ?")
+            params.append(namespace)
         if claimed_by:
             conditions.append("claimed_by = ?")
             params.append(claimed_by)
@@ -806,7 +811,7 @@ class Database:
         project_id: str,
         status: Optional[str] = None,
         category: Optional[str] = None,
-        source_loop: Optional[str] = None,
+        namespace: Optional[str] = None,
     ) -> int:
         """Count work items with optional filters."""
         conditions = ["project_id = ?"]
@@ -818,9 +823,9 @@ class Database:
         if category:
             conditions.append("category = ?")
             params.append(category)
-        if source_loop:
-            conditions.append("source_loop = ?")
-            params.append(source_loop)
+        if namespace:
+            conditions.append("namespace = ?")
+            params.append(namespace)
 
         where_clause = " AND ".join(conditions)
 
@@ -834,7 +839,7 @@ class Database:
     # Allowed columns for work item update operations
     _WORK_ITEM_UPDATE_COLS = frozenset({
         "priority", "content", "status", "category", "tags", "metadata", "updated_at",
-        "source_loop", "item_type", "claimed_by", "claimed_at", "processed_at"
+        "namespace", "item_type", "claimed_by", "claimed_at", "processed_at"
     })
 
     def update_work_item(self, project_id: str, id: str, **kwargs) -> bool:
@@ -1018,28 +1023,33 @@ class Database:
             )
             return cursor.rowcount > 0
 
-    def get_source_item_counts(self, project_id: str) -> dict[str, int]:
-        """Get counts of completed items grouped by source_loop.
+    def get_namespace_item_counts(self, project_id: str) -> dict[str, int]:
+        """Get counts of completed items grouped by namespace.
 
-        Used for dashboard to show available items per producer loop.
+        Used for dashboard to show available items per namespace.
 
         Returns:
-            Dict mapping source_loop name to count of completed items.
+            Dict mapping namespace to count of completed items.
         """
         with self._reader() as conn:
             cursor = conn.execute(
                 """
-                SELECT source_loop, COUNT(*) as count
+                SELECT namespace, COUNT(*) as count
                 FROM work_items
                 WHERE project_id = ?
-                  AND source_loop IS NOT NULL
+                  AND namespace IS NOT NULL
                   AND status = 'completed'
                   AND claimed_by IS NULL
-                GROUP BY source_loop
+                GROUP BY namespace
                 """,
                 (project_id,),
             )
-            return {row["source_loop"]: row["count"] for row in cursor.fetchall()}
+            return {row["namespace"]: row["count"] for row in cursor.fetchall()}
+
+    # Backward compatibility alias
+    def get_source_item_counts(self, project_id: str) -> dict[str, int]:
+        """Deprecated: Use get_namespace_item_counts instead."""
+        return self.get_namespace_item_counts(project_id)
 
     def release_stale_claims(
         self,
@@ -1311,6 +1321,9 @@ class Database:
         refresh_token: Optional[str] = None,
         project_id: Optional[str] = None,
         email: Optional[str] = None,
+        scopes: Optional[str] = None,
+        subscription_type: Optional[str] = None,
+        rate_limit_tier: Optional[str] = None,
     ) -> int:
         """Store or update OAuth credentials.
 
@@ -1321,6 +1334,9 @@ class Database:
             refresh_token: Optional refresh token
             project_id: Project ID for project-scoped credentials
             email: User's email address from profile
+            scopes: JSON array string of OAuth scopes
+            subscription_type: Claude subscription type (e.g., 'max')
+            rate_limit_tier: Rate limit tier (e.g., 'default_claude_max_20x')
 
         Returns:
             Credential record ID
@@ -1347,10 +1363,12 @@ class Database:
                     """
                     UPDATE credentials SET
                         access_token = ?, refresh_token = ?, expires_at = ?,
-                        email = ?, updated_at = ?
+                        email = ?, scopes = ?, subscription_type = ?,
+                        rate_limit_tier = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (access_token, refresh_token, expires_at, email, now, existing[0]),
+                    (access_token, refresh_token, expires_at, email, scopes,
+                     subscription_type, rate_limit_tier, now, existing[0]),
                 )
                 return existing[0]
             else:
@@ -1358,10 +1376,12 @@ class Database:
                 cursor = conn.execute(
                     """
                     INSERT INTO credentials
-                    (scope, project_id, access_token, refresh_token, expires_at, email, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (scope, project_id, access_token, refresh_token, expires_at, email,
+                     scopes, subscription_type, rate_limit_tier, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (scope, project_id, access_token, refresh_token, expires_at, email, now, now),
+                    (scope, project_id, access_token, refresh_token, expires_at, email,
+                     scopes, subscription_type, rate_limit_tier, now, now),
                 )
                 return cursor.lastrowid or 0
 
@@ -1444,7 +1464,8 @@ class Database:
 
     # Allowed columns for credential update operations
     _CREDENTIAL_UPDATE_COLS = frozenset({
-        "access_token", "refresh_token", "expires_at", "updated_at", "email"
+        "access_token", "refresh_token", "expires_at", "updated_at", "email",
+        "scopes", "subscription_type", "rate_limit_tier"
     })
 
     def update_credentials(self, id: int, **kwargs) -> bool:
@@ -1788,29 +1809,13 @@ class Database:
         # Define migrations as (version, sql) tuples
         migrations: list[tuple[int, str]] = [
             # Migration to v2: Add item provenance and claiming columns
+            # NOTE: For new databases (created at SCHEMA_VERSION >= 7), these columns
+            # already exist in the initial schema with correct names. The migration
+            # only runs for databases created before v7.
+            # Indexes are idempotent (IF NOT EXISTS).
             (2, """
-                -- Add item provenance tracking
-                ALTER TABLE work_items ADD COLUMN source_loop TEXT;
-                ALTER TABLE work_items ADD COLUMN item_type TEXT DEFAULT 'item';
-                ALTER TABLE work_items ADD COLUMN claimed_by TEXT;
-                ALTER TABLE work_items ADD COLUMN claimed_at TIMESTAMP;
-                ALTER TABLE work_items ADD COLUMN processed_at TIMESTAMP;
-
-                -- Index for consumer loop queries
-                CREATE INDEX IF NOT EXISTS idx_work_items_source_loop
-                    ON work_items(project_id, source_loop, status);
                 CREATE INDEX IF NOT EXISTS idx_work_items_claimed
                     ON work_items(project_id, claimed_by, claimed_at);
-
-                -- Backfill source_loop from session's loop name where determinable
-                UPDATE work_items
-                SET source_loop = (
-                    SELECT l.name FROM sessions s
-                    JOIN loops l ON l.project_id = s.project_id
-                    WHERE s.project_id = work_items.project_id
-                    LIMIT 1
-                )
-                WHERE source_loop IS NULL;
             """),
             # Migration to v3: Add OAuth credentials table
             (3, """
@@ -1846,6 +1851,54 @@ class Database:
 
                 -- Composite index for run drilldown (all logs for a run, ordered)
                 CREATE INDEX IF NOT EXISTS idx_logs_run_time ON logs(run_id, timestamp);
+            """),
+            # Migration to v6: Add OAuth metadata columns to credentials for Claude Code compatibility
+            # These fields are required by Claude Code CLI when reading ~/.claude/.credentials.json:
+            # - scopes: JSON array of OAuth scopes (e.g., ["user:inference", "user:profile"])
+            # - subscription_type: Claude subscription tier ("free", "pro", "max")
+            # - rate_limit_tier: API rate limit tier (e.g., "default_claude_max_20x")
+            (6, """
+                -- Add OAuth metadata columns for full Claude Code credential compatibility
+                ALTER TABLE credentials ADD COLUMN scopes TEXT;
+                ALTER TABLE credentials ADD COLUMN subscription_type TEXT;
+                ALTER TABLE credentials ADD COLUMN rate_limit_tier TEXT;
+            """),
+            # Migration to v7: Rename source_loop to namespace for clarity
+            # NOTE: For databases created after this migration was added, the column
+            # is already named 'namespace' in the initial schema. This migration only
+            # applies to databases created before the schema was updated.
+            # We make this idempotent by just ensuring the index exists.
+            (7, """
+                -- Drop old index if it exists (for databases migrating from source_loop)
+                DROP INDEX IF EXISTS idx_work_items_source_loop;
+
+                -- Ensure the namespace index exists (works whether column is source_loop or namespace)
+                CREATE INDEX IF NOT EXISTS idx_work_items_namespace
+                    ON work_items(project_id, namespace, status);
+            """),
+            # Migration to v8: Remove FOREIGN KEY on run_id in logs table
+            # Runs exist in project databases, not the global database, so the FK
+            # constraint was causing failures when logging run events.
+            (8, """
+                -- Recreate logs table without FK constraint on run_id
+                CREATE TABLE IF NOT EXISTS logs_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                    run_id TEXT,
+                    level TEXT NOT NULL,
+                    category TEXT DEFAULT 'system',
+                    event TEXT DEFAULT 'log',
+                    message TEXT NOT NULL,
+                    metadata TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO logs_new SELECT * FROM logs;
+                DROP TABLE logs;
+                ALTER TABLE logs_new RENAME TO logs;
+
+                -- Recreate index on logs
+                CREATE INDEX IF NOT EXISTS idx_logs_project ON logs(project_id);
+                CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
             """),
         ]
 

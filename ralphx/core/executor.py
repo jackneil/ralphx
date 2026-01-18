@@ -14,6 +14,7 @@ import asyncio
 import random
 import re
 import signal
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -26,6 +27,7 @@ from ralphx.adapters.claude_cli import ClaudeCLIAdapter
 from ralphx.core.dependencies import DependencyGraph, order_items_by_dependency
 from ralphx.core.project_db import ProjectDatabase
 from ralphx.core.resources import InjectionPosition, ResourceManager
+from ralphx.core.schemas import IMPLEMENTATION_STATUS_SCHEMA, ItemStatus
 from ralphx.core.workspace import get_loop_settings_path
 from ralphx.models.loop import LoopConfig, Mode, ModeSelectionStrategy
 from ralphx.models.project import Project
@@ -39,7 +41,9 @@ class ExecutorEvent(str, Enum):
     RUN_STARTED = "run_started"
     ITERATION_STARTED = "iteration_started"
     ITERATION_COMPLETED = "iteration_completed"
+    PROMPT_PREPARED = "prompt_prepared"  # Before Claude call, includes prompt stats
     ITEM_ADDED = "item_added"
+    GIT_COMMIT = "git_commit"  # Git commit after successful iteration
     ERROR = "error"
     WARNING = "warning"
     HEARTBEAT = "heartbeat"
@@ -74,6 +78,7 @@ class IterationResult:
     error_message: Optional[str] = None
     timeout: bool = False
     no_items_available: bool = False  # For consumer loops: no source items to process
+    claimed_item: Optional[dict] = None  # For consumer loops: the item that was processed
 
 
 # Regex patterns for extracting work items from Claude output
@@ -105,6 +110,8 @@ class LoopExecutor:
         project: Project,
         loop_config: LoopConfig,
         db: ProjectDatabase,
+        workflow_id: str,
+        step_id: int,
         adapter: Optional[LLMAdapter] = None,
         dry_run: bool = False,
         phase: Optional[int] = None,
@@ -112,6 +119,8 @@ class LoopExecutor:
         respect_dependencies: bool = True,
         batch_mode: bool = False,
         batch_size: int = 10,
+        consume_from_step_id: Optional[int] = None,
+        architecture_first: bool = False,
     ):
         """Initialize the executor.
 
@@ -119,6 +128,8 @@ class LoopExecutor:
             project: Project to run loop against.
             loop_config: Loop configuration.
             db: Project-local database instance for persistence.
+            workflow_id: Parent workflow ID (required).
+            step_id: Parent workflow step ID (required).
             adapter: LLM adapter (defaults to ClaudeCLIAdapter).
             dry_run: If True, simulate execution without calling LLM.
             phase: Optional phase number to filter items (consumer loops only).
@@ -126,10 +137,16 @@ class LoopExecutor:
             respect_dependencies: If True, process items in dependency order.
             batch_mode: If True, claim multiple items for batch implementation.
             batch_size: Maximum items to claim for batch mode.
+            consume_from_step_id: For consumer loops, the step ID to consume items from.
+            architecture_first: If True, prioritize foundational stories (FND, DBM, SEC, ARC)
+                               for new codebases. Batches them together for initial build.
         """
         self.project = project
         self.config = loop_config
         self.db = db
+        self.workflow_id = workflow_id
+        self.step_id = step_id
+        self._consume_from_step_id = consume_from_step_id
         # Create adapter with per-loop settings path for permission templates
         # Pass project_id for credential lookup (project-scoped auth)
         if adapter is None:
@@ -149,6 +166,22 @@ class LoopExecutor:
         self._respect_dependencies = respect_dependencies
         self._batch_mode = batch_mode
         self._batch_size = min(batch_size, 50)  # Cap at 50
+        self._architecture_first = architecture_first
+        self._architecture_phase_complete = False
+
+        # Foundational categories to prioritize in architecture-first mode
+        # These are typically infrastructure, database, security, architecture stories
+        self._foundation_categories = frozenset({
+            "fnd", "foundation",
+            "dbm", "database",
+            "sec", "security",
+            "arc", "architecture",
+            "adm", "admin",
+            "dat", "data",
+            "dep", "deployment",
+            "sys", "system",
+            "inf", "infrastructure",
+        })
 
         # Dependency graph for ordering (built on first claim)
         self._dependency_graph: Optional[DependencyGraph] = None
@@ -367,8 +400,139 @@ class LoopExecutor:
             mode_name = list(modes.keys())[0]
             return mode_name, modes[mode_name]
 
+    def _resolve_loop_resource_content(self, resource: dict) -> Optional[str]:
+        """Resolve content for a loop resource based on its source_type.
+
+        Args:
+            resource: Loop resource dict from database.
+
+        Returns:
+            Resolved content string, or None if unable to resolve.
+        """
+        source_type = resource.get("source_type", "")
+
+        if source_type == "system":
+            # Load from system default templates
+            resource_type = resource.get("resource_type", "")
+            default_path = (
+                Path(__file__).parent.parent / "templates" / "loop_templates" / f"{resource_type}.md"
+            )
+            if default_path.exists():
+                return default_path.read_text()
+            return None
+
+        elif source_type == "project_file":
+            # Load from project file path
+            source_path = resource.get("source_path")
+            if source_path:
+                file_path = Path(self.project.path) / source_path
+                if file_path.exists():
+                    return file_path.read_text()
+            return None
+
+        elif source_type == "loop_ref":
+            # Load from another loop's resource (recursively)
+            source_loop = resource.get("source_loop")
+            source_resource_id = resource.get("source_resource_id")
+            if source_loop and source_resource_id:
+                source_resource = self.db.get_loop_resource(source_resource_id)
+                if source_resource:
+                    return self._resolve_loop_resource_content(source_resource)
+            return None
+
+        elif source_type == "project_resource":
+            # Load from project-level resource
+            source_resource_id = resource.get("source_resource_id")
+            if source_resource_id:
+                resource_manager = ResourceManager(self.project.path, db=self.db)
+                proj_resource = resource_manager.db.get_resource(source_resource_id)
+                if proj_resource:
+                    loaded = resource_manager.load_resource(proj_resource)
+                    if loaded:
+                        return loaded.content
+            return None
+
+        elif source_type == "inline":
+            # Content is stored directly
+            return resource.get("inline_content")
+
+        return None
+
+    def _load_loop_resources(self) -> list[dict]:
+        """Load all enabled resources for this loop from the loop_resources table.
+
+        Returns:
+            List of loop resource dicts with resolved content.
+        """
+        resources = self.db.list_loop_resources(
+            loop_name=self.config.name,
+            enabled=True,
+        )
+
+        # Resolve content for each resource
+        result = []
+        for resource in resources:
+            content = self._resolve_loop_resource_content(resource)
+            if content:
+                resource["_resolved_content"] = content
+                result.append(resource)
+
+        # Sort by priority, then name
+        result.sort(key=lambda r: (r.get("priority", 0), r.get("name", "")))
+        return result
+
+    def _build_loop_resource_section(
+        self,
+        resources: list[dict],
+        position: str,
+        include_headers: bool = True,
+    ) -> str:
+        """Build prompt section from loop resources at a specific injection position.
+
+        Args:
+            resources: List of loop resources with resolved content.
+            position: Injection position to filter by.
+            include_headers: Whether to include section headers.
+
+        Returns:
+            Combined content for this position.
+        """
+        position_resources = [r for r in resources if r.get("injection_position") == position]
+
+        if not position_resources:
+            return ""
+
+        sections = []
+        for resource in position_resources:
+            content = resource.get("_resolved_content", "")
+            if not content:
+                continue
+
+            if include_headers:
+                name = resource.get("name", "Resource")
+                resource_type = resource.get("resource_type", "custom")
+                type_labels = {
+                    "loop_template": "Loop Template",
+                    "design_doc": "Design Document",
+                    "guardrails": "Guardrails",
+                    "custom": "Additional Context",
+                }
+                label = type_labels.get(resource_type, "Resource")
+                header = f"## {label}: {name}" if name != resource_type else f"## {label}"
+                sections.append(f"\n{header}\n{content}\n")
+            else:
+                sections.append(content)
+
+        return "\n".join(sections)
+
     def _load_prompt_template(self, mode: Mode) -> str:
         """Load prompt template for a mode.
+
+        Priority order:
+        1. Loop-level LOOP_TEMPLATE resource with position=template_body (from loop_resources table)
+        2. Project-level LOOP_TEMPLATE resource with position=TEMPLATE_BODY (from resources table)
+        3. Mode's prompt_template file path
+        4. Default template from ralphx/templates/loop_templates/{loop_type}.md
 
         Args:
             mode: Mode configuration.
@@ -376,9 +540,38 @@ class LoopExecutor:
         Returns:
             Prompt template content.
         """
+        # Priority 1: Check for loop-level LOOP_TEMPLATE resource
+        loop_resources = self._load_loop_resources()
+        for resource in loop_resources:
+            if (resource.get("resource_type") == "loop_template" and
+                resource.get("injection_position") == "template_body"):
+                content = resource.get("_resolved_content")
+                if content:
+                    return content
+
+        # Priority 2: Check for project-level LOOP_TEMPLATE resource with TEMPLATE_BODY position
+        resource_manager = ResourceManager(self.project.path, db=self.db)
+        resource_set = resource_manager.load_for_loop(self.config)
+        template_resources = resource_set.by_position(InjectionPosition.TEMPLATE_BODY)
+
+        if template_resources:
+            # Use the first LOOP_TEMPLATE resource as the base template
+            resource = template_resources[0]
+            if resource.content:
+                return resource.content
+
+        # Priority 3: Mode's prompt_template file
         template_path = self.project.path / mode.prompt_template
         if template_path.exists():
             return template_path.read_text()
+
+        # Priority 4: Default template for loop type
+        default_template_path = (
+            Path(__file__).parent.parent / "templates" / "loop_templates" / f"{self.config.type.value}.md"
+        )
+        if default_template_path.exists():
+            return default_template_path.read_text()
+
         return f"Prompt template not found: {mode.prompt_template}"
 
     def _escape_template_vars(self, value: str) -> str:
@@ -409,14 +602,18 @@ class LoopExecutor:
         """Build the complete prompt for an iteration.
 
         Assembles the prompt from multiple sources in this order:
-        1. BEFORE_PROMPT position resources (coding standards, system guardrails)
-        2. AFTER_DESIGN_DOC position resources (design docs, architecture)
-        3. Template content
-        4. BEFORE_TASK position resources (output guardrails)
-        5. AFTER_TASK position resources (custom resources)
-        6. Variable substitution (consumer loop variables)
-        7. Batch items context (if batch mode)
-        8. Run tracking marker
+        1. Loop-level resources (from loop_resources table) - preferred if available
+        2. Project-level resources (from resources table) - fallback
+        3. Template content (loop-specific or project-level)
+        4. Variable substitution (consumer loop variables)
+        5. Batch items context (if batch mode)
+        6. Run tracking marker
+
+        Resource injection positions:
+        - BEFORE_PROMPT: Coding standards, system guardrails (at the very start)
+        - AFTER_DESIGN_DOC: Design docs, architecture, domain knowledge
+        - BEFORE_TASK: Output guardrails
+        - AFTER_TASK: Custom resources
 
         Args:
             mode: Mode configuration.
@@ -429,23 +626,25 @@ class LoopExecutor:
         """
         template = self._load_prompt_template(mode)
 
-        # Load project resources
+        # Load loop-specific resources first (from loop_resources table)
+        loop_resources = self._load_loop_resources()
+
+        # Also load project-level resources as fallback
         resource_manager = ResourceManager(self.project.path, db=self.db)
         resource_set = resource_manager.load_for_loop(self.config, mode_name)
 
-        # Build sections for each injection position
-        before_prompt = resource_manager.build_prompt_section(
-            resource_set, InjectionPosition.BEFORE_PROMPT
-        )
-        after_design_doc = resource_manager.build_prompt_section(
-            resource_set, InjectionPosition.AFTER_DESIGN_DOC
-        )
-        before_task = resource_manager.build_prompt_section(
-            resource_set, InjectionPosition.BEFORE_TASK
-        )
-        after_task = resource_manager.build_prompt_section(
-            resource_set, InjectionPosition.AFTER_TASK
-        )
+        # For each injection position, prefer loop resources if available,
+        # otherwise fall back to project-level resources
+        def get_section(position_key: str, injection_pos: InjectionPosition) -> str:
+            loop_section = self._build_loop_resource_section(loop_resources, position_key)
+            if loop_section:
+                return loop_section
+            return resource_manager.build_prompt_section(resource_set, injection_pos)
+
+        before_prompt = get_section("before_prompt", InjectionPosition.BEFORE_PROMPT)
+        after_design_doc = get_section("after_design_doc", InjectionPosition.AFTER_DESIGN_DOC)
+        before_task = get_section("before_task", InjectionPosition.BEFORE_TASK)
+        after_task = get_section("after_task", InjectionPosition.AFTER_TASK)
 
         # Assemble prompt with resources at their positions
         # BEFORE_PROMPT goes at the very start
@@ -505,16 +704,25 @@ class LoopExecutor:
             metadata_json = self._escape_template_vars(
                 json.dumps(metadata) if metadata else "{}"
             )
-            source = claimed_item.get("source_loop", "unknown")
-            # source comes from our DB, not user input, but escape anyway for defense in depth
-            source = self._escape_template_vars(source)
+            # workflow_id from our DB, escape for defense in depth
+            workflow_id_val = self._escape_template_vars(
+                claimed_item.get("workflow_id", self.workflow_id)
+            )
 
             # Substitution order: most specific first to avoid partial matches
             template = template.replace("{{input_item.metadata}}", metadata_json)
             template = template.replace("{{input_item.content}}", content)
             template = template.replace("{{input_item.title}}", title)
             template = template.replace("{{input_item}}", content)  # Alias
-            template = template.replace("{{source_loop}}", source)
+            template = template.replace("{{workflow_id}}", workflow_id_val)
+            # Backward compatibility for old templates using namespace/source_loop
+            template = template.replace("{{namespace}}", workflow_id_val)
+            template = template.replace("{{source_loop}}", workflow_id_val)
+
+        # Add implemented summary for consumer loops (shows what's already been done)
+        if "{{implemented_summary}}" in template and self._is_consumer_loop():
+            impl_summary = self._build_implemented_summary()
+            template = template.replace("{{implemented_summary}}", impl_summary)
 
         # Add batch items context if in batch mode
         if batch_items and len(batch_items) > 1:
@@ -546,7 +754,16 @@ class LoopExecutor:
         return template
 
     def _is_consumer_loop(self) -> bool:
-        """Check if this loop consumes items from another loop."""
+        """Check if this loop consumes items from another loop.
+
+        Returns True if either:
+        - The loop config has item_types.input.source set (config-based)
+        - The consume_from_step_id was passed to constructor (workflow-based)
+        """
+        # Workflow-based consumer: consume_from_step_id was explicitly set
+        if self._consume_from_step_id is not None:
+            return True
+        # Config-based consumer: source defined in loop config
         if not self.config.item_types:
             return False
         if not self.config.item_types.input:
@@ -593,9 +810,10 @@ class LoopExecutor:
         """
         import json
 
-        # 1. Get all items generated by this loop
+        # 1. Get all items generated by this workflow step
         existing_items, _ = self.db.list_work_items(
-            source_loop=self.config.name,
+            workflow_id=self.workflow_id,
+            source_step_id=self.step_id,
             limit=10000,  # Get all existing items
         )
 
@@ -653,25 +871,97 @@ class LoopExecutor:
 
         return template
 
-    def _get_source_loop_name(self) -> Optional[str]:
-        """Get the name of the source loop for consumer loops."""
+    def _get_source_step_id(self) -> Optional[int]:
+        """Get the source step ID for consumer loops.
+
+        For consumer loops, this is the step that produced the items to consume.
+        Set via consume_from_step_id constructor parameter.
+        """
         if not self._is_consumer_loop():
             return None
-        return self.config.item_types.input.source
+        return self._consume_from_step_id
+
+    def _check_consumer_completion(self) -> tuple[bool, int, int]:
+        """Check if consumer loop has processed all available items.
+
+        Returns:
+            Tuple of (all_done, pending_count, total_count).
+            - all_done: True if items exist and all are processed
+            - pending_count: Number of items still pending/claimed
+            - total_count: Total items from source step
+        """
+        source_step_id = self._get_source_step_id()
+        if source_step_id is None:
+            return False, 0, 0
+
+        # Get total items from source (any status)
+        _, total_count = self.db.list_work_items(
+            workflow_id=self.workflow_id,
+            source_step_id=source_step_id,
+            limit=1,  # We just need the count
+        )
+
+        if total_count == 0:
+            # No items exist yet - might be waiting for generator
+            return False, 0, 0
+
+        # Get pending items (status=completed from generator, unclaimed)
+        pending_items, pending_count = self.db.list_work_items(
+            workflow_id=self.workflow_id,
+            source_step_id=source_step_id,
+            status="completed",  # Items ready for consumption
+            unclaimed_only=True,
+            limit=1,
+        )
+
+        # Also check for claimed but not yet processed items
+        # These are in-progress by another executor (or stale)
+        # For now, if pending is 0, we're done
+        all_done = pending_count == 0 and total_count > 0
+
+        return all_done, pending_count, total_count
+
+    def _is_foundational_item(self, item: dict) -> bool:
+        """Check if an item is foundational (for architecture-first mode).
+
+        Foundational items are identified by:
+        1. Category matching foundation categories (FND, DBM, SEC, etc.)
+        2. ID prefix matching foundation category codes
+
+        Args:
+            item: Work item dict.
+
+        Returns:
+            True if item is foundational.
+        """
+        # Check category
+        category = (item.get("category") or "").lower()
+        if category in self._foundation_categories:
+            return True
+
+        # Check ID prefix (e.g., "FND-001" -> "fnd")
+        item_id = item.get("id", "")
+        if "-" in item_id:
+            prefix = item_id.split("-")[0].lower()
+            if prefix in self._foundation_categories:
+                return True
+
+        return False
 
     def _build_dependency_graph(self) -> None:
         """Build/rebuild the dependency graph from source items.
 
         Called on first claim or when needed for phase detection.
         """
-        source_loop = self._get_source_loop_name()
-        if not source_loop:
+        source_step_id = self._get_source_step_id()
+        if source_step_id is None:
             return
 
-        # Get ALL items from source loop (not just unclaimed)
+        # Get ALL items from source step (not just unclaimed)
         # Using limit of 10000 - warn if there are more items
         all_items, total_count = self.db.list_work_items(
-            source_loop=source_loop,
+            workflow_id=self.workflow_id,
+            source_step_id=source_step_id,
             limit=10000,
         )
 
@@ -682,7 +972,7 @@ class LoopExecutor:
         if total_count > 10000:
             self._emit_event(
                 ExecutorEvent.WARNING,
-                f"Source loop has {total_count} items but only loaded 10000. "
+                f"Namespace has {total_count} items but only loaded 10000. "
                 f"Dependency graph may be incomplete. Some items may be processed out of order.",
             )
 
@@ -744,7 +1034,7 @@ class LoopExecutor:
         return self._detected_phases.get(phase, [])
 
     async def _claim_source_item(self, _retry_count: int = 0) -> Optional[dict]:
-        """Claim an item from the source loop for processing.
+        """Claim an item from the source step for processing.
 
         Respects:
         - Phase filtering (if _phase_filter is set)
@@ -759,8 +1049,8 @@ class LoopExecutor:
         """
         MAX_CLAIM_RETRIES = 5
 
-        source_loop = self._get_source_loop_name()
-        if not source_loop:
+        source_step_id = self._get_source_step_id()
+        if source_step_id is None:
             return None
 
         # Build dependency graph on first call
@@ -769,7 +1059,8 @@ class LoopExecutor:
 
         # Query for available items with optional category filter
         items, _ = self.db.list_work_items(
-            source_loop=source_loop,
+            workflow_id=self.workflow_id,
+            source_step_id=source_step_id,
             status="completed",
             unclaimed_only=True,
             category=self._category_filter,
@@ -786,6 +1077,29 @@ class LoopExecutor:
 
             if not items:
                 return None
+
+        # Apply architecture-first prioritization
+        # When enabled, foundational items (FND, DBM, SEC, ARC, etc.) are
+        # prioritized until all foundational items are complete
+        if self._architecture_first and not self._architecture_phase_complete:
+            foundational = [item for item in items if self._is_foundational_item(item)]
+            non_foundational = [item for item in items if not self._is_foundational_item(item)]
+
+            if foundational:
+                # Still have foundational items - prioritize them
+                items = foundational
+                self._emit_event(
+                    ExecutorEvent.INFO,
+                    f"Architecture-first mode: prioritizing {len(foundational)} foundational items",
+                )
+            else:
+                # No more foundational items - mark phase complete
+                self._architecture_phase_complete = True
+                self._emit_event(
+                    ExecutorEvent.INFO,
+                    "Architecture-first mode: foundational phase complete, switching to normal processing",
+                )
+                items = non_foundational
 
         # Apply dependency ordering
         if self._respect_dependencies and self._dependency_graph:
@@ -804,7 +1118,8 @@ class LoopExecutor:
                     )
                     # Fall back to any unclaimed items
                     items, _ = self.db.list_work_items(
-                        source_loop=source_loop,
+                        workflow_id=self.workflow_id,
+                        source_step_id=source_step_id,
                         status="completed",
                         unclaimed_only=True,
                         category=self._category_filter,
@@ -861,6 +1176,89 @@ class LoopExecutor:
 
         return claimed_items
 
+    def _build_implemented_summary(self) -> str:
+        """Build a summary of already-processed items for this consumer loop.
+
+        Returns a formatted string showing what items have been processed and
+        their outcomes (implemented, duplicate, external, skipped, error).
+        This helps Claude understand context and avoid duplicating work.
+
+        Returns:
+            Formatted summary string, or empty string if no items processed yet.
+        """
+        source_step_id = self._get_source_step_id()
+        if source_step_id is None:
+            return ""
+
+        # Get items that are not pending (i.e., have been processed)
+        # Query for each status since list_work_items only supports one status filter
+        processed_items = []
+        for status_val in ["processed", "duplicate", "external", "skipped", "failed"]:
+            items, _ = self.db.list_work_items(
+                workflow_id=self.workflow_id,
+                source_step_id=source_step_id,
+                status=status_val,
+                limit=200,  # Cap at 200 items per status
+            )
+            processed_items.extend(items)
+
+        if not processed_items:
+            return ""
+
+        # Sort by processed_at time
+        processed_items.sort(key=lambda x: x.get("processed_at") or "")
+
+        # Build summary grouped by status
+        by_status: dict[str, list[dict]] = {}
+        for item in processed_items:
+            status = item.get("status", "unknown")
+            if status not in by_status:
+                by_status[status] = []
+            by_status[status].append(item)
+
+        lines = ["## Previously Processed Items\n"]
+        lines.append(f"Total: {len(processed_items)} item(s) already processed.\n")
+
+        status_labels = {
+            "processed": "Implemented",
+            "duplicate": "Duplicates",
+            "external": "External (requires other system)",
+            "skipped": "Skipped",
+            "failed": "Failed/Error",
+        }
+
+        for status_val, label in status_labels.items():
+            items = by_status.get(status_val, [])
+            if not items:
+                continue
+
+            lines.append(f"\n### {label} ({len(items)})")
+            for item in items[:50]:  # Cap display at 50 per status
+                item_id = item.get("id", "?")
+                title = item.get("title") or (item.get("content") or "")[:60]
+                if len(title) > 60:
+                    title = title[:57] + "..."
+
+                metadata = item.get("metadata") or {}
+                summary = metadata.get("implementation_summary", "")
+                reason = metadata.get("status_reason", "")
+                dup_of = item.get("duplicate_of", "")
+
+                entry = f"- **{item_id}**: {title}"
+                if summary:
+                    entry += f" — {summary[:80]}"
+                if reason and status_val in ("skipped", "external"):
+                    entry += f" (reason: {reason[:50]})"
+                if dup_of and status_val == "duplicate":
+                    entry += f" (duplicate of {dup_of})"
+
+                lines.append(entry)
+
+            if len(items) > 50:
+                lines.append(f"... and {len(items) - 50} more")
+
+        return "\n".join(lines)
+
     def _release_claimed_item(self, item_id: str) -> None:
         """Release a claim on an item (on iteration failure)."""
         self.db.release_work_item(item_id)
@@ -879,6 +1277,88 @@ class LoopExecutor:
         )
         if success:
             self._completed_item_ids.add(item_id)
+        return success
+
+    def _update_item_with_structured_status(
+        self,
+        item_id: str,
+        structured_output: dict,
+    ) -> bool:
+        """Update item status using structured output from Claude.
+
+        Parses the structured output from --json-schema and updates the
+        work item with the specific status (implemented, duplicate, external,
+        skipped, error) along with associated metadata.
+
+        Args:
+            item_id: Work item ID to update.
+            structured_output: Parsed JSON from Claude's structured output.
+
+        Returns:
+            True if item was updated, False otherwise.
+        """
+        # Extract status and related fields from structured output
+        status = structured_output.get("status", "implemented")
+
+        # Validate status is a known value
+        try:
+            validated_status = ItemStatus(status)
+        except ValueError:
+            # Unknown status, default to implemented
+            validated_status = ItemStatus.IMPLEMENTED
+
+        # Map ItemStatus to database status values
+        status_map = {
+            ItemStatus.IMPLEMENTED: "processed",
+            ItemStatus.DUPLICATE: "duplicate",
+            ItemStatus.EXTERNAL: "external",
+            ItemStatus.SKIPPED: "skipped",
+            ItemStatus.ERROR: "failed",
+        }
+        db_status = status_map.get(validated_status, "processed")
+
+        # Extract optional fields
+        summary = structured_output.get("summary")
+        duplicate_of = structured_output.get("duplicate_of")
+        external_system = structured_output.get("external_system")
+        reason = structured_output.get("reason")
+        files_changed = structured_output.get("files_changed", [])
+        tests_passed = structured_output.get("tests_passed")
+
+        # Build metadata dict for extra fields
+        metadata = {}
+        if summary:
+            metadata["implementation_summary"] = summary
+        if external_system:
+            metadata["external_system"] = external_system
+        if reason:
+            metadata["status_reason"] = reason
+        if files_changed:
+            metadata["files_changed"] = files_changed
+        if tests_passed is not None:
+            metadata["tests_passed"] = tests_passed
+
+        success = self.db.update_work_item_with_status(
+            id=item_id,
+            status=db_status,
+            processed_by=self.config.name,
+            duplicate_of=duplicate_of,
+            skip_reason=reason if validated_status == ItemStatus.SKIPPED else None,
+            metadata=metadata,
+        )
+
+        if success:
+            self._completed_item_ids.add(item_id)
+
+            # Log the specific status for visibility
+            status_msg = f"Item {item_id} marked as {validated_status.value}"
+            if duplicate_of:
+                status_msg += f" (duplicate of {duplicate_of})"
+            elif reason:
+                status_msg += f": {reason[:50]}..." if len(reason) > 50 else f": {reason}"
+
+            self._emit_event(ExecutorEvent.ITERATION_COMPLETED, status_msg)
+
         return success
 
     def extract_work_items(self, output: str) -> list[dict]:
@@ -960,8 +1440,7 @@ class LoopExecutor:
         """
         saved = 0
 
-        # Determine source_loop and item_type from loop config
-        source_loop = self.config.name
+        # Determine item_type from loop config
         item_type = "item"
         if self.config.item_types and self.config.item_types.output:
             item_type = self.config.item_types.output.singular
@@ -971,6 +1450,8 @@ class LoopExecutor:
                 item_id = item.get('id', str(uuid.uuid4())[:8])
                 self.db.create_work_item(
                     id=item_id,
+                    workflow_id=self.workflow_id,
+                    source_step_id=self.step_id,
                     content=item.get('content', ''),
                     title=item.get('title'),
                     priority=item.get('priority'),
@@ -978,7 +1459,6 @@ class LoopExecutor:
                     category=item.get('category'),
                     metadata=item.get('metadata'),
                     dependencies=item.get('dependencies'),
-                    source_loop=source_loop,
                     item_type=item_type,
                 )
                 saved += 1
@@ -1037,6 +1517,19 @@ class LoopExecutor:
             # Build prompt - include batch items if in batch mode
             prompt = self._build_prompt(mode, mode_name, claimed_item, claimed_items if self._batch_mode else None)
 
+            # Emit prompt prepared event with size stats
+            prompt_chars = len(prompt)
+            prompt_lines = prompt.count("\n") + 1 if prompt else 0
+            estimated_tokens = prompt_chars // 4  # Rough estimate
+            self._emit_event(
+                ExecutorEvent.PROMPT_PREPARED,
+                f"Prompt: {prompt_chars:,} chars, {prompt_lines:,} lines, ~{estimated_tokens:,} tokens",
+                prompt_chars=prompt_chars,
+                prompt_lines=prompt_lines,
+                estimated_tokens=estimated_tokens,
+                mode=mode_name,
+            )
+
             if self.dry_run:
                 # Simulate execution
                 await asyncio.sleep(0.1)
@@ -1053,11 +1546,20 @@ class LoopExecutor:
                 return result
 
             # Execute with adapter
+            # For consumer loops, use structured output schema for status reporting
+            # Note: Structured output only works for single-item mode because the
+            # schema reports ONE status, which would incorrectly apply to ALL items
+            # in batch mode. Batch mode falls back to generic "processed" status.
+            json_schema = None
+            if self._is_consumer_loop() and not self._batch_mode:
+                json_schema = IMPLEMENTATION_STATUS_SCHEMA
+
             exec_result = await self.adapter.execute(
                 prompt=prompt,
                 model=mode.model,
                 tools=mode.tools if mode.tools else None,
                 timeout=mode.timeout,
+                json_schema=json_schema,
             )
 
             result.session_id = exec_result.session_id
@@ -1085,17 +1587,28 @@ class LoopExecutor:
                     status="completed" if exec_result.success else "error",
                 )
 
-            # Mark claimed item(s) as processed on success
+            # Mark claimed item(s) based on structured output or as processed
             if result.success:
                 items_to_mark = claimed_items if self._batch_mode else ([claimed_item] if claimed_item else [])
                 for item in items_to_mark:
-                    if not self._mark_item_processed(item["id"]):
-                        # Failed to mark as processed - log warning but don't fail iteration
-                        # Item may have been processed by another consumer or released
-                        self._emit_event(
-                            ExecutorEvent.WARNING,
-                            f"Failed to mark item {item['id']} as processed - may already be processed",
-                        )
+                    # Use structured output status if available and valid
+                    # structured_output must be a dict for _update_item_with_structured_status
+                    if isinstance(exec_result.structured_output, dict):
+                        if not self._update_item_with_structured_status(
+                            item["id"],
+                            exec_result.structured_output,
+                        ):
+                            self._emit_event(
+                                ExecutorEvent.WARNING,
+                                f"Failed to update item {item['id']} with structured status",
+                            )
+                    else:
+                        # Fallback to generic processed status
+                        if not self._mark_item_processed(item["id"]):
+                            self._emit_event(
+                                ExecutorEvent.WARNING,
+                                f"Failed to mark item {item['id']} as processed - may already be processed",
+                            )
 
         except asyncio.TimeoutError:
             result.success = False
@@ -1115,6 +1628,9 @@ class LoopExecutor:
             result.duration_seconds = (
                 datetime.utcnow() - start_time
             ).total_seconds()
+
+            # Store claimed item for git commit message templating
+            result.claimed_item = claimed_item
 
             # Release claimed item(s) on failure
             if not result.success:
@@ -1190,6 +1706,8 @@ class LoopExecutor:
         self.db.create_run(
             id=run_id,
             loop_name=self.config.name,
+            workflow_id=self.workflow_id,
+            step_id=self.step_id,
         )
 
         self._emit_event(
@@ -1246,12 +1764,34 @@ class LoopExecutor:
                 if result.no_items_available:
                     # Don't count this against max_iterations - we didn't actually do work
                     self._iteration -= 1  # Undo the increment
-                    self._emit_event(
-                        ExecutorEvent.HEARTBEAT,
-                        f"Consumer loop waiting for items from source",
-                        mode=mode_name,
-                    )
-                    # Use longer back-off when no items available (5s or configured cooldown, whichever is longer)
+
+                    # Check if ALL items have been processed (consumer complete)
+                    # vs just waiting for items to arrive (generator still working)
+                    all_done, pending, total = self._check_consumer_completion()
+
+                    if all_done:
+                        # All items from source have been processed - consumer is done!
+                        stop_reason = f"All items processed ({total} total)"
+                        self._emit_event(ExecutorEvent.RUN_COMPLETED, stop_reason)
+                        self._run.status = RunStatus.COMPLETED
+                        break
+
+                    if total == 0:
+                        # No items exist yet - waiting for generator
+                        self._emit_event(
+                            ExecutorEvent.HEARTBEAT,
+                            f"Consumer loop waiting for items from source (none exist yet)",
+                            mode=mode_name,
+                        )
+                    else:
+                        # Items exist but all are claimed/in-progress
+                        self._emit_event(
+                            ExecutorEvent.HEARTBEAT,
+                            f"Consumer loop waiting ({pending} pending, {total} total)",
+                            mode=mode_name,
+                        )
+
+                    # Use longer back-off when no items available
                     wait_time = max(5.0, self.config.limits.cooldown_between_iterations)
                     if not self._stopping:
                         await asyncio.sleep(wait_time)
@@ -1291,12 +1831,27 @@ class LoopExecutor:
 
                 if result.success:
                     self._consecutive_errors = 0
+
+                    # Handle git commit for consumer loops after successful implementation
+                    if self._is_consumer_loop():
+                        # Pass the processed item for commit message templating
+                        git_success = await self._handle_git_commit(
+                            mode_name,
+                            result,
+                            item=result.claimed_item,
+                        )
+                        if not git_success:
+                            # Git commit failed with fail_on_error=True
+                            result.success = False
+                            result.error_message = "Git commit failed"
                 else:
                     self._consecutive_errors += 1
                     self._emit_event(
                         ExecutorEvent.ERROR,
                         result.error_message or "Iteration failed",
                         mode=mode_name,
+                        consecutive_errors=self._consecutive_errors,
+                        max_consecutive_errors=self.config.limits.max_consecutive_errors,
                     )
 
                 self._emit_event(
@@ -1377,3 +1932,168 @@ class LoopExecutor:
             self._run.status = RunStatus.ACTIVE
             self.db.update_run(self._run.id, status="active")
             self._emit_event(ExecutorEvent.RUN_RESUMED, "Run resumed")
+
+    # ========== Git Integration ==========
+
+    async def _handle_git_commit(
+        self,
+        mode_name: str,
+        result: "IterationResult",
+        item: Optional[dict] = None,
+    ) -> bool:
+        """Commit changes after successful implementation.
+
+        Args:
+            mode_name: Name of the mode that was executed.
+            result: Result of the iteration.
+            item: The work item that was processed (for consumer loops).
+
+        Returns:
+            True if commit succeeded (or not enabled), False if commit failed.
+        """
+        if not self.config.git or not self.config.git.enabled:
+            return True
+        if not self.config.git.auto_commit or not result.success:
+            return True
+
+        # Check .git exists
+        git_dir = Path(self.project.path) / ".git"
+        if not git_dir.exists():
+            self._emit_event(
+                ExecutorEvent.WARNING,
+                "Git enabled but no .git directory found",
+            )
+            return True  # Not a fatal error unless fail_on_error is True
+
+        # Build commit message
+        template = self.config.git.commit_template or "Implement {item_id}"
+        item_id = item.get("id", "unknown") if item else "batch"
+        item_title = item.get("title", "")[:50] if item else ""
+        message = template.format(
+            iteration=self._iteration,
+            mode=mode_name,
+            item_id=item_id,
+            summary=item_title,
+        )
+
+        # Run git commit
+        success = await self._run_git_commit(message)
+
+        if not success and self.config.git.fail_on_error:
+            return False
+
+        return True
+
+    async def _run_git_commit(self, message: str) -> bool:
+        """Execute git add and commit.
+
+        Args:
+            message: Commit message.
+
+        Returns:
+            True if commit succeeded, False otherwise.
+        """
+        project_path = Path(self.project.path)
+
+        try:
+            # Run git add -A to stage all changes
+            add_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["git", "add", "-A"],
+                    cwd=project_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ),
+            )
+
+            if add_result.returncode != 0:
+                self._emit_event(
+                    ExecutorEvent.WARNING,
+                    f"git add failed: {add_result.stderr.strip()}",
+                )
+                return False
+
+            # Check if there are changes to commit
+            status_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["git", "diff", "--cached", "--quiet"],
+                    cwd=project_path,
+                    capture_output=True,
+                    timeout=30,
+                ),
+            )
+
+            if status_result.returncode == 0:
+                # No changes to commit
+                self._emit_event(
+                    ExecutorEvent.HEARTBEAT,
+                    "No changes to commit",
+                )
+                return True
+
+            # Run git commit
+            commit_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["git", "commit", "-m", message],
+                    cwd=project_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                ),
+            )
+
+            if commit_result.returncode != 0:
+                # Check for pre-commit hook failure or merge conflict
+                stderr = commit_result.stderr.strip()
+                if "hook" in stderr.lower() or "pre-commit" in stderr.lower():
+                    self._emit_event(
+                        ExecutorEvent.WARNING,
+                        f"Pre-commit hook rejected commit: {stderr}",
+                    )
+                elif "conflict" in stderr.lower():
+                    self._emit_event(
+                        ExecutorEvent.WARNING,
+                        f"Merge conflict detected: {stderr}",
+                    )
+                else:
+                    self._emit_event(
+                        ExecutorEvent.WARNING,
+                        f"git commit failed: {stderr}",
+                    )
+                return False
+
+            # Parse commit hash from output (usually in first line)
+            output = commit_result.stdout.strip()
+            commit_hash = ""
+            if output:
+                # Try to extract short hash from output like "[main abc1234] message"
+                import re
+                match = re.search(r'\[[\w-]+\s+([a-f0-9]+)\]', output)
+                if match:
+                    commit_hash = match.group(1)
+
+            self._emit_event(
+                ExecutorEvent.GIT_COMMIT,
+                f"Committed changes: {message[:50]}",
+                commit_hash=commit_hash,
+                message=message,
+            )
+
+            return True
+
+        except subprocess.TimeoutExpired:
+            self._emit_event(
+                ExecutorEvent.WARNING,
+                "Git operation timed out",
+            )
+            return False
+        except Exception as e:
+            self._emit_event(
+                ExecutorEvent.WARNING,
+                f"Git operation failed: {e}",
+            )
+            return False

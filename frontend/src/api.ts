@@ -122,6 +122,8 @@ export async function listLoops(slug: string) {
     type: string
     modes: string[]
     item_types?: ItemTypes
+    workflow_id?: string  // Optional - legacy loops may not have this
+    step_id?: number
   }[]>(`/projects/${slug}/loops`)
 }
 
@@ -186,7 +188,8 @@ export interface CategoryInfo {
 
 export interface PhaseInfoResponse {
   loop_name: string
-  source_loop: string | null
+  workflow_id: string | null
+  source_step_id: number | null
   total_items: number
   phases: PhaseInfo[]
   categories: CategoryInfo[]
@@ -215,6 +218,12 @@ export async function pauseLoop(slug: string, loopName: string) {
 export async function resumeLoop(slug: string, loopName: string) {
   return request<{ message: string }>(`/projects/${slug}/loops/${loopName}/resume`, {
     method: 'POST',
+  })
+}
+
+export async function deleteLoop(slug: string, loopName: string) {
+  return request<void>(`/projects/${slug}/loops/${loopName}`, {
+    method: 'DELETE',
   })
 }
 
@@ -248,13 +257,13 @@ export async function createLoop(slug: string, name: string, content: string) {
 // Items (Work Items)
 export interface Item {
   id: string
-  project_id: string
+  workflow_id: string
+  source_step_id: number
   content: string
   title?: string
   status: string
   category?: string
   priority?: number
-  source_loop?: string
   item_type?: string
   claimed_by?: string
   claimed_at?: string
@@ -267,6 +276,7 @@ export interface Item {
   phase?: number
   duplicate_of?: string
   skip_reason?: string
+  tags?: string[]
 }
 
 export async function listItems(
@@ -274,7 +284,8 @@ export async function listItems(
   params?: {
     status?: string
     category?: string
-    source_loop?: string
+    workflow_id?: string
+    source_step_id?: number
     limit?: number
     offset?: number
   }
@@ -282,7 +293,8 @@ export async function listItems(
   const searchParams = new URLSearchParams()
   if (params?.status) searchParams.set('status', params.status)
   if (params?.category) searchParams.set('category', params.category)
-  if (params?.source_loop) searchParams.set('source_loop', params.source_loop)
+  if (params?.workflow_id) searchParams.set('workflow_id', params.workflow_id)
+  if (params?.source_step_id) searchParams.set('source_step_id', params.source_step_id.toString())
   if (params?.limit) searchParams.set('limit', params.limit.toString())
   if (params?.offset) searchParams.set('offset', params.offset.toString())
 
@@ -303,6 +315,8 @@ export async function createItem(
   slug: string,
   data: {
     content: string
+    workflow_id: string
+    source_step_id: number
     category?: string
     priority?: number
     metadata?: Record<string, unknown>
@@ -378,6 +392,60 @@ export async function browseDirectory(path?: string) {
     canGoUp: boolean
     parent: string | null
   }>(`/filesystem/browse${params}`)
+}
+
+// Ready Check (Pre-Flight Clarification)
+export interface ReadyCheckQuestion {
+  id: string
+  category: string
+  question: string
+  context?: string
+}
+
+export interface ReadyCheckAnswer {
+  question_id: string
+  answer: string
+}
+
+export interface ReadyCheckStatus {
+  has_qa: boolean
+  qa_count: number
+  last_updated?: string
+  qa_summary: string[]
+  resource_id?: number
+}
+
+export interface ReadyCheckTriggerResponse {
+  status: 'analyzing' | 'questions' | 'ready'
+  questions: ReadyCheckQuestion[]
+  assessment?: string
+  session_id?: string
+}
+
+export async function getReadyCheckStatus(slug: string, loopName: string) {
+  return request<ReadyCheckStatus>(`/projects/${slug}/loops/${loopName}/ready-check`)
+}
+
+export async function triggerReadyCheck(slug: string, loopName: string) {
+  return request<ReadyCheckTriggerResponse>(`/projects/${slug}/loops/${loopName}/ready-check`, {
+    method: 'POST',
+  })
+}
+
+export async function submitReadyCheckAnswers(
+  slug: string,
+  loopName: string,
+  questions: ReadyCheckQuestion[],
+  answers: ReadyCheckAnswer[]
+) {
+  return request<{
+    saved: boolean
+    resource_id?: number
+    can_start: boolean
+  }>(`/projects/${slug}/loops/${loopName}/ready-check/answers`, {
+    method: 'POST',
+    body: JSON.stringify({ questions, answers }),
+  })
 }
 
 // Runs
@@ -495,7 +563,11 @@ export interface PermissionTemplateDetail extends PermissionTemplateInfo {
 }
 
 export async function listPermissionTemplates() {
-  return request<PermissionTemplateInfo[]>('/permission-templates')
+  return request<PermissionTemplateInfo[]>('/projects/permission-templates')
+}
+
+export async function getPermissionTemplate(templateId: string) {
+  return request<PermissionTemplateDetail>(`/projects/permission-templates/${templateId}`)
 }
 
 export async function applyPermissionTemplate(
@@ -509,6 +581,48 @@ export async function applyPermissionTemplate(
   }>(`/projects/${slug}/loops/${loopName}/apply-permissions`, {
     method: 'POST',
     body: JSON.stringify({ template_id: templateId }),
+  })
+}
+
+// Loop Permissions
+export interface LoopPermissions {
+  has_custom: boolean
+  source: 'custom' | 'template' | 'default'
+  permissions: {
+    allow: string[]
+    deny?: string[]
+  }
+  settings_path: string
+  template_id?: string
+}
+
+export async function getLoopPermissions(
+  slug: string,
+  loopName: string
+): Promise<LoopPermissions> {
+  return request<LoopPermissions>(`/projects/${slug}/loops/${loopName}/permissions`)
+}
+
+export async function updateLoopPermissions(
+  slug: string,
+  loopName: string,
+  data: {
+    permissions?: { allow: string[]; deny?: string[] }
+    template_id?: string
+  }
+): Promise<LoopPermissions> {
+  return request<LoopPermissions>(`/projects/${slug}/loops/${loopName}/permissions`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteLoopPermissions(
+  slug: string,
+  loopName: string
+): Promise<void> {
+  return request<void>(`/projects/${slug}/loops/${loopName}/permissions`, {
+    method: 'DELETE',
   })
 }
 
@@ -1040,6 +1154,766 @@ export async function cleanupLogs(days: number = 30): Promise<{ deleted: number;
   return request<{ deleted: number; days: number }>(`/logs?days=${days}`, {
     method: 'DELETE',
   })
+}
+
+// ============================================================================
+// Loop Resources API (per-loop resources)
+// ============================================================================
+
+export interface LoopResource {
+  id: number
+  loop_name: string
+  resource_type: 'loop_template' | 'design_doc' | 'guardrails' | 'custom'
+  name: string
+  injection_position: 'template_body' | 'before_prompt' | 'after_design_doc' | 'before_task' | 'after_task'
+  source_type: 'system' | 'project_file' | 'loop_ref' | 'project_resource' | 'inline'
+  source_path?: string | null
+  source_loop?: string | null
+  source_resource_id?: number | null
+  enabled: boolean
+  priority: number
+  created_at?: string
+  content?: string | null
+}
+
+export interface CreateLoopResourceRequest {
+  resource_type: string
+  name: string
+  injection_position?: string
+  source_type: string
+  source_path?: string
+  source_loop?: string
+  source_resource_id?: number
+  inline_content?: string
+  enabled?: boolean
+  priority?: number
+}
+
+export interface UpdateLoopResourceRequest {
+  name?: string
+  injection_position?: string
+  source_type?: string
+  source_path?: string
+  source_loop?: string
+  source_resource_id?: number
+  inline_content?: string
+  enabled?: boolean
+  priority?: number
+}
+
+export async function listLoopResources(
+  slug: string,
+  loopName: string,
+  includeContent: boolean = false
+): Promise<LoopResource[]> {
+  const params = includeContent ? '?include_content=true' : ''
+  return request<LoopResource[]>(`/projects/${slug}/loops/${loopName}/resources${params}`)
+}
+
+export async function getLoopResource(
+  slug: string,
+  loopName: string,
+  resourceId: number,
+  includeContent: boolean = true
+): Promise<LoopResource> {
+  const params = includeContent ? '?include_content=true' : ''
+  return request<LoopResource>(`/projects/${slug}/loops/${loopName}/resources/${resourceId}${params}`)
+}
+
+export async function createLoopResource(
+  slug: string,
+  loopName: string,
+  data: CreateLoopResourceRequest
+): Promise<LoopResource> {
+  return request<LoopResource>(`/projects/${slug}/loops/${loopName}/resources`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function updateLoopResource(
+  slug: string,
+  loopName: string,
+  resourceId: number,
+  data: UpdateLoopResourceRequest
+): Promise<LoopResource> {
+  return request<LoopResource>(`/projects/${slug}/loops/${loopName}/resources/${resourceId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteLoopResource(
+  slug: string,
+  loopName: string,
+  resourceId: number
+): Promise<void> {
+  return request<void>(`/projects/${slug}/loops/${loopName}/resources/${resourceId}`, {
+    method: 'DELETE',
+  })
+}
+
+// ============================================================================
+// Workflows API
+// ============================================================================
+
+export interface WorkflowStep {
+  id: number
+  workflow_id: string
+  step_number: number
+  name: string
+  step_type: 'interactive' | 'autonomous'
+  status: 'pending' | 'active' | 'completed' | 'skipped'
+  config?: {
+    description?: string
+    loopType?: string
+    model?: 'sonnet' | 'opus' | 'haiku'
+    timeout?: number
+    allowedTools?: string[]
+    inputs?: string[]
+    outputs?: string[]
+    skippable?: boolean
+    skipCondition?: string
+    architecture_first?: boolean
+  }
+  loop_name?: string
+  artifacts?: Record<string, unknown>
+  started_at?: string
+  completed_at?: string
+}
+
+export interface Workflow {
+  id: string
+  template_id?: string
+  name: string
+  namespace: string
+  status: 'draft' | 'active' | 'paused' | 'completed'
+  current_step: number
+  created_at: string
+  updated_at: string
+  steps: WorkflowStep[]
+}
+
+export interface WorkflowTemplateStep {
+  number: number
+  name: string
+  type: 'interactive' | 'autonomous'
+  description?: string
+  loopType?: string
+  inputs?: string[]
+  outputs?: string[]
+  skippable?: boolean
+  skipCondition?: string
+}
+
+export interface WorkflowTemplate {
+  id: string
+  name: string
+  description?: string
+  steps: WorkflowTemplateStep[]
+  created_at: string
+}
+
+export async function listWorkflowTemplates(slug: string): Promise<WorkflowTemplate[]> {
+  return request<WorkflowTemplate[]>(`/projects/${slug}/workflow-templates`)
+}
+
+export async function getWorkflowTemplate(slug: string, templateId: string): Promise<WorkflowTemplate> {
+  return request<WorkflowTemplate>(`/projects/${slug}/workflow-templates/${templateId}`)
+}
+
+export async function listWorkflows(slug: string, status?: string): Promise<Workflow[]> {
+  const params = status ? `?status_filter=${status}` : ''
+  return request<Workflow[]>(`/projects/${slug}/workflows${params}`)
+}
+
+export async function getWorkflow(slug: string, workflowId: string): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows/${workflowId}`)
+}
+
+export async function createWorkflow(
+  slug: string,
+  data: { name: string; template_id?: string; config?: { architecture_first?: boolean } }
+): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function updateWorkflow(
+  slug: string,
+  workflowId: string,
+  data: { name?: string; status?: string }
+): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows/${workflowId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteWorkflow(slug: string, workflowId: string): Promise<void> {
+  return request<void>(`/projects/${slug}/workflows/${workflowId}`, {
+    method: 'DELETE',
+  })
+}
+
+export async function startWorkflow(slug: string, workflowId: string): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows/${workflowId}/start`, {
+    method: 'POST',
+  })
+}
+
+export async function pauseWorkflow(slug: string, workflowId: string): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows/${workflowId}/pause`, {
+    method: 'POST',
+  })
+}
+
+export async function advanceWorkflowStep(
+  slug: string,
+  workflowId: string,
+  options?: { skip_current?: boolean; artifacts?: Record<string, unknown> }
+): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows/${workflowId}/advance`, {
+    method: 'POST',
+    body: JSON.stringify(options || {}),
+  })
+}
+
+// Step CRUD operations
+export async function createWorkflowStep(
+  slug: string,
+  workflowId: string,
+  data: {
+    name: string
+    step_type: 'interactive' | 'autonomous'
+    description?: string
+    loop_type?: string
+    skippable?: boolean
+    model?: 'sonnet' | 'opus' | 'haiku'
+    timeout?: number
+    allowed_tools?: string[]
+  }
+): Promise<WorkflowStep> {
+  return request<WorkflowStep>(`/projects/${slug}/workflows/${workflowId}/steps`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function updateWorkflowStep(
+  slug: string,
+  workflowId: string,
+  stepId: number,
+  data: {
+    name?: string
+    step_type?: 'interactive' | 'autonomous'
+    description?: string
+    loop_type?: string
+    skippable?: boolean
+    model?: 'sonnet' | 'opus' | 'haiku'
+    timeout?: number
+    allowed_tools?: string[]
+  }
+): Promise<WorkflowStep> {
+  return request<WorkflowStep>(`/projects/${slug}/workflows/${workflowId}/steps/${stepId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteWorkflowStep(
+  slug: string,
+  workflowId: string,
+  stepId: number
+): Promise<void> {
+  return request<void>(`/projects/${slug}/workflows/${workflowId}/steps/${stepId}`, {
+    method: 'DELETE',
+  })
+}
+
+export async function reorderWorkflowSteps(
+  slug: string,
+  workflowId: string,
+  stepIds: number[]
+): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows/${workflowId}/steps/reorder`, {
+    method: 'POST',
+    body: JSON.stringify({ step_ids: stepIds }),
+  })
+}
+
+// ============================================================================
+// Planning Sessions API
+// ============================================================================
+
+export interface PlanningMessage {
+  role: 'user' | 'assistant'
+  content: string
+  timestamp: string
+  metadata?: Record<string, unknown>
+}
+
+export interface PlanningSession {
+  id: string
+  workflow_id: string
+  step_id: number
+  messages: PlanningMessage[]
+  artifacts?: {
+    design_doc?: string
+    guardrails?: string
+  }
+  status: 'active' | 'completed'
+  created_at: string
+  updated_at: string
+}
+
+export async function getPlanningSession(
+  slug: string,
+  workflowId: string
+): Promise<PlanningSession> {
+  return request<PlanningSession>(`/projects/${slug}/workflows/${workflowId}/planning`)
+}
+
+export async function sendPlanningMessage(
+  slug: string,
+  workflowId: string,
+  content: string
+): Promise<PlanningSession> {
+  return request<PlanningSession>(`/projects/${slug}/workflows/${workflowId}/planning/message`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  })
+}
+
+export async function updatePlanningArtifacts(
+  slug: string,
+  workflowId: string,
+  artifacts: { design_doc?: string; guardrails?: string }
+): Promise<PlanningSession> {
+  return request<PlanningSession>(`/projects/${slug}/workflows/${workflowId}/planning/artifacts`, {
+    method: 'PATCH',
+    body: JSON.stringify(artifacts),
+  })
+}
+
+export async function completePlanningSession(
+  slug: string,
+  workflowId: string,
+  artifacts?: { design_doc?: string; guardrails?: string }
+): Promise<PlanningSession> {
+  return request<PlanningSession>(`/projects/${slug}/workflows/${workflowId}/planning/complete`, {
+    method: 'POST',
+    body: JSON.stringify(artifacts || {}),
+  })
+}
+
+export function streamPlanningResponse(
+  slug: string,
+  workflowId: string
+): EventSource {
+  return new EventSource(`${API_BASE}/projects/${slug}/workflows/${workflowId}/planning/stream`)
+}
+
+export function streamPlanningArtifacts(
+  slug: string,
+  workflowId: string
+): EventSource {
+  return new EventSource(`${API_BASE}/projects/${slug}/workflows/${workflowId}/planning/generate-artifacts`)
+}
+
+// ============================================================================
+// Workflow Resources API
+// ============================================================================
+
+export interface WorkflowResource {
+  id: number
+  workflow_id: string
+  resource_type: string
+  name: string
+  content?: string
+  file_path?: string
+  source?: string
+  source_id?: number
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export async function listWorkflowResources(
+  slug: string,
+  workflowId: string,
+  params?: { resource_type?: string; enabled?: boolean }
+): Promise<WorkflowResource[]> {
+  const searchParams = new URLSearchParams()
+  if (params?.resource_type) searchParams.set('resource_type', params.resource_type)
+  if (params?.enabled !== undefined) searchParams.set('enabled', params.enabled.toString())
+  const query = searchParams.toString()
+  return request<WorkflowResource[]>(
+    `/projects/${slug}/workflows/${workflowId}/resources${query ? `?${query}` : ''}`
+  )
+}
+
+export async function createWorkflowResource(
+  slug: string,
+  workflowId: string,
+  data: {
+    resource_type: string
+    name: string
+    content: string
+    source?: string
+  }
+): Promise<WorkflowResource> {
+  return request<WorkflowResource>(`/projects/${slug}/workflows/${workflowId}/resources`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function getWorkflowResource(
+  slug: string,
+  workflowId: string,
+  resourceId: number
+): Promise<WorkflowResource> {
+  return request<WorkflowResource>(
+    `/projects/${slug}/workflows/${workflowId}/resources/${resourceId}`
+  )
+}
+
+export async function updateWorkflowResource(
+  slug: string,
+  workflowId: string,
+  resourceId: number,
+  data: {
+    name?: string
+    content?: string
+    enabled?: boolean
+  }
+): Promise<WorkflowResource> {
+  return request<WorkflowResource>(
+    `/projects/${slug}/workflows/${workflowId}/resources/${resourceId}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }
+  )
+}
+
+export async function deleteWorkflowResource(
+  slug: string,
+  workflowId: string,
+  resourceId: number
+): Promise<void> {
+  return request<void>(
+    `/projects/${slug}/workflows/${workflowId}/resources/${resourceId}`,
+    { method: 'DELETE' }
+  )
+}
+
+export async function importProjectResourceToWorkflow(
+  slug: string,
+  workflowId: string,
+  projectResourceId: number
+): Promise<WorkflowResource> {
+  return request<WorkflowResource>(
+    `/projects/${slug}/workflows/${workflowId}/resources/import/${projectResourceId}`,
+    { method: 'POST' }
+  )
+}
+
+// ============================================================================
+// Step Resources API (Per-Step Resource Overrides)
+// ============================================================================
+
+export interface StepResource {
+  id: number
+  step_id: number
+  workflow_resource_id?: number
+  resource_type?: string
+  name?: string
+  content?: string
+  file_path?: string
+  mode: 'override' | 'disable' | 'add'
+  enabled: boolean
+  priority: number
+  created_at: string
+  updated_at: string
+}
+
+export interface EffectiveResource {
+  id: number
+  resource_type: string
+  name: string
+  content?: string
+  file_path?: string
+  source: 'workflow' | 'step_override' | 'step_add'
+  priority?: number
+}
+
+export interface PromptSection {
+  position: string
+  content: string
+  resource_name?: string
+  resource_type?: string
+}
+
+export interface PreviewPromptResponse {
+  prompt_sections: PromptSection[]
+  resources_used: string[]
+  total_chars: number
+  total_tokens_estimate: number
+}
+
+export async function listStepResources(
+  slug: string,
+  workflowId: string,
+  stepId: number
+): Promise<StepResource[]> {
+  return request<StepResource[]>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/resources`
+  )
+}
+
+export async function getEffectiveStepResources(
+  slug: string,
+  workflowId: string,
+  stepId: number
+): Promise<EffectiveResource[]> {
+  return request<EffectiveResource[]>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/resources/effective`
+  )
+}
+
+export async function createStepResource(
+  slug: string,
+  workflowId: string,
+  stepId: number,
+  data: {
+    mode: 'override' | 'disable' | 'add'
+    workflow_resource_id?: number
+    resource_type?: string
+    name?: string
+    content?: string
+    file_path?: string
+    enabled?: boolean
+    priority?: number
+  }
+): Promise<StepResource> {
+  return request<StepResource>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/resources`,
+    {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }
+  )
+}
+
+export async function updateStepResource(
+  slug: string,
+  workflowId: string,
+  stepId: number,
+  resourceId: number,
+  data: {
+    name?: string
+    content?: string
+    file_path?: string
+    enabled?: boolean
+    priority?: number
+  }
+): Promise<StepResource> {
+  return request<StepResource>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/resources/${resourceId}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }
+  )
+}
+
+export async function deleteStepResource(
+  slug: string,
+  workflowId: string,
+  stepId: number,
+  resourceId: number
+): Promise<void> {
+  return request<void>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/resources/${resourceId}`,
+    { method: 'DELETE' }
+  )
+}
+
+export async function disableInheritedResource(
+  slug: string,
+  workflowId: string,
+  stepId: number,
+  workflowResourceId: number
+): Promise<StepResource> {
+  return request<StepResource>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/resources/disable/${workflowResourceId}`,
+    { method: 'POST' }
+  )
+}
+
+export async function enableInheritedResource(
+  slug: string,
+  workflowId: string,
+  stepId: number,
+  workflowResourceId: number
+): Promise<void> {
+  return request<void>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/resources/disable/${workflowResourceId}`,
+    { method: 'DELETE' }
+  )
+}
+
+export async function previewStepPrompt(
+  slug: string,
+  workflowId: string,
+  stepId: number
+): Promise<PreviewPromptResponse> {
+  return request<PreviewPromptResponse>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/preview-prompt`
+  )
+}
+
+// ============================================================================
+// Project Resources (Shared Library) API
+// ============================================================================
+
+export interface ProjectResource {
+  id: number
+  resource_type: string
+  name: string
+  content?: string
+  description?: string
+  auto_inherit: boolean
+  created_at: string
+  updated_at: string
+}
+
+export async function listProjectResources(
+  slug: string,
+  params?: { resource_type?: string }
+): Promise<ProjectResource[]> {
+  const searchParams = new URLSearchParams()
+  if (params?.resource_type) searchParams.set('resource_type', params.resource_type)
+  const query = searchParams.toString()
+  return request<ProjectResource[]>(
+    `/projects/${slug}/project-resources${query ? `?${query}` : ''}`
+  )
+}
+
+export async function createProjectResource(
+  slug: string,
+  data: {
+    resource_type: string
+    name: string
+    content: string
+    description?: string
+    auto_inherit?: boolean
+  }
+): Promise<ProjectResource> {
+  return request<ProjectResource>(`/projects/${slug}/project-resources`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function getProjectResource(
+  slug: string,
+  resourceId: number
+): Promise<ProjectResource> {
+  return request<ProjectResource>(
+    `/projects/${slug}/project-resources/${resourceId}`
+  )
+}
+
+export async function updateProjectResource(
+  slug: string,
+  resourceId: number,
+  data: {
+    name?: string
+    content?: string
+    description?: string
+    auto_inherit?: boolean
+  }
+): Promise<ProjectResource> {
+  return request<ProjectResource>(
+    `/projects/${slug}/project-resources/${resourceId}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }
+  )
+}
+
+export async function deleteProjectResource(
+  slug: string,
+  resourceId: number
+): Promise<void> {
+  return request<void>(
+    `/projects/${slug}/project-resources/${resourceId}`,
+    { method: 'DELETE' }
+  )
+}
+
+// ============================================================================
+// JSONL Import API
+// ============================================================================
+
+export interface ImportFormat {
+  id: string
+  label: string
+  description?: string
+  field_mapping: Record<string, string>
+  sample_content?: string
+}
+
+export interface ImportJsonlResponse {
+  imported: number
+  skipped: number
+  errors: string[]
+  total_lines: number
+}
+
+export async function listImportFormats(slug: string): Promise<ImportFormat[]> {
+  return request<ImportFormat[]>(`/projects/${slug}/import-formats`)
+}
+
+export async function importJsonlToWorkflow(
+  slug: string,
+  workflowId: string,
+  sourceStepId: number,
+  formatId: string,
+  file: File,
+  loopName?: string
+): Promise<ImportJsonlResponse> {
+  const formData = new FormData()
+  formData.append('file', file)
+
+  const params = new URLSearchParams({
+    format_id: formatId,
+    workflow_id: workflowId,
+    source_step_id: sourceStepId.toString(),
+  })
+  if (loopName) params.set('loop_name', loopName)
+
+  const response = await fetch(
+    `${API_BASE}/projects/${slug}/import-jsonl?${params}`,
+    {
+      method: 'POST',
+      body: formData,
+    }
+  )
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}))
+    const message = errorData.error?.message || errorData.detail || response.statusText
+    throw new APIError(message, response.status, errorData.error?.code)
+  }
+
+  return response.json()
 }
 
 export { APIError }

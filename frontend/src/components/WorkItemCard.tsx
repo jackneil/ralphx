@@ -67,9 +67,14 @@ export default function WorkItemCard({ projectSlug, item, onUpdate, terminology 
               Phase {item.phase}
             </span>
           )}
-          {item.source_loop && (
-            <span className="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300" title="Source loop">
-              {item.source_loop}
+          {item.workflow_id && (
+            <span className="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300" title="Workflow ID">
+              {item.workflow_id.slice(0, 8)}
+            </span>
+          )}
+          {item.source_step_id && (
+            <span className="text-xs px-2 py-0.5 rounded bg-indigo-900/50 text-indigo-300" title="Source step">
+              Step {item.source_step_id}
             </span>
           )}
           {item.item_type && item.item_type !== 'item' && (
@@ -162,7 +167,8 @@ export default function WorkItemCard({ projectSlug, item, onUpdate, terminology 
               <div>Processed: {new Date(item.processed_at).toLocaleString()}</div>
             )}
             <div>ID: {item.id}</div>
-            {item.source_loop && <div>Source: {item.source_loop}</div>}
+            {item.workflow_id && <div>Workflow: {item.workflow_id}</div>}
+            {item.source_step_id !== undefined && <div>Source Step: {item.source_step_id}</div>}
             {item.item_type && <div>Type: {itemTypeName}</div>}
             {item.phase !== undefined && <div>Phase: {item.phase}</div>}
             {item.duplicate_of && <div>Duplicate of: {item.duplicate_of}</div>}

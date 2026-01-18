@@ -25,7 +25,7 @@ export default function Dashboard() {
       <div className="mb-8">
         <h1 className="text-3xl font-bold text-white mb-2">Dashboard</h1>
         <p className="text-gray-400">
-          Manage your RalphX projects and loops
+          Manage your RalphX projects and workflows
         </p>
       </div>
 
@@ -100,7 +100,7 @@ export default function Dashboard() {
             <EmptyState
               icon={EMPTY_STATE_ICONS.folder}
               title="No projects yet"
-              description="Create your first project to start building AI-powered development loops."
+              description="Create your first project to start building AI-powered development workflows."
               action={{
                 label: 'Add Project',
                 onClick: () => setShowAddProject(true),
@@ -142,7 +142,7 @@ export default function Dashboard() {
         </div>
         <div className="card">
           <div className="text-3xl font-bold text-green-400">0</div>
-          <div className="text-sm text-gray-400">Active Loops</div>
+          <div className="text-sm text-gray-400">Active Workflows</div>
         </div>
         <div className="card">
           <div className="text-3xl font-bold text-yellow-400">0</div>

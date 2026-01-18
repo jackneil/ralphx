@@ -275,8 +275,14 @@ class ImportManager:
         source_path: Path,
         loop_name: str,
         project_id: str,
+        workflow_id: str = None,
+        source_step_id: int = None,
     ) -> ImportResult:
         """Import a JSONL file as work items.
+
+        DEPRECATED: This method uses the legacy loop-centric model.
+        In the workflow-first architecture, work items must belong to a workflow.
+        Use ProjectDatabase.import_jsonl with workflow_id and source_step_id instead.
 
         Each line should be a JSON object with at least:
         - id: Item identifier
@@ -292,10 +298,27 @@ class ImportManager:
             source_path: Path to the JSONL file.
             loop_name: Name of the loop these items belong to.
             project_id: Project ID for database insertion.
+            workflow_id: (Required for new usage) Parent workflow ID.
+            source_step_id: (Required for new usage) Step that created these items.
 
         Returns:
             ImportResult with import status.
         """
+        # TODO(migration): Remove legacy path after full workflow migration
+        if workflow_id is None or source_step_id is None:
+            import logging
+            logging.warning(
+                f"import_jsonl called without workflow context for loop {loop_name}. "
+                "This legacy usage is deprecated. Work items now require workflow_id "
+                "and source_step_id."
+            )
+            return ImportResult(
+                success=False,
+                errors=[
+                    "Legacy import without workflow context is no longer supported. "
+                    "Work items must belong to a workflow. Use workflow-based creation instead."
+                ],
+            )
         if not self.project_db:
             return ImportResult(
                 success=False,
@@ -331,18 +354,17 @@ class ImportManager:
                             errors.append(f"Line {line_num}: missing 'content' field")
                             continue
 
-                        # Create work item
+                        # Create work item (workflow-scoped)
                         self.project_db.create_work_item(
                             id=str(item["id"]),
-                            project_id=project_id,
+                            workflow_id=workflow_id,
+                            source_step_id=source_step_id,
                             content=item["content"],
                             title=item.get("title"),
                             priority=item.get("priority"),
                             status="completed",  # Items ready for consumption
                             category=item.get("category"),
-                            tags=item.get("tags"),
                             metadata=item.get("metadata"),
-                            source_loop=loop_name,
                             item_type=item.get("item_type", "story"),
                         )
                         items_created += 1

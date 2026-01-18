@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useNavigate } from 'react-router-dom'
 import { useDashboardStore } from '../stores/dashboard'
 import {
   getProject,
@@ -15,8 +15,12 @@ import {
   deleteLoopInput,
   applyInputTemplate,
   validateLoopInputs,
+  getReadyCheckStatus,
+  startLoop,
+  deleteLoop,
   type InputFileInfo,
   type ValidationResult,
+  type ReadyCheckStatus,
 } from '../api'
 import LoopControl from '../components/LoopControl'
 import ProgressBar from '../components/ProgressBar'
@@ -24,6 +28,9 @@ import SessionTail from '../components/SessionTail'
 import { LoopBuilder } from '../components/LoopBuilder'
 import { EmptyState, EMPTY_STATE_ICONS } from '../components/Help'
 import InputTemplateSelector from '../components/InputTemplateSelector'
+import LoopResourceManager from '../components/LoopResourceManager'
+import ReadyCheckModal from '../components/ReadyCheckModal'
+import { confirm as confirmDialog, toast } from '../lib/alerts'
 
 const TAG_LABELS: Record<string, string> = {
   master_design: 'Master Design',
@@ -33,7 +40,7 @@ const TAG_LABELS: Record<string, string> = {
   reference: 'Reference',
 }
 
-type TabType = 'overview' | 'items' | 'inputs' | 'runs'
+type TabType = 'overview' | 'items' | 'inputs' | 'resources' | 'runs'
 
 interface LoopDetail {
   name: string
@@ -52,6 +59,7 @@ interface LoopStatus {
 
 export default function LoopDetail() {
   const { slug, loopName } = useParams<{ slug: string; loopName: string }>()
+  const navigate = useNavigate()
   const { selectedProject, setSelectedProject, items, itemsTotal, itemsLoading, setItems, setItemsLoading } = useDashboardStore()
 
   const [loop, setLoop] = useState<LoopDetail | null>(null)
@@ -74,6 +82,14 @@ export default function LoopDetail() {
   const [showTemplateSelector, setShowTemplateSelector] = useState(false)
   const [validation, setValidation] = useState<ValidationResult | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // Ready Check state
+  const [readyCheckStatus, setReadyCheckStatus] = useState<ReadyCheckStatus | null>(null)
+  const [showReadyCheckModal, setShowReadyCheckModal] = useState(false)
+  // Items filtering state
+  const [itemsStatusFilter, setItemsStatusFilter] = useState<string>('')
+  const [itemsCategoryFilter, setItemsCategoryFilter] = useState<string>('')
+  const [itemsOffset, setItemsOffset] = useState(0)
+  const [itemsCategories, setItemsCategories] = useState<string[]>([])
 
   const loadStatus = useCallback(async () => {
     if (!slug || !loopName) return
@@ -85,19 +101,39 @@ export default function LoopDetail() {
     }
   }, [slug, loopName])
 
-  const loadItems = useCallback(async () => {
+  const loadItems = useCallback(async (resetOffset = false) => {
     if (!slug || !loopName) return
     setItemsLoading(true)
+    const offset = resetOffset ? 0 : itemsOffset
+    if (resetOffset) setItemsOffset(0)
     try {
-      // Load items for this specific loop
-      const result = await listItems(slug, { source_loop: loopName, limit: 50 })
-      setItems(result.items, result.total)
+      // Load items - note: loops are now tied to workflows, items filter by workflow_id
+      const result = await listItems(slug, {
+        status: itemsStatusFilter || undefined,
+        category: itemsCategoryFilter || undefined,
+        limit: 50,
+        offset,
+      })
+      if (offset === 0) {
+        setItems(result.items, result.total)
+      } else {
+        // Append for "load more"
+        setItems([...items, ...result.items], result.total)
+      }
+      // Extract unique categories from items for the filter dropdown
+      const cats = new Set<string>()
+      result.items.forEach(i => { if (i.category) cats.add(i.category) })
+      if (offset === 0) {
+        setItemsCategories(Array.from(cats).sort())
+      } else {
+        setItemsCategories(prev => Array.from(new Set([...prev, ...cats])).sort())
+      }
     } catch {
       setItems([], 0)
     } finally {
       setItemsLoading(false)
     }
-  }, [slug, loopName, setItems, setItemsLoading])
+  }, [slug, loopName, setItems, setItemsLoading, itemsStatusFilter, itemsCategoryFilter, itemsOffset, items])
 
   const loadInputs = useCallback(async () => {
     if (!slug || !loopName || !loop) return
@@ -206,14 +242,36 @@ export default function LoopDetail() {
     return () => clearInterval(interval)
   }, [slug, loopName, setSelectedProject, loadStatus, setItems])
 
+  // Load ready check status
+  useEffect(() => {
+    if (!slug || !loopName) return
+    async function loadReadyCheck() {
+      try {
+        const status = await getReadyCheckStatus(slug!, loopName!)
+        setReadyCheckStatus(status)
+      } catch {
+        // Ready check status not available - that's fine
+        setReadyCheckStatus({ has_qa: false, qa_count: 0, qa_summary: [] })
+      }
+    }
+    loadReadyCheck()
+  }, [slug, loopName])
+
   // Load tab-specific data when tab changes
   useEffect(() => {
     if (activeTab === 'items') {
-      loadItems()
+      loadItems(true) // Reset offset when switching to tab
     } else if (activeTab === 'inputs') {
       loadInputs()
     }
-  }, [activeTab, loadItems, loadInputs])
+  }, [activeTab, loadInputs]) // Removed loadItems from deps to prevent loops
+
+  // Reload items when filters change
+  useEffect(() => {
+    if (activeTab === 'items' && slug && loopName) {
+      loadItems(true)
+    }
+  }, [itemsStatusFilter, itemsCategoryFilter]) // Only filter changes trigger reload
 
   // Handle Escape key for modal
   useEffect(() => {
@@ -253,6 +311,27 @@ export default function LoopDetail() {
     setLoop(loopDetail)
     setShowLoopBuilder(false)
   }, [slug, loopName])
+
+  const handleDeleteLoop = useCallback(async () => {
+    if (!slug || !loopName || !loop) return
+
+    // Check if running
+    if (status?.is_running) {
+      toast.error('Cannot delete a running loop. Stop it first.')
+      return
+    }
+
+    const confirmed = await confirmDialog.typeToDelete(loopName, 'loop')
+    if (!confirmed) return
+
+    try {
+      await deleteLoop(slug, loopName)
+      toast.success(`Loop "${loop.display_name}" deleted`)
+      navigate(`/projects/${slug}`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to delete loop')
+    }
+  }, [slug, loopName, loop, status?.is_running, navigate])
 
   if (loadError) {
     return (
@@ -324,6 +403,18 @@ export default function LoopDetail() {
             <span>Edit Config</span>
           </button>
 
+          {/* Delete Button */}
+          <button
+            onClick={handleDeleteLoop}
+            className="flex items-center space-x-2 px-4 py-2 bg-red-900/30 text-red-400 rounded hover:bg-red-900/50 border border-red-800/50 transition-colors"
+            title="Delete this loop"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+            <span>Delete</span>
+          </button>
+
           {/* Controls */}
           <LoopControl
             projectSlug={slug!}
@@ -353,7 +444,7 @@ export default function LoopDetail() {
       {/* Tabs */}
       <div className="border-b border-gray-700 mb-6">
         <nav className="flex space-x-8">
-          {(['overview', 'items', 'inputs', 'runs'] as TabType[]).map((tab) => (
+          {(['overview', 'items', 'inputs', 'resources', 'runs'] as TabType[]).map((tab) => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
@@ -369,9 +460,104 @@ export default function LoopDetail() {
         </nav>
       </div>
 
+      {/* Ready Check Modal */}
+      {showReadyCheckModal && (
+        <ReadyCheckModal
+          projectSlug={slug!}
+          loopName={loopName!}
+          onClose={() => setShowReadyCheckModal(false)}
+          onComplete={async (shouldStart) => {
+            setShowReadyCheckModal(false)
+            // Reload ready check status
+            try {
+              const status = await getReadyCheckStatus(slug!, loopName!)
+              setReadyCheckStatus(status)
+            } catch {
+              // Ignore
+            }
+            // Start loop if requested
+            if (shouldStart) {
+              try {
+                await startLoop(slug!, loopName!, { force: true })
+                loadStatus()
+              } catch (err) {
+                setActionError(err instanceof Error ? err.message : 'Failed to start loop')
+              }
+            }
+          }}
+        />
+      )}
+
       {/* Tab Content */}
       {activeTab === 'overview' && (
         <>
+          {/* Pre-Flight Ready Check */}
+          <div className="card mb-6">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-white">Pre-Flight Check</h2>
+              {readyCheckStatus?.has_qa ? (
+                <span className="text-green-400 text-sm flex items-center gap-1">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                  </svg>
+                  Complete
+                </span>
+              ) : (
+                <span className="text-yellow-400 text-sm flex items-center gap-1">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                  </svg>
+                  Required
+                </span>
+              )}
+            </div>
+
+            {readyCheckStatus?.has_qa ? (
+              <div className="mt-3">
+                <p className="text-sm text-gray-400 mb-2">
+                  {readyCheckStatus.qa_count} clarification{readyCheckStatus.qa_count !== 1 ? 's' : ''} recorded
+                  {readyCheckStatus.last_updated && (
+                    <> • Last updated {new Date(readyCheckStatus.last_updated).toLocaleDateString()}</>
+                  )}
+                </p>
+                {readyCheckStatus.qa_summary.length > 0 && (
+                  <ul className="text-sm text-gray-500 space-y-1 mb-3">
+                    {readyCheckStatus.qa_summary.map((summary, i) => (
+                      <li key={i}>• {summary}</li>
+                    ))}
+                  </ul>
+                )}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setShowReadyCheckModal(true)}
+                    className="text-sm text-primary-400 hover:text-primary-300"
+                  >
+                    View / Edit
+                  </button>
+                  <button
+                    onClick={() => setShowReadyCheckModal(true)}
+                    className="text-sm text-gray-400 hover:text-gray-300"
+                  >
+                    Run Again
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="mt-3">
+                <p className="text-sm text-gray-400 mb-3">
+                  Run a Ready Check before starting to ensure Claude understands the task.
+                  This helps catch ambiguities and missing context.
+                </p>
+                <button
+                  onClick={() => setShowReadyCheckModal(true)}
+                  className="px-4 py-2 bg-primary-600 hover:bg-primary-500 rounded text-white text-sm"
+                >
+                  Run Ready Check
+                </button>
+              </div>
+            )}
+          </div>
+
           {/* Status */}
           <div className="card mb-6">
             <div className="flex items-center justify-between">
@@ -476,38 +662,111 @@ export default function LoopDetail() {
             <h2 className="text-lg font-semibold text-white">Items</h2>
             <span className="text-sm text-gray-400">{itemsTotal} items</span>
           </div>
-          {itemsLoading ? (
+
+          {/* Filters */}
+          <div className="flex flex-wrap items-center gap-3 mb-4 pb-4 border-b border-gray-700">
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-gray-400">Status:</label>
+              <select
+                value={itemsStatusFilter}
+                onChange={(e) => setItemsStatusFilter(e.target.value)}
+                className="px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-white"
+              >
+                <option value="">All</option>
+                <option value="pending">Pending</option>
+                <option value="completed">Completed</option>
+                <option value="in_progress">In Progress</option>
+                <option value="failed">Failed</option>
+                <option value="skipped">Skipped</option>
+                <option value="dup">Duplicate</option>
+                <option value="external">External</option>
+              </select>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-gray-400">Category:</label>
+              <select
+                value={itemsCategoryFilter}
+                onChange={(e) => setItemsCategoryFilter(e.target.value)}
+                className="px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-white"
+              >
+                <option value="">All</option>
+                {itemsCategories.map(cat => (
+                  <option key={cat} value={cat}>{cat}</option>
+                ))}
+              </select>
+            </div>
+            {(itemsStatusFilter || itemsCategoryFilter) && (
+              <button
+                onClick={() => {
+                  setItemsStatusFilter('')
+                  setItemsCategoryFilter('')
+                }}
+                className="text-sm text-gray-400 hover:text-white"
+              >
+                Clear filters
+              </button>
+            )}
+          </div>
+
+          {itemsLoading && items.length === 0 ? (
             <div className="text-gray-400">Loading items...</div>
           ) : items.length === 0 ? (
             <EmptyState
               icon={EMPTY_STATE_ICONS.inbox}
               title="No items yet"
-              description="Items generated by this loop will appear here."
+              description={itemsStatusFilter || itemsCategoryFilter
+                ? "No items match the current filters."
+                : "Items generated by this loop will appear here."}
             />
           ) : (
-            <div className="space-y-2">
-              {items.map((item) => (
-                <div key={item.id} className="p-3 bg-gray-700 rounded-md">
-                  <div className="flex items-center justify-between mb-1">
-                    <span
-                      className={`text-xs px-2 py-0.5 rounded ${
-                        item.status === 'completed'
-                          ? 'bg-green-900 text-green-300'
-                          : item.status === 'pending'
-                          ? 'bg-yellow-900 text-yellow-300'
-                          : 'bg-gray-600 text-gray-300'
-                      }`}
-                    >
-                      {item.status}
-                    </span>
-                    {item.category && (
-                      <span className="text-xs text-gray-400">{item.category}</span>
-                    )}
+            <>
+              <div className="space-y-2">
+                {items.map((item) => (
+                  <div key={item.id} className="p-3 bg-gray-700 rounded-md">
+                    <div className="flex items-center justify-between mb-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-gray-500 font-mono">{item.id}</span>
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded ${
+                            item.status === 'completed'
+                              ? 'bg-green-900 text-green-300'
+                              : item.status === 'pending'
+                              ? 'bg-yellow-900 text-yellow-300'
+                              : item.status === 'in_progress'
+                              ? 'bg-blue-900 text-blue-300'
+                              : item.status === 'failed'
+                              ? 'bg-red-900 text-red-300'
+                              : 'bg-gray-600 text-gray-300'
+                          }`}
+                        >
+                          {item.status}
+                        </span>
+                      </div>
+                      {item.category && (
+                        <span className="text-xs text-gray-400">{item.category}</span>
+                      )}
+                    </div>
+                    <p className="text-sm text-gray-200 line-clamp-2">{item.content}</p>
                   </div>
-                  <p className="text-sm text-gray-200 line-clamp-2">{item.content}</p>
+                ))}
+              </div>
+
+              {/* Load More */}
+              {items.length < itemsTotal && (
+                <div className="mt-4 text-center">
+                  <button
+                    onClick={() => {
+                      setItemsOffset(items.length)
+                      loadItems(false)
+                    }}
+                    disabled={itemsLoading}
+                    className="px-4 py-2 bg-gray-700 text-gray-300 rounded hover:bg-gray-600 disabled:opacity-50"
+                  >
+                    {itemsLoading ? 'Loading...' : `Load More (${items.length} of ${itemsTotal})`}
+                  </button>
                 </div>
-              ))}
-            </div>
+              )}
+            </>
           )}
         </div>
       )}
@@ -635,6 +894,16 @@ export default function LoopDetail() {
               </div>
             )}
           </div>
+        </div>
+      )}
+
+      {activeTab === 'resources' && loop && (
+        <div className="card">
+          <LoopResourceManager
+            projectSlug={slug!}
+            loopName={loopName!}
+            loopType={loop.type === 'generator' ? 'planning' : 'implementation'}
+          />
         </div>
       )}
 

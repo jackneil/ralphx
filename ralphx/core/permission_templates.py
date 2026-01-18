@@ -125,7 +125,69 @@ TEMPLATES = {
             }
         },
     },
+    "default_implementation": {
+        "name": "Default Implementation",
+        "description": "Comprehensive permissions for autonomous implementation loops",
+        "settings": {
+            "permissions": {
+                "allow": [
+                    # File operations
+                    "Read(**)",
+                    "Write(**)",
+                    "Edit(**)",
+                    "Glob(**)",
+                    "Grep(**)",
+                    # Shell utilities
+                    "Bash(cat *)",
+                    "Bash(ls *)",
+                    "Bash(head *)",
+                    "Bash(tail *)",
+                    "Bash(wc *)",
+                    "Bash(find *)",
+                    "Bash(grep *)",
+                    "Bash(mkdir *)",
+                    "Bash(touch *)",
+                    "Bash(cp *)",
+                    "Bash(mv *)",
+                    "Bash(rm *)",
+                    # Git operations
+                    "Bash(git *)",
+                    # Python
+                    "Bash(python *)",
+                    "Bash(python3 *)",
+                    "Bash(pip *)",
+                    "Bash(pip3 *)",
+                    "Bash(pytest *)",
+                    # Node/NPM
+                    "Bash(npm *)",
+                    "Bash(npx *)",
+                    "Bash(node *)",
+                    # Shell basics
+                    "Bash(cd *)",
+                    "Bash(source *)",
+                    "Bash(export *)",
+                    "Bash(echo *)",
+                    "Bash(curl *)",
+                    "Bash(which *)",
+                    "Bash(pwd)",
+                    # Python tools
+                    "Bash(alembic *)",
+                    "Bash(uvicorn *)",
+                    # Docker
+                    "Bash(docker *)",
+                    "Bash(docker-compose *)",
+                    # Web
+                    "WebSearch",
+                    "WebFetch(domain:*)",
+                ]
+            }
+        },
+    },
 }
+
+
+# Default template to apply when creating a new loop
+DEFAULT_LOOP_TEMPLATE = "default_implementation"
 
 
 def list_templates() -> list[dict]:
@@ -234,6 +296,40 @@ def apply_template_to_loop(
 
     # Write settings
     write_settings_file(settings_path, template_id=template_id)
+
+    return settings_path
+
+
+def ensure_loop_has_permissions(
+    project_path: Path,
+    loop_name: str,
+    template_id: Optional[str] = None,
+) -> Path:
+    """Ensure a loop has a settings.json file with permissions.
+
+    If no settings file exists, creates one with the default template.
+    If a settings file already exists, leaves it unchanged.
+
+    Args:
+        project_path: Path to the project directory.
+        loop_name: Name of the loop.
+        template_id: Optional template to use (defaults to DEFAULT_LOOP_TEMPLATE).
+
+    Returns:
+        Path to the settings.json file.
+    """
+    from ralphx.core.workspace import get_loop_settings_path, ensure_loop_directory
+
+    # Ensure loop directory exists
+    ensure_loop_directory(project_path, loop_name)
+
+    # Get settings path
+    settings_path = get_loop_settings_path(project_path, loop_name)
+
+    # Only write if file doesn't exist
+    if not settings_path.exists():
+        template = template_id or DEFAULT_LOOP_TEMPLATE
+        write_settings_file(settings_path, template_id=template)
 
     return settings_path
 

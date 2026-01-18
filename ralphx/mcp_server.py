@@ -34,6 +34,14 @@ class MCPServer:
             "ralphx_list_items": self._list_items,
             "ralphx_add_item": self._add_item,
             "ralphx_update_item": self._update_item,
+            # Workflow tools
+            "ralphx_list_workflows": self._list_workflows,
+            "ralphx_get_workflow": self._get_workflow,
+            "ralphx_create_workflow": self._create_workflow,
+            "ralphx_start_workflow": self._start_workflow,
+            "ralphx_pause_workflow": self._pause_workflow,
+            "ralphx_advance_workflow": self._advance_workflow,
+            "ralphx_list_workflow_templates": self._list_workflow_templates,
         }
 
     def run(self) -> None:
@@ -70,7 +78,7 @@ class MCPServer:
             "params": {
                 "serverInfo": {
                     "name": "ralphx",
-                    "version": "0.1.1",
+                    "version": "0.1.2",
                 },
                 "capabilities": {
                     "tools": True,
@@ -106,7 +114,7 @@ class MCPServer:
                 "result": {
                     "serverInfo": {
                         "name": "ralphx",
-                        "version": "0.1.1",
+                        "version": "0.1.2",
                     },
                     "capabilities": {
                         "tools": {
@@ -298,7 +306,7 @@ class MCPServer:
             },
             {
                 "name": "ralphx_add_item",
-                "description": "Add a new work item to a project",
+                "description": "Add a new work item to a workflow step",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -310,6 +318,14 @@ class MCPServer:
                             "type": "string",
                             "description": "Item content/description",
                         },
+                        "workflow_id": {
+                            "type": "string",
+                            "description": "Workflow ID the item belongs to",
+                        },
+                        "source_step_id": {
+                            "type": "integer",
+                            "description": "Step ID that creates/owns this item",
+                        },
                         "category": {
                             "type": "string",
                             "description": "Item category",
@@ -319,7 +335,7 @@ class MCPServer:
                             "description": "Priority (0-10)",
                         },
                     },
-                    "required": ["slug", "content"],
+                    "required": ["slug", "content", "workflow_id", "source_step_id"],
                 },
             },
             {
@@ -354,6 +370,133 @@ class MCPServer:
                         },
                     },
                     "required": ["slug", "item_id"],
+                },
+            },
+            # Workflow tools
+            {
+                "name": "ralphx_list_workflows",
+                "description": "List all workflows for a project",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "Project slug",
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "Filter by status (draft, active, paused, completed)",
+                        },
+                    },
+                    "required": ["slug"],
+                },
+            },
+            {
+                "name": "ralphx_get_workflow",
+                "description": "Get workflow details including steps",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "Project slug",
+                        },
+                        "workflow_id": {
+                            "type": "string",
+                            "description": "Workflow ID",
+                        },
+                    },
+                    "required": ["slug", "workflow_id"],
+                },
+            },
+            {
+                "name": "ralphx_create_workflow",
+                "description": "Create a new workflow from a template",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "Project slug",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Workflow name",
+                        },
+                        "template_id": {
+                            "type": "string",
+                            "description": "Template ID (e.g., 'build-product')",
+                        },
+                    },
+                    "required": ["slug", "name"],
+                },
+            },
+            {
+                "name": "ralphx_start_workflow",
+                "description": "Start a workflow execution",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "Project slug",
+                        },
+                        "workflow_id": {
+                            "type": "string",
+                            "description": "Workflow ID",
+                        },
+                    },
+                    "required": ["slug", "workflow_id"],
+                },
+            },
+            {
+                "name": "ralphx_pause_workflow",
+                "description": "Pause a running workflow",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "Project slug",
+                        },
+                        "workflow_id": {
+                            "type": "string",
+                            "description": "Workflow ID",
+                        },
+                    },
+                    "required": ["slug", "workflow_id"],
+                },
+            },
+            {
+                "name": "ralphx_advance_workflow",
+                "description": "Advance a workflow to the next step by completing the current step",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "Project slug",
+                        },
+                        "workflow_id": {
+                            "type": "string",
+                            "description": "Workflow ID",
+                        },
+                    },
+                    "required": ["slug", "workflow_id"],
+                },
+            },
+            {
+                "name": "ralphx_list_workflow_templates",
+                "description": "List available workflow templates for creating new workflows",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "Project slug",
+                        },
+                    },
+                    "required": ["slug"],
                 },
             },
         ]
@@ -493,20 +636,24 @@ class MCPServer:
         self,
         slug: str,
         content: str,
+        workflow_id: str,
+        source_step_id: int,
         category: Optional[str] = None,
         priority: int = 0,
     ) -> dict:
-        """Add a work item."""
+        """Add a work item to a workflow step."""
         import uuid
 
         project = self.manager.get_project(slug)
         if not project:
             raise ValueError(f"Project not found: {slug}")
 
-        item_id = str(uuid.uuid4())
+        item_id = str(uuid.uuid4())[:8]
         project_db = self.manager.get_project_db(project.path)
         project_db.create_work_item(
             id=item_id,
+            workflow_id=workflow_id,
+            source_step_id=source_step_id,
             content=content,
             category=category,
             priority=priority,
@@ -548,6 +695,245 @@ class MCPServer:
         return {
             "id": item_id,
             "message": "Item updated",
+        }
+
+    # Workflow implementations
+
+    def _list_workflows(self, slug: str, status: Optional[str] = None) -> dict:
+        """List workflows for a project."""
+        project = self.manager.get_project(slug)
+        if not project:
+            raise ValueError(f"Project not found: {slug}")
+
+        project_db = self.manager.get_project_db(project.path)
+        workflows = project_db.list_workflows(status=status)
+
+        return {
+            "workflows": [
+                {
+                    "id": w["id"],
+                    "name": w["name"],
+                    "namespace": w["namespace"],
+                    "status": w["status"],
+                    "current_step": w["current_step"],
+                    "created_at": w["created_at"],
+                }
+                for w in workflows
+            ],
+        }
+
+    def _get_workflow(self, slug: str, workflow_id: str) -> dict:
+        """Get workflow details."""
+        project = self.manager.get_project(slug)
+        if not project:
+            raise ValueError(f"Project not found: {slug}")
+
+        project_db = self.manager.get_project_db(project.path)
+        workflow = project_db.get_workflow(workflow_id)
+        if not workflow:
+            raise ValueError(f"Workflow not found: {workflow_id}")
+
+        steps = project_db.list_workflow_steps(workflow_id)
+
+        return {
+            "id": workflow["id"],
+            "name": workflow["name"],
+            "namespace": workflow["namespace"],
+            "status": workflow["status"],
+            "current_step": workflow["current_step"],
+            "created_at": workflow["created_at"],
+            "steps": [
+                {
+                    "id": s["id"],
+                    "step_number": s["step_number"],
+                    "name": s["name"],
+                    "step_type": s["step_type"],
+                    "status": s["status"],
+                }
+                for s in steps
+            ],
+        }
+
+    def _create_workflow(
+        self,
+        slug: str,
+        name: str,
+        template_id: Optional[str] = None,
+    ) -> dict:
+        """Create a new workflow."""
+        import uuid
+
+        project = self.manager.get_project(slug)
+        if not project:
+            raise ValueError(f"Project not found: {slug}")
+
+        project_db = self.manager.get_project_db(project.path)
+
+        # Generate unique ID and namespace
+        workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
+        namespace = name.lower().replace(" ", "-")[:56]
+        namespace = f"{namespace}-{uuid.uuid4().hex[:7]}"
+
+        # Get template steps if template specified
+        template_steps = []
+        if template_id:
+            project_db.seed_workflow_templates_if_empty()
+            template = project_db.get_workflow_template(template_id)
+            if template:
+                template_steps = template.get("phases", [])
+
+        # Create workflow
+        project_db.create_workflow(
+            id=workflow_id,
+            name=name,
+            namespace=namespace,
+            template_id=template_id,
+            status="draft",
+        )
+
+        # Create steps from template
+        for step_def in template_steps:
+            project_db.create_workflow_step(
+                workflow_id=workflow_id,
+                step_number=step_def["number"],
+                name=step_def["name"],
+                step_type=step_def["type"],
+                config={
+                    "description": step_def.get("description"),
+                    "loopType": step_def.get("loopType"),
+                    "skippable": step_def.get("skippable", False),
+                },
+                status="pending",
+            )
+
+        return {
+            "id": workflow_id,
+            "name": name,
+            "namespace": namespace,
+            "message": "Workflow created",
+        }
+
+    def _start_workflow(self, slug: str, workflow_id: str) -> dict:
+        """Start a workflow."""
+        import asyncio
+        from ralphx.core.workflow_executor import WorkflowExecutor
+
+        project = self.manager.get_project(slug)
+        if not project:
+            raise ValueError(f"Project not found: {slug}")
+
+        project_db = self.manager.get_project_db(project.path)
+        executor = WorkflowExecutor(
+            project=project,
+            db=project_db,
+            workflow_id=workflow_id,
+        )
+
+        # Run async start_workflow synchronously
+        loop = asyncio.new_event_loop()
+        try:
+            workflow = loop.run_until_complete(executor.start_workflow())
+        finally:
+            loop.close()
+
+        return {
+            "id": workflow["id"],
+            "status": workflow["status"],
+            "current_step": workflow["current_step"],
+            "message": "Workflow started",
+        }
+
+    def _pause_workflow(self, slug: str, workflow_id: str) -> dict:
+        """Pause a workflow."""
+        import asyncio
+        from ralphx.core.workflow_executor import WorkflowExecutor
+
+        project = self.manager.get_project(slug)
+        if not project:
+            raise ValueError(f"Project not found: {slug}")
+
+        project_db = self.manager.get_project_db(project.path)
+        executor = WorkflowExecutor(
+            project=project,
+            db=project_db,
+            workflow_id=workflow_id,
+        )
+
+        # Run async pause_workflow synchronously
+        loop = asyncio.new_event_loop()
+        try:
+            workflow = loop.run_until_complete(executor.pause_workflow())
+        finally:
+            loop.close()
+
+        return {
+            "id": workflow["id"],
+            "status": workflow["status"],
+            "message": "Workflow paused",
+        }
+
+    def _advance_workflow(self, slug: str, workflow_id: str) -> dict:
+        """Advance a workflow to the next step."""
+        import asyncio
+        from ralphx.core.workflow_executor import WorkflowExecutor
+
+        project = self.manager.get_project(slug)
+        if not project:
+            raise ValueError(f"Project not found: {slug}")
+
+        project_db = self.manager.get_project_db(project.path)
+        executor = WorkflowExecutor(
+            project=project,
+            db=project_db,
+            workflow_id=workflow_id,
+        )
+
+        # Get current step and complete it
+        workflow = project_db.get_workflow(workflow_id)
+        if not workflow:
+            raise ValueError(f"Workflow not found: {workflow_id}")
+
+        current_step = project_db.get_workflow_step_by_number(
+            workflow_id, workflow["current_step"]
+        )
+        if not current_step:
+            raise ValueError("No current step found")
+
+        # Run async complete_step synchronously
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(executor.complete_step(current_step["id"]))
+        finally:
+            loop.close()
+
+        # Get updated workflow
+        workflow = project_db.get_workflow(workflow_id)
+        return {
+            "id": workflow["id"],
+            "current_step": workflow["current_step"],
+            "status": workflow["status"],
+            "message": f"Advanced to step {workflow['current_step']}",
+        }
+
+    def _list_workflow_templates(self, slug: str) -> dict:
+        """List available workflow templates."""
+        project = self.manager.get_project(slug)
+        if not project:
+            raise ValueError(f"Project not found: {slug}")
+
+        project_db = self.manager.get_project_db(project.path)
+        templates = project_db.list_workflow_templates()
+
+        return {
+            "templates": [
+                {
+                    "id": t["id"],
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "step_count": len(t.get("phases", [])),
+                }
+                for t in templates
+            ]
         }
 
 

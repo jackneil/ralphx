@@ -12,6 +12,7 @@ from ralphx.core.import_manager import ImportManager
 from ralphx.core.input_templates import get_required_tags, validate_loop_inputs
 from ralphx.core.loop import LoopLoader
 from ralphx.core.project import ProjectManager
+from ralphx.core.project_db import ProjectDatabase
 from ralphx.models.loop import LoopConfig, LoopType, ModeSelectionStrategy, ItemTypes
 from ralphx.models.run import Run, RunStatus
 from ralphx.core.logger import loop_log
@@ -145,7 +146,7 @@ class LoopStatus(BaseModel):
 
     loop_name: str
     is_running: bool
-    current_run_id: Optional[int] = None
+    current_run_id: Optional[str] = None
     current_iteration: int = 0
     current_mode: Optional[str] = None
     items_generated: int = 0
@@ -307,6 +308,55 @@ async def start_loop(
             detail=f"Loop not found: {loop_name}",
         )
 
+    # Get loop's workflow context from database
+    loop_record = project_db.get_loop(loop_name)
+    if not loop_record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Loop '{loop_name}' not registered in database. "
+                   "Loops must be created via a workflow to run.",
+        )
+    workflow_id = loop_record.get("workflow_id")
+    step_id = loop_record.get("step_id")
+    if not workflow_id or step_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Loop '{loop_name}' missing workflow context. "
+                   "Loops must be created via a workflow to run.",
+        )
+
+    # For consumer loops, determine which step to consume items from
+    # By default, consume from the previous step in the workflow
+    consume_from_step_id = None
+    if config.type == LoopType.CONSUMER:
+        # Get the current step to find its step_number
+        current_step = project_db.get_workflow_step(step_id)
+        step_number = current_step["step_number"] if current_step else 1
+
+        if step_number > 1:
+            # Get the previous step
+            prev_step = project_db.get_workflow_step_by_number(workflow_id, step_number - 1)
+            if prev_step:
+                consume_from_step_id = prev_step["id"]
+        else:
+            # Single-step consumer: consume from own step ID (for imported items)
+            consume_from_step_id = step_id
+
+    # Check if ready check (Q&A) has been completed
+    # Required for first run of consumer loops - CANNOT be bypassed with force
+    if config.type == LoopType.CONSUMER:
+        resources = project_db.list_loop_resources(loop_name)
+        has_qa = any(r["resource_type"] == "qa_responses" for r in resources)
+        if not has_qa:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "READY_CHECK_REQUIRED",
+                    "message": "Please complete a Ready Check before starting this loop",
+                    "redirect": f"/projects/{slug}/loops/{loop_name}",
+                },
+            )
+
     # Validate required inputs (unless force=True)
     if not request.force:
         # Determine loop type for validation
@@ -331,17 +381,20 @@ async def start_loop(
                 },
             )
 
-    # Create executor with phase/category filtering
+    # Create executor with workflow context and phase/category filtering
     executor = LoopExecutor(
         project=project,
         loop_config=config,
         db=project_db,
+        workflow_id=workflow_id,
+        step_id=step_id,
         dry_run=request.dry_run,
         phase=request.phase,
         category=request.category,
         respect_dependencies=request.respect_dependencies,
         batch_mode=request.batch_mode,
         batch_size=request.batch_size,
+        consume_from_step_id=consume_from_step_id,
     )
 
     _running_loops[key] = executor
@@ -671,6 +724,8 @@ class StoriesSourceInput(BaseModel):
     loop_name: Optional[str] = Field(None, description="Source loop name if type='loop'")
     content: Optional[str] = Field(None, description="JSONL content if type='content'")
     filename: Optional[str] = Field(None, description="Filename if type='content'")
+    format_id: Optional[str] = Field("hank_prd", description="Import format ID for parsing JSONL")
+    namespace: Optional[str] = Field(None, description="Namespace for imported items (defaults to loop_id)")
 
 
 class CreateSimpleLoopRequest(BaseModel):
@@ -703,11 +758,21 @@ class CreateSimpleLoopRequest(BaseModel):
 async def create_simple_loop(slug: str, request: CreateSimpleLoopRequest):
     """Create a loop using the simplified wizard flow.
 
-    This endpoint handles the simple loop creation with sensible defaults.
+    DEPRECATED: This endpoint uses the legacy standalone loop model.
+    In the workflow-first architecture, loops are created automatically
+    by workflow steps. Use POST /workflows to create a new workflow instead.
+
+    TODO(migration): This endpoint needs to be updated to either:
+    1. Create a workflow implicitly (quick workflow for legacy compatibility)
+    2. Be deprecated and removed in favor of workflow-based creation
+
     The loop ID is auto-generated as {type}-{YYYYMMDD}_{n}.
     Users only need to provide:
     - Planning: design doc + optional templates
     - Implementation: stories source + design context + optional templates
+
+    WARNING: JSONL import in this endpoint is currently broken after the
+    workflow-first migration - work items now require workflow_id and source_step_id.
     """
     from pathlib import Path
 
@@ -752,7 +817,10 @@ async def create_simple_loop(slug: str, request: CreateSimpleLoopRequest):
             description=description,
         )
     else:
-        source_loop = None
+        # ALWAYS set namespace for implementation loops (fix for broken loops)
+        # Default to loop_id if no explicit source provided
+        namespace = loop_id.replace("-", "_")
+
         # Validate stories_source.type if provided
         if request.stories_source and request.stories_source.type not in ("loop", "content"):
             raise HTTPException(
@@ -780,9 +848,14 @@ async def create_simple_loop(slug: str, request: CreateSimpleLoopRequest):
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Source loop '{source_loop}' not found in this project.",
                 )
+            namespace = source_loop  # Use source loop name as namespace
+        elif request.stories_source and request.stories_source.type == "content":
+            # For JSONL uploads, derive namespace from request or loop_id
+            namespace = request.stories_source.namespace or loop_id.replace("-", "_")
+
         config_yaml = generate_simple_implementation_config(
             name=loop_id,
-            source_loop=source_loop,
+            namespace=namespace,
             display_name=display_name,
             description=description,
         )
@@ -877,11 +950,55 @@ async def create_simple_loop(slug: str, request: CreateSimpleLoopRequest):
                 if result.success:
                     inputs_created.append(filename)
 
+                # Also import JSONL into work_items table
+                import tempfile
+                from pathlib import Path as TmpPath
+
+                # Use namespace already computed for config (or derive from loop_id if not set)
+                import_namespace = namespace or loop_id.replace("-", "_")
+                format_id = request.stories_source.format_id or "hank_prd"
+
+                # Seed defaults if needed to ensure format exists
+                project_db.seed_defaults_if_empty()
+
+                # DEPRECATED: JSONL import in legacy simple loop creation is broken
+                # after workflow-first migration. Work items now require workflow_id
+                # and source_step_id. Skipping import until this endpoint is migrated.
+                #
+                # TODO(migration): Either:
+                # 1. Create an implicit workflow/step for legacy loop creation
+                # 2. Remove this code path and require workflow-based creation
+                import logging
+                logging.warning(
+                    f"JSONL import skipped for {loop_id}: legacy simple loop creation "
+                    "does not support workflow-scoped work items. Use workflow-based "
+                    "creation instead."
+                )
+                # Original broken code:
+                # with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tmp:
+                # NOTE: JSONL import code was removed because it requires workflow context
+                # (workflow_id, source_step_id) which standalone loop creation doesn't have.
+                # See TODO at function docstring for migration plan.
+
+    # Check for duplicate display names (warn but don't block)
+    warnings = []
+    duplicate_names = [
+        loop.name for loop in existing_loops
+        if loop.display_name == display_name and loop.name != loop_id
+    ]
+    if duplicate_names:
+        warnings.append(
+            f"Warning: Another loop already uses the display name '{display_name}'. "
+            f"Consider using a unique name to avoid confusion. "
+            f"Existing loops: {', '.join(duplicate_names)}"
+        )
+
     return {
         "loop_id": loop_id,
         "display_name": display_name,
         "loop_dir": str(loops_dir / f"{loop_id}.yaml"),
         "inputs_created": inputs_created,
+        "warnings": warnings,
         "message": f"Created {request.type} loop '{display_name}' (ID: {loop_id}) with {len(inputs_created)} inputs",
     }
 
@@ -1158,7 +1275,8 @@ class PhaseInfoResponse(BaseModel):
     """Response with phase and category information for a consumer loop."""
 
     loop_name: str
-    source_loop: Optional[str]
+    namespace: Optional[str] = None  # Source namespace for items
+    source_loop: Optional[str] = None  # Backward compatibility
     total_items: int
     phases: list[PhaseInfo]
     categories: list[CategoryInfo]
@@ -1202,15 +1320,17 @@ async def get_loop_phases(slug: str, loop_name: str):
         )
 
     # Check if this is a consumer loop
-    source_loop = None
+    # source_loop in config refers to the loop name, which is used as namespace
+    namespace = None
     if config.item_types and config.item_types.input:
-        source_loop = config.item_types.input.source
+        namespace = config.item_types.input.source
 
-    if not source_loop:
+    if not namespace:
         # Not a consumer loop - return empty phase info
         return PhaseInfoResponse(
             loop_name=loop_name,
-            source_loop=None,
+            namespace=None,
+            source_loop=None,  # Backward compatibility
             total_items=0,
             phases=[],
             categories=[],
@@ -1219,16 +1339,17 @@ async def get_loop_phases(slug: str, loop_name: str):
             graph_stats={},
         )
 
-    # Get all items from source loop
+    # Get all items from namespace
     items, total = project_db.list_work_items(
-        source_loop=source_loop,
+        namespace=namespace,
         limit=10000,
     )
 
     if not items:
         return PhaseInfoResponse(
             loop_name=loop_name,
-            source_loop=source_loop,
+            namespace=namespace,
+            source_loop=namespace,  # Backward compatibility
             total_items=0,
             phases=[],
             categories=[],
@@ -1305,7 +1426,8 @@ async def get_loop_phases(slug: str, loop_name: str):
 
     return PhaseInfoResponse(
         loop_name=loop_name,
-        source_loop=source_loop,
+        namespace=namespace,
+        source_loop=namespace,  # Backward compatibility
         total_items=total,
         phases=phases,
         categories=categories,
@@ -1313,4 +1435,1204 @@ async def get_loop_phases(slug: str, loop_name: str):
         has_cycles=graph.has_cycle(),
         graph_stats=graph.get_stats(),
         warnings=warnings,
+    )
+
+
+# ========== Loop Resources (per-loop resources) ==========
+
+
+class LoopResourceResponse(BaseModel):
+    """Response model for a loop resource."""
+
+    id: int
+    loop_name: str
+    resource_type: str
+    name: str
+    injection_position: str
+    source_type: str
+    source_path: Optional[str] = None
+    source_loop: Optional[str] = None
+    source_resource_id: Optional[int] = None
+    enabled: bool
+    priority: int
+    created_at: Optional[str] = None
+    # Optionally include resolved content
+    content: Optional[str] = None
+
+
+class CreateLoopResourceRequest(BaseModel):
+    """Request to create a loop resource."""
+
+    resource_type: str = Field(..., description="Type: loop_template, design_doc, guardrails, custom")
+    name: str = Field(..., description="Display name for this resource")
+    injection_position: str = Field("after_design_doc", description="Where to inject in prompt")
+    source_type: str = Field(..., description="How to load: system, project_file, loop_ref, project_resource, inline")
+    source_path: Optional[str] = Field(None, description="For project_file: path relative to project")
+    source_loop: Optional[str] = Field(None, description="For loop_ref: source loop name")
+    source_resource_id: Optional[int] = Field(None, description="For loop_ref or project_resource")
+    inline_content: Optional[str] = Field(None, description="For inline: actual content")
+    enabled: bool = Field(True, description="Whether this resource is active")
+    priority: int = Field(0, description="Order priority (lower = earlier)")
+
+
+class UpdateLoopResourceRequest(BaseModel):
+    """Request to update a loop resource."""
+
+    name: Optional[str] = None
+    injection_position: Optional[str] = None
+    source_type: Optional[str] = None
+    source_path: Optional[str] = None
+    source_loop: Optional[str] = None
+    source_resource_id: Optional[int] = None
+    inline_content: Optional[str] = None
+    enabled: Optional[bool] = None
+    priority: Optional[int] = None
+
+
+@router.get("/{slug}/loops/{loop_name}/resources", response_model=list[LoopResourceResponse])
+async def list_loop_resources(
+    slug: str,
+    loop_name: str,
+    include_content: bool = False,
+):
+    """List all resources for a specific loop.
+
+    These are per-loop resources stored in the loop_resources table,
+    different from project-level resources in the resources table.
+
+    Query params:
+        include_content: If true, resolve and include content for each resource
+    """
+    # Security: Validate loop name
+    if not LOOP_NAME_PATTERN.match(loop_name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid loop name - use only letters, numbers, underscores, and dashes",
+        )
+
+    manager, project, project_db = get_managers(slug)
+
+    # Check loop exists
+    loader = LoopLoader(db=project_db)
+    config = loader.get_loop(loop_name)
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Loop not found: {loop_name}",
+        )
+
+    resources = project_db.list_loop_resources(loop_name=loop_name)
+
+    result = []
+    for r in resources:
+        response = LoopResourceResponse(
+            id=r["id"],
+            loop_name=r["loop_name"],
+            resource_type=r["resource_type"],
+            name=r["name"],
+            injection_position=r["injection_position"],
+            source_type=r["source_type"],
+            source_path=r.get("source_path"),
+            source_loop=r.get("source_loop"),
+            source_resource_id=r.get("source_resource_id"),
+            enabled=r["enabled"],
+            priority=r["priority"],
+            created_at=r.get("created_at"),
+        )
+
+        if include_content:
+            # Resolve content based on source_type
+            response.content = _resolve_loop_resource_content(
+                r, project.path, project_db
+            )
+
+        result.append(response)
+
+    return result
+
+
+@router.post("/{slug}/loops/{loop_name}/resources", response_model=LoopResourceResponse)
+async def create_loop_resource(
+    slug: str,
+    loop_name: str,
+    request: CreateLoopResourceRequest,
+):
+    """Create a new resource for a loop.
+
+    Source types:
+    - system: Use built-in default template
+    - project_file: Import from a file in the project (provide source_path)
+    - loop_ref: Reference another loop's resource (provide source_loop + source_resource_id)
+    - project_resource: Use a project-level resource (provide source_resource_id)
+    - inline: Store content directly (provide inline_content)
+    """
+    # Security: Validate loop name
+    if not LOOP_NAME_PATTERN.match(loop_name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid loop name - use only letters, numbers, underscores, and dashes",
+        )
+
+    manager, project, project_db = get_managers(slug)
+
+    # Check loop exists
+    loader = LoopLoader(db=project_db)
+    config = loader.get_loop(loop_name)
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Loop not found: {loop_name}",
+        )
+
+    # Validate source_type requirements
+    if request.source_type == "project_file" and not request.source_path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="source_path is required when source_type is 'project_file'",
+        )
+    if request.source_type == "loop_ref" and (not request.source_loop or not request.source_resource_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="source_loop and source_resource_id are required when source_type is 'loop_ref'",
+        )
+    if request.source_type == "project_resource" and not request.source_resource_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="source_resource_id is required when source_type is 'project_resource'",
+        )
+    if request.source_type == "inline" and not request.inline_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="inline_content is required when source_type is 'inline'",
+        )
+
+    # Check for duplicate
+    existing = project_db.get_loop_resource_by_name(
+        loop_name, request.resource_type, request.name
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Resource '{request.name}' of type '{request.resource_type}' already exists for this loop",
+        )
+
+    # Create the resource
+    resource = project_db.create_loop_resource(
+        loop_name=loop_name,
+        resource_type=request.resource_type,
+        name=request.name,
+        injection_position=request.injection_position,
+        source_type=request.source_type,
+        source_path=request.source_path,
+        source_loop=request.source_loop,
+        source_resource_id=request.source_resource_id,
+        inline_content=request.inline_content,
+        enabled=request.enabled,
+        priority=request.priority,
+    )
+
+    return LoopResourceResponse(
+        id=resource["id"],
+        loop_name=resource["loop_name"],
+        resource_type=resource["resource_type"],
+        name=resource["name"],
+        injection_position=resource["injection_position"],
+        source_type=resource["source_type"],
+        source_path=resource.get("source_path"),
+        source_loop=resource.get("source_loop"),
+        source_resource_id=resource.get("source_resource_id"),
+        enabled=resource["enabled"],
+        priority=resource["priority"],
+        created_at=resource.get("created_at"),
+    )
+
+
+@router.get("/{slug}/loops/{loop_name}/resources/{resource_id}", response_model=LoopResourceResponse)
+async def get_loop_resource(
+    slug: str,
+    loop_name: str,
+    resource_id: int,
+    include_content: bool = True,
+):
+    """Get a specific loop resource by ID."""
+    manager, project, project_db = get_managers(slug)
+
+    resource = project_db.get_loop_resource(resource_id)
+    if not resource or resource["loop_name"] != loop_name:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Resource not found: {resource_id}",
+        )
+
+    response = LoopResourceResponse(
+        id=resource["id"],
+        loop_name=resource["loop_name"],
+        resource_type=resource["resource_type"],
+        name=resource["name"],
+        injection_position=resource["injection_position"],
+        source_type=resource["source_type"],
+        source_path=resource.get("source_path"),
+        source_loop=resource.get("source_loop"),
+        source_resource_id=resource.get("source_resource_id"),
+        enabled=resource["enabled"],
+        priority=resource["priority"],
+        created_at=resource.get("created_at"),
+    )
+
+    if include_content:
+        response.content = _resolve_loop_resource_content(
+            resource, project.path, project_db
+        )
+
+    return response
+
+
+@router.patch("/{slug}/loops/{loop_name}/resources/{resource_id}", response_model=LoopResourceResponse)
+async def update_loop_resource(
+    slug: str,
+    loop_name: str,
+    resource_id: int,
+    request: UpdateLoopResourceRequest,
+):
+    """Update a loop resource."""
+    manager, project, project_db = get_managers(slug)
+
+    resource = project_db.get_loop_resource(resource_id)
+    if not resource or resource["loop_name"] != loop_name:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Resource not found: {resource_id}",
+        )
+
+    # Build update dict from non-None fields
+    updates = {}
+    if request.name is not None:
+        updates["name"] = request.name
+    if request.injection_position is not None:
+        updates["injection_position"] = request.injection_position
+    if request.source_type is not None:
+        updates["source_type"] = request.source_type
+    if request.source_path is not None:
+        updates["source_path"] = request.source_path
+    if request.source_loop is not None:
+        updates["source_loop"] = request.source_loop
+    if request.source_resource_id is not None:
+        updates["source_resource_id"] = request.source_resource_id
+    if request.inline_content is not None:
+        updates["inline_content"] = request.inline_content
+    if request.enabled is not None:
+        updates["enabled"] = request.enabled
+    if request.priority is not None:
+        updates["priority"] = request.priority
+
+    if updates:
+        project_db.update_loop_resource(resource_id, **updates)
+
+    # Return updated resource
+    updated = project_db.get_loop_resource(resource_id)
+    return LoopResourceResponse(
+        id=updated["id"],
+        loop_name=updated["loop_name"],
+        resource_type=updated["resource_type"],
+        name=updated["name"],
+        injection_position=updated["injection_position"],
+        source_type=updated["source_type"],
+        source_path=updated.get("source_path"),
+        source_loop=updated.get("source_loop"),
+        source_resource_id=updated.get("source_resource_id"),
+        enabled=updated["enabled"],
+        priority=updated["priority"],
+        created_at=updated.get("created_at"),
+    )
+
+
+@router.delete("/{slug}/loops/{loop_name}/resources/{resource_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_loop_resource(
+    slug: str,
+    loop_name: str,
+    resource_id: int,
+):
+    """Delete a loop resource."""
+    manager, project, project_db = get_managers(slug)
+
+    resource = project_db.get_loop_resource(resource_id)
+    if not resource or resource["loop_name"] != loop_name:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Resource not found: {resource_id}",
+        )
+
+    project_db.delete_loop_resource(resource_id)
+    return None
+
+
+def _resolve_loop_resource_content(
+    resource: dict,
+    project_path: str,
+    db,
+) -> Optional[str]:
+    """Resolve content for a loop resource based on its source_type.
+
+    This is a helper function for API routes - the executor has its own version.
+    """
+    from pathlib import Path
+
+    source_type = resource.get("source_type", "")
+
+    if source_type == "system":
+        # Load from system default templates
+        resource_type = resource.get("resource_type", "")
+        default_path = (
+            Path(__file__).parent.parent.parent / "templates" / "loop_templates" / f"{resource_type}.md"
+        )
+        if default_path.exists():
+            return default_path.read_text()
+        return None
+
+    elif source_type == "project_file":
+        # Load from project file path
+        source_path = resource.get("source_path")
+        if source_path:
+            file_path = Path(project_path) / source_path
+            if file_path.exists():
+                return file_path.read_text()
+        return None
+
+    elif source_type == "loop_ref":
+        # Load from another loop's resource (recursively)
+        source_resource_id = resource.get("source_resource_id")
+        if source_resource_id:
+            source_resource = db.get_loop_resource(source_resource_id)
+            if source_resource:
+                return _resolve_loop_resource_content(source_resource, project_path, db)
+        return None
+
+    elif source_type == "project_resource":
+        # Load from project-level resource
+        from ralphx.core.resources import ResourceManager
+        source_resource_id = resource.get("source_resource_id")
+        if source_resource_id:
+            resource_manager = ResourceManager(project_path, db=db)
+            proj_resource = resource_manager.db.get_resource(source_resource_id)
+            if proj_resource:
+                loaded = resource_manager.load_resource(proj_resource)
+                if loaded:
+                    return loaded.content
+        return None
+
+    elif source_type == "inline":
+        # Content is stored directly
+        return resource.get("inline_content")
+
+    return None
+
+
+# ============================================================================
+# Ready Check (Pre-Flight Clarification) Endpoints
+# ============================================================================
+
+
+class ReadyCheckStatusResponse(BaseModel):
+    """Response model for ready check status."""
+
+    has_qa: bool = False
+    qa_count: int = 0
+    last_updated: Optional[str] = None
+    qa_summary: list[str] = Field(default_factory=list)
+    resource_id: Optional[int] = None
+
+
+class ReadyCheckQuestion(BaseModel):
+    """A question from Claude during ready check."""
+
+    id: str
+    category: str
+    question: str
+    context: Optional[str] = None
+
+
+class ReadyCheckTriggerResponse(BaseModel):
+    """Response model for triggering a ready check."""
+
+    status: str  # "analyzing", "questions", "ready"
+    questions: list[ReadyCheckQuestion] = Field(default_factory=list)
+    assessment: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class ReadyCheckAnswer(BaseModel):
+    """An answer to a ready check question."""
+
+    question_id: str
+    answer: str
+
+
+class ReadyCheckAnswersRequest(BaseModel):
+    """Request model for submitting ready check answers."""
+
+    session_id: Optional[str] = None
+    questions: list[ReadyCheckQuestion] = Field(default_factory=list)
+    answers: list[ReadyCheckAnswer] = Field(default_factory=list)
+
+
+class ReadyCheckAnswersResponse(BaseModel):
+    """Response model for submitting ready check answers."""
+
+    saved: bool
+    resource_id: Optional[int] = None
+    can_start: bool = False
+
+
+@router.get("/{slug}/loops/{loop_name}/ready-check", response_model=ReadyCheckStatusResponse)
+async def get_ready_check_status(slug: str, loop_name: str):
+    """Get the ready check status for a loop."""
+    from ralphx.core.loop import LoopLoader
+    from ralphx.core.project import ProjectManager
+
+    manager = ProjectManager()
+    project = manager.get_project(slug)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {slug}",
+        )
+
+    project_db = ProjectDatabase(project.path)
+
+    # Validate the loop exists
+    loader = LoopLoader(db=project_db)
+    loop_config = loader.get_loop(loop_name)
+    if not loop_config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Loop not found: {loop_name}",
+        )
+
+    # Look for qa_responses resource
+    resources = project_db.list_loop_resources(loop_name)
+    qa_resource = next(
+        (r for r in resources if r["resource_type"] == "qa_responses"),
+        None,
+    )
+
+    if not qa_resource:
+        return ReadyCheckStatusResponse(has_qa=False)
+
+    # Parse the Q&A content to get summary
+    content = qa_resource.get("inline_content", "")
+    qa_count = content.count("## ")  # Count section headers
+    qa_summary = []
+
+    # Extract first line of each answer for summary
+    import re
+    sections = re.split(r"\n## ", content)
+    for section in sections[1:]:  # Skip the header
+        lines = section.split("\n")
+        if lines:
+            title = lines[0].strip()
+            # Find the answer line
+            for line in lines:
+                if line.startswith("**Answer:**"):
+                    answer = line.replace("**Answer:**", "").strip()[:50]
+                    qa_summary.append(f"{title}: {answer}...")
+                    break
+
+    return ReadyCheckStatusResponse(
+        has_qa=True,
+        qa_count=qa_count,
+        last_updated=qa_resource.get("updated_at") or qa_resource.get("created_at"),
+        qa_summary=qa_summary[:5],  # First 5 for summary
+        resource_id=qa_resource.get("id"),
+    )
+
+
+@router.post("/{slug}/loops/{loop_name}/ready-check", response_model=ReadyCheckTriggerResponse)
+async def trigger_ready_check(slug: str, loop_name: str):
+    """Trigger a ready check analysis for a loop.
+
+    This sends the loop configuration and resources to Claude to identify
+    any clarifying questions before starting the loop.
+    """
+    import json
+    import uuid
+
+    from ralphx.core.loop import LoopLoader
+    from ralphx.core.project import ProjectManager
+
+    manager = ProjectManager()
+    project = manager.get_project(slug)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {slug}",
+        )
+
+    project_db = ProjectDatabase(project.path)
+    loader = LoopLoader(db=project_db)
+    loop_config = loader.get_loop(loop_name)
+
+    if not loop_config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Loop not found: {loop_name}",
+        )
+
+    # Get loop's workflow context from database
+    loop_record = project_db.get_loop(loop_name)
+    workflow_id = loop_record.get("workflow_id") if loop_record else None
+    step_id = loop_record.get("step_id") if loop_record else None
+
+    # For consumer loops, determine which step to consume items from
+    consume_from_step_id = None
+    if loop_config.type == LoopType.CONSUMER and workflow_id and step_id is not None:
+        if step_id > 1:
+            # Get the previous step
+            prev_step = project_db.get_workflow_step_by_number(workflow_id, step_id - 1)
+            if prev_step:
+                consume_from_step_id = prev_step["id"]
+        else:
+            # Single-step consumer: consume from own step ID (for imported items)
+            step = project_db.get_workflow_step_by_number(workflow_id, step_id)
+            if step:
+                consume_from_step_id = step["id"]
+
+    # Get pending items for this loop
+    pending_count = 0
+    sample_item = None
+    if consume_from_step_id:
+        items, total = project_db.list_work_items(
+            source_step_id=consume_from_step_id,
+            status="pending",
+            limit=1,
+        )
+        pending_count = total
+        if items:
+            sample_item = items[0]
+
+    # Get loop resources
+    resources = project_db.list_loop_resources(loop_name)
+    resource_contents = {}
+    for res in resources:
+        if res["resource_type"] != "qa_responses":  # Skip existing Q&A
+            content = _resolve_loop_resource_content(res, str(project.path), project_db)
+            if content:
+                resource_contents[res["name"]] = {
+                    "type": res["resource_type"],
+                    "content": content[:5000],  # Limit size
+                }
+
+    # Build the ready check prompt
+    prompt = _build_ready_check_prompt(
+        loop_config=loop_config,
+        resources=resource_contents,
+        sample_item=sample_item,
+        pending_count=pending_count,
+        namespace=loop_name,  # Use loop name as identifier
+    )
+
+    # Call Claude via the CLI adapter
+    from ralphx.adapters.claude_cli import ClaudeCLIAdapter
+
+    # Create adapter with project context (handles auth internally)
+    adapter = ClaudeCLIAdapter(
+        project_path=project.path,
+        project_id=project.id,
+    )
+
+    try:
+        # Run Claude analysis with sonnet model
+        result = await adapter.execute(
+            prompt=prompt,
+            model="sonnet",
+            tools=[],  # No tools needed for Q&A analysis
+            timeout=120,
+        )
+
+        # Check for execution failures
+        if not result.success:
+            if result.error_message:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Ready check analysis failed: {result.error_message}",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Ready check analysis failed with unknown error",
+            )
+
+        # Parse the response
+        response_text = result.text_output
+
+        if not response_text.strip():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Ready check analysis returned empty response",
+            )
+
+        # Try to extract JSON from response
+        json_match = re.search(r"```json\s*(.*?)\s*```", response_text, re.DOTALL)
+        if json_match:
+            response_data = json.loads(json_match.group(1))
+        else:
+            # Try direct JSON parse
+            response_data = json.loads(response_text)
+
+        questions = response_data.get("questions", [])
+        assessment = response_data.get("assessment", "")
+
+        if not questions:
+            return ReadyCheckTriggerResponse(
+                status="ready",
+                questions=[],
+                assessment=assessment or "Ready to start - no clarifications needed",
+            )
+
+        return ReadyCheckTriggerResponse(
+            status="questions",
+            questions=[
+                ReadyCheckQuestion(
+                    id=q.get("id", f"q-{i}"),
+                    category=q.get("category", "General"),
+                    question=q.get("question", ""),
+                    context=q.get("context"),
+                )
+                for i, q in enumerate(questions)
+            ],
+            assessment=assessment,
+            session_id=str(uuid.uuid4()),
+        )
+
+    except json.JSONDecodeError as e:
+        # Claude returned non-JSON response - this is unexpected, report it
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ready check analysis returned invalid JSON: {str(e)}. "
+                   "Claude may not have followed the expected response format.",
+        )
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ready check failed: {str(e)}",
+        )
+
+
+@router.post("/{slug}/loops/{loop_name}/ready-check/answers", response_model=ReadyCheckAnswersResponse)
+async def submit_ready_check_answers(
+    slug: str,
+    loop_name: str,
+    request: ReadyCheckAnswersRequest,
+):
+    """Submit answers to ready check questions.
+
+    This saves the Q&A as a loop resource that will be injected into
+    the executor prompt for all future iterations.
+    """
+    from ralphx.core.loop import LoopLoader
+    from ralphx.core.project import ProjectManager
+
+    manager = ProjectManager()
+    project = manager.get_project(slug)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {slug}",
+        )
+
+    project_db = ProjectDatabase(project.path)
+
+    # Validate the loop exists
+    loader = LoopLoader(db=project_db, project_path=str(project.path))
+    loop_config = loader.get_loop(loop_name)
+    if not loop_config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Loop not found: {loop_name}",
+        )
+
+    # Build the Q&A markdown content
+    content_lines = [
+        "# Pre-Flight Clarifications",
+        "",
+        "The following clarifications were provided by the user before starting this loop:",
+        "",
+    ]
+
+    # Match questions to answers - track how many were matched
+    questions_by_id = {q.id: q for q in request.questions}
+    matched_count = 0
+    for answer in request.answers:
+        question = questions_by_id.get(answer.question_id)
+        if question:
+            # Validate answer is not empty
+            if not answer.answer.strip():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Answer for question '{question.question[:50]}...' cannot be empty",
+                )
+            matched_count += 1
+            content_lines.extend([
+                f"## {question.category}",
+                f"**Question:** {question.question}",
+                f"**Answer:** {answer.answer}",
+                "",
+            ])
+
+    # Require at least one valid Q&A pair
+    if matched_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid question-answer pairs provided. "
+                   "Please answer at least one question.",
+        )
+
+    content = "\n".join(content_lines)
+
+    # Check if Q&A resource already exists
+    resources = project_db.list_loop_resources(loop_name)
+    existing_qa = next(
+        (r for r in resources if r["resource_type"] == "qa_responses"),
+        None,
+    )
+
+    if existing_qa:
+        # Update existing resource
+        project_db.update_loop_resource(
+            existing_qa["id"],
+            inline_content=content,
+        )
+        resource_id = existing_qa["id"]
+    else:
+        # Create new resource - returns dict, extract ID
+        new_resource = project_db.create_loop_resource(
+            loop_name=loop_name,
+            resource_type="qa_responses",
+            name="Pre-Flight Clarifications",
+            injection_position="after_design_doc",
+            source_type="inline",
+            inline_content=content,
+            enabled=True,
+            priority=50,  # After design doc
+        )
+        resource_id = new_resource["id"]
+
+    return ReadyCheckAnswersResponse(
+        saved=True,
+        resource_id=resource_id,
+        can_start=True,
+    )
+
+
+def _build_ready_check_prompt(
+    loop_config,
+    resources: dict,
+    sample_item: Optional[dict],
+    pending_count: int,
+    namespace: Optional[str],
+) -> str:
+    """Build the prompt for ready check analysis."""
+    import json
+
+    lines = [
+        "# Pre-Flight Analysis Request",
+        "",
+        "You are about to run an implementation loop. Before starting, analyze the configuration and ask any clarifying questions.",
+        "",
+        "## Loop Configuration",
+        f"- Name: {loop_config.name}",
+        f"- Type: {loop_config.type.value if hasattr(loop_config.type, 'value') else loop_config.type}",
+        f"- Description: {loop_config.description or 'N/A'}",
+    ]
+
+    # Add mode info
+    if loop_config.modes:
+        mode_names = list(loop_config.modes.keys())
+        first_mode = loop_config.modes.get(mode_names[0])
+        if first_mode:
+            lines.append(f"- Model: {first_mode.model}")
+            lines.append(f"- Timeout: {first_mode.timeout}s per iteration")
+
+    if loop_config.limits:
+        lines.append(f"- Max iterations: {loop_config.limits.max_iterations}")
+
+    if namespace:
+        lines.append(f"- Namespace: {namespace} ({pending_count} pending items)")
+
+    lines.append("")
+    lines.append("## Resources That Will Be Used")
+    lines.append("")
+
+    for name, info in resources.items():
+        lines.append(f"### {name} ({info['type']})")
+        lines.append("```")
+        lines.append(info["content"])
+        lines.append("```")
+        lines.append("")
+
+    if sample_item:
+        lines.append("## Sample Work Item")
+        lines.append("Here's an example of the items you'll be implementing:")
+        lines.append("```json")
+        lines.append(json.dumps(sample_item, indent=2, default=str))
+        lines.append("```")
+        lines.append("")
+
+    lines.extend([
+        "## Your Task",
+        "",
+        "Analyze the above and identify any clarifying questions you need answered before implementing stories. Focus on:",
+        "",
+        "1. **Ambiguities** - Where requirements could be interpreted multiple ways",
+        "2. **Missing information** - What context would help you implement correctly",
+        "3. **Decisions** - Where you'd have to make assumptions otherwise",
+        "4. **Technical choices** - Where best practices could vary",
+        "",
+        "If everything is clear and you have no questions, respond with:",
+        "```json",
+        '{"questions": [], "assessment": "Ready to start"}',
+        "```",
+        "",
+        "Otherwise, respond with:",
+        "```json",
+        "{",
+        '  "questions": [',
+        "    {",
+        '      "id": "unique-id",',
+        '      "category": "Testing|Architecture|Style|Dependencies|etc",',
+        '      "question": "Your question here",',
+        '      "context": "Why you\'re asking / what you found"',
+        "    }",
+        "  ],",
+        '  "assessment": "Brief assessment of overall readiness"',
+        "}",
+        "```",
+    ])
+
+    return "\n".join(lines)
+
+
+# ============================================================================
+# Loop Permissions Endpoints
+# ============================================================================
+
+
+class LoopPermissionsResponse(BaseModel):
+    """Response model for loop permissions."""
+
+    has_custom: bool = Field(..., description="Whether the loop has custom permissions")
+    source: str = Field(..., description="Source of permissions: 'custom', 'template', or 'default'")
+    permissions: dict = Field(..., description="The permissions object with allow/deny lists")
+    settings_path: str = Field(..., description="Path to the settings.json file")
+    template_id: Optional[str] = Field(None, description="Template ID if using a template")
+
+
+class UpdateLoopPermissionsRequest(BaseModel):
+    """Request model for updating loop permissions."""
+
+    permissions: dict = Field(..., description="The permissions object with allow/deny lists")
+    template_id: Optional[str] = Field(None, description="Optional: apply a template instead of custom permissions")
+
+
+@router.get("/{slug}/loops/{loop_name}/permissions", response_model=LoopPermissionsResponse)
+async def get_loop_permissions(slug: str, loop_name: str):
+    """Get the permissions configuration for a loop.
+
+    Returns the current permissions from the loop's settings.json file,
+    or indicates if no custom permissions are set (using defaults).
+    """
+    from pathlib import Path
+    from ralphx.core.workspace import get_loop_settings_path
+    from ralphx.core.permission_templates import (
+        read_settings_file,
+        TEMPLATES,
+        DEFAULT_LOOP_TEMPLATE,
+    )
+
+    # Security: Validate loop name
+    if not LOOP_NAME_PATTERN.match(loop_name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid loop name",
+        )
+
+    manager, project, project_db = get_managers(slug)
+
+    # Get loop config to verify it exists
+    loader = LoopLoader(db=project_db)
+    config = loader.get_loop(loop_name)
+
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Loop not found: {loop_name}",
+        )
+
+    # Get settings path
+    settings_path = get_loop_settings_path(project.path, loop_name)
+
+    # Check if custom settings exist
+    if settings_path.exists():
+        settings = read_settings_file(settings_path)
+        permissions = settings.get("permissions", {"allow": [], "deny": []}) if settings else {"allow": [], "deny": []}
+
+        # Try to detect if it matches a template
+        template_id = None
+        for tid, template in TEMPLATES.items():
+            template_perms = template["settings"].get("permissions", {})
+            if permissions == template_perms:
+                template_id = tid
+                break
+
+        return LoopPermissionsResponse(
+            has_custom=True,
+            source="template" if template_id else "custom",
+            permissions=permissions,
+            settings_path=str(settings_path),
+            template_id=template_id,
+        )
+
+    # No custom settings - return default template info
+    default_template = TEMPLATES.get(DEFAULT_LOOP_TEMPLATE, {})
+    default_permissions = default_template.get("settings", {}).get("permissions", {"allow": [], "deny": []})
+
+    return LoopPermissionsResponse(
+        has_custom=False,
+        source="default",
+        permissions=default_permissions,
+        settings_path=str(settings_path),
+        template_id=DEFAULT_LOOP_TEMPLATE,
+    )
+
+
+@router.put("/{slug}/loops/{loop_name}/permissions", response_model=LoopPermissionsResponse)
+async def update_loop_permissions(
+    slug: str,
+    loop_name: str,
+    request: UpdateLoopPermissionsRequest,
+):
+    """Update the permissions configuration for a loop.
+
+    Can either:
+    1. Apply a template by providing template_id
+    2. Set custom permissions by providing permissions object
+
+    This writes to <project>/.ralphx/loops/{loop_name}/settings.json
+    """
+    from pathlib import Path
+    from ralphx.core.workspace import get_loop_settings_path, ensure_loop_directory
+    from ralphx.core.permission_templates import (
+        write_settings_file,
+        read_settings_file,
+        TEMPLATES,
+    )
+
+    # Security: Validate loop name
+    if not LOOP_NAME_PATTERN.match(loop_name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid loop name",
+        )
+
+    manager, project, project_db = get_managers(slug)
+
+    # Verify loop exists
+    loader = LoopLoader(db=project_db)
+    config = loader.get_loop(loop_name)
+
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Loop not found: {loop_name}",
+        )
+
+    # Check if loop is running
+    key = f"{slug}:{loop_name}"
+    if key in _running_loops:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot update permissions while loop is running",
+        )
+
+    # Ensure loop directory exists
+    ensure_loop_directory(project.path, loop_name)
+    settings_path = get_loop_settings_path(project.path, loop_name)
+
+    # Apply template or custom permissions
+    if request.template_id:
+        if request.template_id not in TEMPLATES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown template: {request.template_id}. "
+                       f"Available: {list(TEMPLATES.keys())}",
+            )
+        write_settings_file(settings_path, template_id=request.template_id)
+        template = TEMPLATES[request.template_id]
+        permissions = template["settings"]["permissions"]
+        source = "template"
+    else:
+        # Validate permissions structure
+        if not isinstance(request.permissions, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Permissions must be an object",
+            )
+        if "allow" not in request.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Permissions must have an 'allow' list",
+            )
+        # Validate allow is a list of strings
+        if not isinstance(request.permissions["allow"], list):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Permissions 'allow' must be a list",
+            )
+        for item in request.permissions["allow"]:
+            if not isinstance(item, str):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="All items in 'allow' must be strings",
+                )
+        # Validate deny if present
+        if "deny" in request.permissions:
+            if not isinstance(request.permissions["deny"], list):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Permissions 'deny' must be a list",
+                )
+            for item in request.permissions["deny"]:
+                if not isinstance(item, str):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="All items in 'deny' must be strings",
+                    )
+
+        # Write custom permissions
+        settings = {"permissions": request.permissions}
+        write_settings_file(settings_path, custom_settings=settings)
+        permissions = request.permissions
+        source = "custom"
+
+    loop_log.info(
+        "permissions_updated",
+        f"Loop permissions updated: {loop_name}",
+        project_id=project.id,
+        loop_name=loop_name,
+        extra={"source": source, "template_id": request.template_id},
+    )
+
+    return LoopPermissionsResponse(
+        has_custom=True,
+        source=source,
+        permissions=permissions,
+        settings_path=str(settings_path),
+        template_id=request.template_id if source == "template" else None,
+    )
+
+
+@router.delete("/{slug}/loops/{loop_name}/permissions", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_loop_permissions(slug: str, loop_name: str):
+    """Delete custom permissions for a loop.
+
+    This removes the settings.json file, causing the loop to use defaults.
+    """
+    from pathlib import Path
+    from ralphx.core.workspace import get_loop_settings_path
+
+    # Security: Validate loop name
+    if not LOOP_NAME_PATTERN.match(loop_name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid loop name",
+        )
+
+    manager, project, project_db = get_managers(slug)
+
+    # Verify loop exists
+    loader = LoopLoader(db=project_db)
+    config = loader.get_loop(loop_name)
+
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Loop not found: {loop_name}",
+        )
+
+    # Check if loop is running
+    key = f"{slug}:{loop_name}"
+    if key in _running_loops:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot delete permissions while loop is running",
+        )
+
+    # Delete settings file if it exists
+    settings_path = get_loop_settings_path(project.path, loop_name)
+    if settings_path.exists():
+        settings_path.unlink()
+
+        loop_log.info(
+            "permissions_deleted",
+            f"Loop permissions deleted: {loop_name}",
+            project_id=project.id,
+            loop_name=loop_name,
+        )
+
+    return None
+
+
+# ============================================================================
+# Permission Templates List Endpoint
+# ============================================================================
+
+
+class PermissionTemplateInfoResponse(BaseModel):
+    """Response model for a permission template."""
+
+    id: str
+    name: str
+    description: str
+
+
+class PermissionTemplateDetailResponse(PermissionTemplateInfoResponse):
+    """Response model for permission template details."""
+
+    settings: dict
+
+
+@router.get("/permission-templates", response_model=list[PermissionTemplateInfoResponse])
+async def list_permission_templates():
+    """List all available permission templates."""
+    from ralphx.core.permission_templates import list_templates
+
+    templates = list_templates()
+    return [
+        PermissionTemplateInfoResponse(
+            id=t["id"],
+            name=t["name"],
+            description=t["description"],
+        )
+        for t in templates
+    ]
+
+
+@router.get("/permission-templates/{template_id}", response_model=PermissionTemplateDetailResponse)
+async def get_permission_template(template_id: str):
+    """Get details of a specific permission template."""
+    from ralphx.core.permission_templates import get_template
+
+    template = get_template(template_id)
+    if not template:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Template not found: {template_id}",
+        )
+
+    return PermissionTemplateDetailResponse(
+        id=template_id,
+        name=template["name"],
+        description=template["description"],
+        settings=template["settings"],
     )

@@ -80,12 +80,14 @@ class ClaudeCLIAdapter(LLMAdapter):
         self,
         model: str,
         tools: Optional[list[str]] = None,
+        json_schema: Optional[dict] = None,
     ) -> list[str]:
         """Build the claude command line.
 
         Args:
             model: Model identifier.
             tools: List of tool names.
+            json_schema: Optional JSON schema for structured output.
 
         Returns:
             Command as list of strings.
@@ -93,13 +95,21 @@ class ClaudeCLIAdapter(LLMAdapter):
         # Resolve model name
         full_model = MODEL_MAP.get(model, model)
 
+        # When using json_schema, we need --output-format json (not stream-json)
+        # because structured_output is only in the final JSON result
+        output_format = "json" if json_schema else "stream-json"
+
         cmd = [
             "claude",
             "-p",  # Print mode (non-interactive)
             "--verbose",  # Required when using -p with stream-json
             "--model", full_model,
-            "--output-format", "stream-json",  # For session tracking
+            "--output-format", output_format,
         ]
+
+        # Add JSON schema for structured output
+        if json_schema:
+            cmd.extend(["--json-schema", json.dumps(json_schema)])
 
         # Add loop-specific settings file if provided
         if self._settings_path and self._settings_path.exists():
@@ -118,6 +128,7 @@ class ClaudeCLIAdapter(LLMAdapter):
         model: str = "sonnet",
         tools: Optional[list[str]] = None,
         timeout: int = 300,
+        json_schema: Optional[dict] = None,
     ) -> ExecutionResult:
         """Execute a prompt and return the result.
 
@@ -126,10 +137,16 @@ class ClaudeCLIAdapter(LLMAdapter):
             model: Model identifier.
             tools: List of tool names.
             timeout: Timeout in seconds.
+            json_schema: Optional JSON schema for structured output.
 
         Returns:
             ExecutionResult with output and metadata.
         """
+        # When using json_schema, use dedicated non-streaming execution
+        if json_schema:
+            return await self._execute_with_schema(prompt, model, tools, timeout, json_schema)
+
+        # Standard streaming execution
         result = ExecutionResult(started_at=datetime.utcnow())
         text_parts = []
         tool_calls = []
@@ -165,22 +182,141 @@ class ClaudeCLIAdapter(LLMAdapter):
 
         return result
 
-    async def stream(
+    async def _execute_with_schema(
         self,
         prompt: str,
-        model: str = "sonnet",
-        tools: Optional[list[str]] = None,
-        timeout: int = 300,
-    ) -> AsyncIterator[StreamEvent]:
-        """Stream execution events from Claude CLI.
+        model: str,
+        tools: Optional[list[str]],
+        timeout: int,
+        json_schema: dict,
+    ) -> ExecutionResult:
+        """Execute with JSON schema for structured output.
 
-        Automatically handles credential refresh and swap for the execution.
+        Uses --output-format json which returns a single JSON result
+        containing structured_output.
 
         Args:
             prompt: The prompt to send.
             model: Model identifier.
             tools: List of tool names.
             timeout: Timeout in seconds.
+            json_schema: JSON schema for structured output validation.
+
+        Returns:
+            ExecutionResult with structured_output populated.
+        """
+        result = ExecutionResult(started_at=datetime.utcnow())
+
+        # Validate and refresh token
+        if not await refresh_token_if_needed(self._project_id, validate=True):
+            result.success = False
+            result.error_message = "No valid credentials. Token may be expired."
+            return result
+
+        # Swap credentials for execution
+        with swap_credentials_for_loop(self._project_id) as has_creds:
+            if not has_creds:
+                result.success = False
+                result.error_message = "No credentials available."
+                return result
+
+            cmd = self._build_command(model, tools, json_schema)
+
+            try:
+                # Start process
+                self._process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(self.project_path),
+                )
+
+                # Send prompt
+                if self._process.stdin:
+                    self._process.stdin.write(prompt.encode())
+                    await self._process.stdin.drain()
+                    self._process.stdin.close()
+                    await self._process.stdin.wait_closed()
+
+                # Read output with timeout
+                async with asyncio.timeout(timeout):
+                    stdout, stderr = await self._process.communicate()
+
+                result.exit_code = self._process.returncode or 0
+                result.completed_at = datetime.utcnow()
+
+                # Parse JSON result
+                if stdout:
+                    try:
+                        data = json.loads(stdout.decode())
+                        result.session_id = data.get("session_id")
+                        result.structured_output = data.get("structured_output")
+
+                        # Check for errors in result
+                        if data.get("is_error"):
+                            result.success = False
+                            result.error_message = data.get("result", "Unknown error")
+                        elif data.get("subtype") == "error_max_structured_output_retries":
+                            result.success = False
+                            result.error_message = "Could not produce valid structured output"
+                        else:
+                            result.success = True
+
+                        # Extract text from result if available
+                        result.text_output = data.get("result", "")
+
+                    except json.JSONDecodeError as e:
+                        result.success = False
+                        result.error_message = f"Failed to parse JSON output: {e}"
+
+                # Handle stderr
+                if stderr:
+                    stderr_text = stderr.decode(errors="replace").strip()
+                    if stderr_text and not result.error_message:
+                        result.error_message = stderr_text[:500]
+
+                if result.exit_code != 0 and result.success:
+                    result.success = False
+                    if not result.error_message:
+                        result.error_message = f"Exit code {result.exit_code}"
+
+            except asyncio.TimeoutError:
+                result.timeout = True
+                result.success = False
+                result.error_message = f"Execution timed out after {timeout}s"
+                await self.stop()
+
+            except Exception as e:
+                result.success = False
+                result.error_message = str(e)
+
+            finally:
+                self._process = None
+
+        return result
+
+    async def stream(
+        self,
+        prompt: str,
+        model: str = "sonnet",
+        tools: Optional[list[str]] = None,
+        timeout: int = 300,
+        json_schema: Optional[dict] = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream execution events from Claude CLI.
+
+        Automatically handles credential refresh and swap for the execution.
+
+        Note: When json_schema is provided, streaming is not truly supported.
+        Use execute() instead for structured output.
+
+        Args:
+            prompt: The prompt to send.
+            model: Model identifier.
+            tools: List of tool names.
+            timeout: Timeout in seconds.
+            json_schema: Optional JSON schema (not recommended for streaming).
 
         Yields:
             StreamEvent objects as execution progresses.

@@ -17,6 +17,8 @@ class ItemCreate(BaseModel):
     """Request model for creating a work item."""
 
     content: str = Field(..., min_length=1, description="Item content/description")
+    workflow_id: str = Field(..., min_length=1, description="Parent workflow ID")
+    source_step_id: int = Field(..., description="Workflow step that created this item")
     category: Optional[str] = Field(None, description="Category name")
     priority: int = Field(0, ge=0, le=10, description="Priority (0-10)")
     metadata: Optional[dict] = Field(None, description="Additional metadata")
@@ -36,13 +38,14 @@ class ItemResponse(BaseModel):
     """Response model for a work item."""
 
     id: str
-    project_id: str
+    workflow_id: str
+    source_step_id: int
     content: str
+    title: Optional[str] = None
     status: str
     category: Optional[str] = None
     priority: Optional[int] = None
     tags: Optional[list[str]] = None
-    source_loop: Optional[str] = None
     item_type: Optional[str] = None
     claimed_by: Optional[str] = None
     claimed_at: Optional[str] = None
@@ -50,19 +53,25 @@ class ItemResponse(BaseModel):
     created_at: str
     updated_at: str
     metadata: Optional[dict] = None
+    # Phase and dependency fields
+    dependencies: Optional[list[str]] = None
+    phase: Optional[int] = None
+    duplicate_of: Optional[str] = None
+    skip_reason: Optional[str] = None
 
     @classmethod
     def from_item(cls, item: WorkItem) -> "ItemResponse":
         """Create from WorkItem model."""
         return cls(
             id=item.id,
-            project_id=item.project_id,
+            workflow_id=item.workflow_id,
+            source_step_id=item.source_step_id,
             content=item.content,
+            title=item.title,
             status=item.status.value,
             category=item.category,
             priority=item.priority,
             tags=item.tags,
-            source_loop=item.source_loop,
             item_type=item.item_type,
             claimed_by=item.claimed_by,
             claimed_at=item.claimed_at.isoformat() if item.claimed_at else None,
@@ -70,6 +79,10 @@ class ItemResponse(BaseModel):
             created_at=item.created_at.isoformat() if item.created_at else "",
             updated_at=item.updated_at.isoformat() if item.updated_at else "",
             metadata=item.metadata,
+            dependencies=item.dependencies,
+            phase=item.phase,
+            duplicate_of=item.duplicate_of,
+            skip_reason=item.skip_reason,
         )
 
 
@@ -118,6 +131,8 @@ async def list_items(
     slug: str,
     item_status: Optional[str] = Query(None, alias="status", description="Filter by status"),
     category: Optional[str] = Query(None, description="Filter by category"),
+    workflow_id: Optional[str] = Query(None, description="Filter by workflow"),
+    source_step_id: Optional[int] = Query(None, description="Filter by source step"),
     limit: int = Query(50, ge=1, le=1000, description="Items per page"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
 ):
@@ -128,6 +143,8 @@ async def list_items(
     items_data, total = project_db.list_work_items(
         status=item_status,
         category=category,
+        workflow_id=workflow_id,
+        source_step_id=source_step_id,
         limit=limit,
         offset=offset,
     )
@@ -135,7 +152,7 @@ async def list_items(
     # Convert to response models
     items = []
     for row in items_data:
-        item = WorkItem.from_dict(row, project_id=project.id)
+        item = WorkItem.from_dict(row)
         items.append(ItemResponse.from_item(item))
 
     return ItemsPage(
@@ -179,12 +196,33 @@ async def get_item(slug: str, item_id: str):
 
 @router.post("/{slug}/items", response_model=ItemResponse, status_code=status.HTTP_201_CREATED)
 async def create_item(slug: str, data: ItemCreate):
-    """Create a new work item."""
+    """Create a new work item.
+
+    Work items must belong to a workflow and must specify which step created them.
+    """
     manager, project, project_db = get_project(slug)
+
+    # Verify workflow exists
+    workflow = project_db.get_workflow(data.workflow_id)
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow not found: {data.workflow_id}",
+        )
+
+    # Verify step exists and belongs to this workflow
+    step = project_db.get_workflow_step(data.source_step_id)
+    if not step or step["workflow_id"] != data.workflow_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Step {data.source_step_id} not found or does not belong to workflow {data.workflow_id}",
+        )
 
     item_id = str(uuid.uuid4())
     project_db.create_work_item(
         id=item_id,
+        workflow_id=data.workflow_id,
+        source_step_id=data.source_step_id,
         content=data.content,
         category=data.category,
         priority=data.priority,
@@ -326,10 +364,10 @@ class ClaimResponse(BaseModel):
     """Response model for a claimed item."""
 
     id: str
-    project_id: str
+    workflow_id: str
+    source_step_id: int
     content: str
     status: str
-    source_loop: Optional[str] = None
     item_type: Optional[str] = None
     claimed_by: str
     claimed_at: str
@@ -376,10 +414,10 @@ async def claim_item(slug: str, item_id: str, data: ClaimRequest):
     row = project_db.get_work_item(item_id)
     return ClaimResponse(
         id=row["id"],
-        project_id=project.id,
+        workflow_id=row["workflow_id"],
+        source_step_id=row["source_step_id"],
         content=row["content"],
         status=row["status"],
-        source_loop=row.get("source_loop"),
         item_type=row.get("item_type"),
         claimed_by=row["claimed_by"],
         claimed_at=row["claimed_at"],
@@ -455,23 +493,25 @@ async def mark_item_processed(slug: str, item_id: str, data: ClaimRequest):
     return {"message": f"Item {item_id} marked as processed by {data.consumer_loop}"}
 
 
-@router.get("/{slug}/items/source/{source_loop}")
-async def list_source_items(
+@router.get("/{slug}/items/workflow/{workflow_id}/step/{step_id}")
+async def list_step_items(
     slug: str,
-    source_loop: str,
+    workflow_id: str,
+    step_id: int,
     unclaimed: bool = Query(True, description="Only return unclaimed items"),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    """List items produced by a source loop that are available for consumption.
+    """List items from a workflow step that are available for consumption.
 
-    Returns completed items from the source loop that haven't been claimed yet.
+    Returns completed items from the step that haven't been claimed yet.
     """
     manager, project, project_db = get_project(slug)
 
-    # Get items from the source loop (returns tuple of items and total)
+    # Get items from the workflow step (returns tuple of items and total)
     items_data, total = project_db.list_work_items(
-        source_loop=source_loop,
+        workflow_id=workflow_id,
+        source_step_id=step_id,
         status="completed",
         unclaimed_only=unclaimed,
         limit=limit,
@@ -480,7 +520,7 @@ async def list_source_items(
 
     items = []
     for row in items_data:
-        item = WorkItem.from_dict(row, project_id=project.id)
+        item = WorkItem.from_dict(row)
         items.append(ItemResponse.from_item(item))
 
     return ItemsPage(
@@ -491,17 +531,17 @@ async def list_source_items(
     )
 
 
-@router.get("/{slug}/items/source-counts")
-async def get_source_item_counts(slug: str):
-    """Get pending item counts grouped by source_loop.
+@router.get("/{slug}/items/workflow-counts/{workflow_id}")
+async def get_workflow_item_counts(slug: str, workflow_id: str):
+    """Get item counts grouped by step and status for a workflow.
 
-    Useful for dashboard displays showing available work per loop.
+    Useful for dashboard displays showing item progress per workflow step.
     """
     manager, project, project_db = get_project(slug)
 
-    counts = project_db.get_source_item_counts()
+    counts = project_db.get_workflow_item_counts(workflow_id)
 
-    return {"counts": counts}
+    return {"counts": counts, "workflow_id": workflow_id}
 
 
 @router.post("/{slug}/items/release-stale")

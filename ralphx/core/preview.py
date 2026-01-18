@@ -337,14 +337,16 @@ class PromptPreviewEngine:
         title = item.get("title") or ""
         metadata = item.get("metadata")
         metadata_json = json.dumps(metadata) if metadata else "{}"
-        source = item.get("source_loop", "unknown")
+        namespace = item.get("namespace", "unknown")
 
         # Substitution order: most specific first
         result = template.replace("{{input_item.metadata}}", metadata_json)
         result = result.replace("{{input_item.content}}", content)
         result = result.replace("{{input_item.title}}", title)
         result = result.replace("{{input_item}}", content)
-        result = result.replace("{{source_loop}}", source)
+        result = result.replace("{{namespace}}", namespace)
+        # Backward compatibility
+        result = result.replace("{{source_loop}}", namespace)
 
         return result
 
@@ -370,25 +372,28 @@ class PromptPreviewEngine:
             return False
         return bool(self.config.item_types.input.source)
 
-    def _get_source_loop_name(self) -> Optional[str]:
-        """Get the source loop name for consumer loops."""
+    def _get_source_namespace(self) -> Optional[str]:
+        """Get the source namespace for consumer loops.
+
+        For consumer loops, this is the source loop name used as the namespace.
+        """
         if not self._is_consumer_loop():
             return None
         return self.config.item_types.input.source
 
     def _get_sample_item(self) -> Optional[dict]:
-        """Get a sample item from the source loop for preview.
+        """Get a sample item from the source namespace for preview.
 
         Returns:
             Sample item dict or None.
         """
-        source_loop = self._get_source_loop_name()
-        if not source_loop:
+        namespace = self._get_source_namespace()
+        if not namespace:
             return None
 
-        # Get first completed item from source loop
+        # Get first completed item from namespace
         items, _ = self.db.list_work_items(
-            source_loop=source_loop,
+            namespace=namespace,
             status="completed",
             limit=1,
         )
@@ -398,7 +403,7 @@ class PromptPreviewEngine:
 
         # Fallback: get any pending item
         items, _ = self.db.list_work_items(
-            source_loop=source_loop,
+            namespace=namespace,
             status="pending",
             limit=1,
         )
@@ -409,8 +414,8 @@ class PromptPreviewEngine:
         # Return a placeholder
         return {
             "id": "sample-001",
-            "content": "[Sample item content - no items in source loop]",
-            "source_loop": source_loop,
+            "content": "[Sample item content - no items in namespace]",
+            "namespace": namespace,
         }
 
     def _explain_strategy(self) -> str:
@@ -467,13 +472,15 @@ class PromptPreviewEngine:
                 variables["{{input_item.content}}"] = sample_item.get("content", "")[:50] + "..."
                 variables["{{input_item.title}}"] = sample_item.get("title", "")
                 variables["{{input_item.metadata}}"] = "{...}"
-                variables["{{source_loop}}"] = sample_item.get("source_loop", "")
+                variables["{{namespace}}"] = sample_item.get("namespace", "")
+                variables["{{source_loop}}"] = sample_item.get("namespace", "")  # Backward compat
             else:
                 variables["{{input_item}}"] = "[Claimed item content]"
                 variables["{{input_item.content}}"] = "[Claimed item content]"
                 variables["{{input_item.title}}"] = "[Claimed item title]"
                 variables["{{input_item.metadata}}"] = "[Claimed item metadata as JSON]"
-                variables["{{source_loop}}"] = self._get_source_loop_name() or ""
+                variables["{{namespace}}"] = self._get_source_namespace() or ""
+                variables["{{source_loop}}"] = self._get_source_namespace() or ""  # Backward compat
 
         # Design doc variable (if configured)
         if self.config.context and self.config.context.design_doc:

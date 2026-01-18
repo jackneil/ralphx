@@ -176,10 +176,18 @@ class OAuthFlow:
             tokens = resp.json()
             logger.info(f"OAuth token received: expires_in={tokens.get('expires_in')}s, scopes={tokens.get('scope')}")
 
-            # Extract email from account field
+            # Extract email and additional OAuth metadata from account field
             account = tokens.get("account", {})
             if account.get("email_address"):
                 tokens["email"] = account["email_address"]
+            if account.get("subscriptionType"):
+                tokens["subscription_type"] = account["subscriptionType"]
+            if account.get("rateLimitTier"):
+                tokens["rate_limit_tier"] = account["rateLimitTier"]
+
+            # Store scopes as list (from space-separated string)
+            if tokens.get("scope"):
+                tokens["scopes"] = tokens["scope"].split()
 
             # Step 2: Try to create long-lived API key using the OAuth token
             access_token = tokens.get("access_token")

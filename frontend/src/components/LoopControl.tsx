@@ -93,7 +93,7 @@ export default function LoopControl({
     setShowStartOptions(false)
   }
 
-  const isConsumer = loopType === 'consumer' || phaseInfo?.source_loop
+  const isConsumer = loopType === 'consumer' || phaseInfo?.source_step_id
 
   return (
     <div className="flex flex-col">
@@ -224,7 +224,8 @@ export default function LoopControl({
 
                       {/* Stats summary */}
                       <div className="text-xs text-gray-400 border-t border-gray-700 pt-2">
-                        {phaseInfo.total_items} total items from {phaseInfo.source_loop}
+                        {phaseInfo.total_items} total items
+                        {phaseInfo.workflow_id && ` from workflow ${phaseInfo.workflow_id.slice(0, 8)}`}
                         {phaseInfo.graph_stats.items_with_dependencies > 0 && (
                           <span> | {phaseInfo.graph_stats.items_with_dependencies} with dependencies</span>
                         )}

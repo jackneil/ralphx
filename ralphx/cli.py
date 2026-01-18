@@ -463,17 +463,25 @@ def run_loop(
         console.print(f"\nSync loops first: [cyan]ralphx loops sync --project {project}[/cyan]")
         raise typer.Exit(1)
 
+    # Calculate max iterations for display and execution
+    max_iter = iterations or config.limits.max_iterations
+
     if not quiet:
-        console.print(f"[bold]Running loop:[/bold] {config.display_name}")
-        console.print(f"  Project: {proj.name} ({project})")
-        console.print(f"  Strategy: {config.mode_selection.strategy.value}")
-        max_iter = iterations or config.limits.max_iterations
-        console.print(f"  Iterations: {max_iter}")
-        if dry_run:
-            console.print("  [yellow]Dry run mode - no LLM calls[/yellow]")
-        if resume:
-            console.print("  [blue]Resume mode (Plan 09)[/blue]")
+        from ralphx.core.display import build_config_banner, TimestampedConsole
+
+        # Show configuration banner
+        banner = build_config_banner(
+            project=proj,
+            config=config,
+            max_iterations=max_iter,
+            dry_run=dry_run,
+            resume=resume,
+        )
+        console.print(banner)
         console.print()
+
+        # Create timestamped console for run output
+        ts_console = TimestampedConsole(console)
 
     # Create executor using project-local database for portability
     project_db = proj_manager.get_project_db(proj.path)
@@ -484,30 +492,69 @@ def run_loop(
         dry_run=dry_run,
     )
 
-    # Event handler for CLI output
+    # Track run start time for elapsed calculation
+    from datetime import datetime
+    run_start_time = datetime.utcnow()
+
+    # Event handler for CLI output with timestamps
     def on_event(event: ExecutorEventData) -> None:
         if quiet:
             return
 
+        # Import here to avoid issues when quiet=True
+        from ralphx.core.display import format_iteration_header
+        from rich.markup import escape
+
         if event.event == ExecutorEvent.ITERATION_STARTED:
             mode = event.data.get("mode", "unknown")
-            console.print(f"  [dim]Iteration {event.iteration}[/dim] mode={mode}")
+            # Get mode config for model and timeout
+            mode_config = config.modes.get(mode)
+            model = mode_config.model if mode_config else "sonnet"
+            timeout = mode_config.timeout if mode_config else 300
+
+            # Calculate elapsed time
+            elapsed = (datetime.utcnow() - run_start_time).total_seconds()
+
+            # Format iteration header
+            main_line, detail_line = format_iteration_header(
+                iteration=event.iteration,
+                max_iterations=max_iter,
+                elapsed_seconds=elapsed,
+                mode=mode,
+                model=model,
+                timeout=timeout,
+            )
+            ts_console.print(main_line)
+            ts_console.print_continuation(detail_line)
+
+        elif event.event == ExecutorEvent.PROMPT_PREPARED:
+            # Show prompt size statistics
+            ts_console.print(event.message)
 
         elif event.event == ExecutorEvent.ITEM_ADDED:
             item_id = event.data.get("item_id", "?")
-            console.print(f"    [green]+[/green] {item_id}")
+            ts_console.print(f"[green]+[/green] {escape(item_id)}")
 
         elif event.event == ExecutorEvent.ERROR:
-            console.print(f"    [red]Error:[/red] {event.message}")
+            # Include consecutive error count
+            consecutive = event.data.get("consecutive_errors", 0)
+            max_consecutive = event.data.get("max_consecutive_errors", 3)
+            error_msg = escape(event.message or "Unknown error")
+            if consecutive > 0:
+                ts_console.print(f"[red]Error:[/red] {error_msg} (consecutive: {consecutive}/{max_consecutive})")
+            else:
+                ts_console.print(f"[red]Error:[/red] {error_msg}")
 
         elif event.event == ExecutorEvent.WARNING:
-            console.print(f"    [yellow]Warning:[/yellow] {event.message}")
+            ts_console.print(f"[yellow]Warning:[/yellow] {escape(event.message or '')}")
 
         elif event.event == ExecutorEvent.RUN_COMPLETED:
-            console.print(f"\n[green]Completed:[/green] {event.message}")
+            ts_console.print_blank()
+            ts_console.print(f"[green]Completed:[/green] {escape(event.message or '')}")
 
         elif event.event == ExecutorEvent.RUN_ABORTED:
-            console.print(f"\n[yellow]Aborted:[/yellow] {event.message}")
+            ts_console.print_blank()
+            ts_console.print(f"[yellow]Aborted:[/yellow] {escape(event.message or '')}")
 
     executor.add_event_handler(on_event)
 
@@ -516,13 +563,18 @@ def run_loop(
         run = asyncio.run(executor.run(max_iterations=iterations))
 
         if not quiet:
-            console.print(f"\n[bold]Run Summary[/bold]")
-            console.print(f"  Run ID: {run.id}")
-            console.print(f"  Status: {run.status.value}")
-            console.print(f"  Iterations: {run.iterations_completed}")
-            console.print(f"  Items generated: {run.items_generated}")
-            if run.duration_seconds:
-                console.print(f"  Duration: {run.duration_seconds:.1f}s")
+            from ralphx.core.display import build_summary_banner
+
+            console.print()  # Blank line before summary
+            summary_banner = build_summary_banner(
+                run_id=run.id,
+                status=run.status.value,
+                iterations=run.iterations_completed,
+                items_generated=run.items_generated,
+                duration_seconds=run.duration_seconds,
+                error_message=run.error_message,
+            )
+            console.print(summary_banner)
 
         if run.status.value == "error":
             raise typer.Exit(1)

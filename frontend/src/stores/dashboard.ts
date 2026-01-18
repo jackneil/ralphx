@@ -25,6 +25,8 @@ export interface Loop {
   is_running: boolean
   current_iteration?: number
   current_mode?: string
+  workflow_id?: string  // Optional - legacy loops may not have this
+  step_id?: number
 }
 
 // Re-export Item from api.ts for backward compatibility

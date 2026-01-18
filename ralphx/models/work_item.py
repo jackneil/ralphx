@@ -17,6 +17,8 @@ class WorkItemStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     DUPLICATE = "duplicate"
+    DUP = "dup"  # Alias for duplicate (from hank-rcm import)
+    EXTERNAL = "external"  # Item handled externally
 
 
 class WorkItemCreate(BaseModel):
@@ -32,11 +34,12 @@ class WorkItemCreate(BaseModel):
     metadata: Optional[dict[str, Any]] = None
     dependencies: Optional[list[str]] = Field(None, description="IDs of items this depends on")
 
-    def to_work_item(self, project_id: str) -> "WorkItem":
-        """Convert to full WorkItem with project ID."""
+    def to_work_item(self, workflow_id: str, source_step_id: int) -> "WorkItem":
+        """Convert to full WorkItem with workflow context."""
         return WorkItem(
             id=self.id,
-            project_id=project_id,
+            workflow_id=workflow_id,
+            source_step_id=source_step_id,
             content=self.content,
             title=self.title,
             priority=self.priority,
@@ -54,7 +57,9 @@ class WorkItem(BaseModel):
     """Full work item model."""
 
     id: str = Field(..., description="Unique identifier within project")
-    project_id: str = Field(..., description="Parent project ID")
+    project_id: str = Field("", description="Deprecated - use workflow_id instead")
+    workflow_id: str = Field(..., description="Parent workflow ID")
+    source_step_id: int = Field(..., description="Workflow step that created this item")
     content: str = Field(..., description="Main content")
     title: Optional[str] = Field(None, description="Short title for the item")
     priority: Optional[int] = Field(None, ge=0)
@@ -62,7 +67,6 @@ class WorkItem(BaseModel):
     category: Optional[str] = None
     tags: Optional[list[str]] = None
     metadata: Optional[dict[str, Any]] = None
-    source_loop: Optional[str] = Field(None, description="Loop that created this item")
     item_type: Optional[str] = Field(None, description="Semantic type from output.singular")
     claimed_by: Optional[str] = Field(None, description="Loop that claimed this item for processing")
     claimed_at: Optional[datetime] = Field(None, description="When the item was claimed")
@@ -81,7 +85,8 @@ class WorkItem(BaseModel):
         """Convert to dictionary for database storage."""
         return {
             "id": self.id,
-            "project_id": self.project_id,
+            "workflow_id": self.workflow_id,
+            "source_step_id": self.source_step_id,
             "content": self.content,
             "title": self.title,
             "priority": self.priority,
@@ -89,7 +94,6 @@ class WorkItem(BaseModel):
             "category": self.category,
             "tags": self.tags,
             "metadata": self.metadata,
-            "source_loop": self.source_loop,
             "item_type": self.item_type,
             "claimed_by": self.claimed_by,
             "claimed_at": self.claimed_at.isoformat() if self.claimed_at else None,
@@ -108,11 +112,12 @@ class WorkItem(BaseModel):
 
         Args:
             data: Dictionary with work item data.
-            project_id: Project ID (if not in data, e.g., from ProjectDatabase).
+            project_id: Deprecated - ignored, use workflow_id in data.
         """
         return cls(
             id=data["id"],
-            project_id=data.get("project_id", project_id),
+            workflow_id=data["workflow_id"],
+            source_step_id=data["source_step_id"],
             content=data["content"],
             title=data.get("title"),
             priority=data.get("priority"),
@@ -120,7 +125,6 @@ class WorkItem(BaseModel):
             category=data.get("category"),
             tags=data.get("tags"),
             metadata=data.get("metadata"),
-            source_loop=data.get("source_loop"),
             item_type=data.get("item_type"),
             claimed_by=data.get("claimed_by"),
             claimed_at=(

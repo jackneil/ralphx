@@ -4,13 +4,18 @@ Project-level resources (design docs, architecture, coding standards, etc.)
 that can be inherited by loops and injected into prompts.
 
 Resources are stored in <project>/.ralphx/resources/ with subdirectories:
-- design_doc/
-- architecture/
-- coding_standards/
-- domain_knowledge/
-- custom/
+- loop_template/    # Base loop instructions (main driving prompt)
+- design_doc/       # Project design/PRD
+- architecture/     # System architecture docs
+- coding_standards/ # Coding guidelines
+- domain_knowledge/ # Domain-specific context
+- guardrails/       # Quality rules and constraints
+- custom/           # Other resources
 
 Loops can configure which resources to inherit via their ContextConfig.resources field.
+
+Security Note: Imported resources execute as prompt content. Only import files
+from trusted sources.
 """
 
 from dataclasses import dataclass, field
@@ -24,10 +29,12 @@ from ralphx.core.project_db import ProjectDatabase
 class ResourceType(str, Enum):
     """Types of project resources."""
 
+    LOOP_TEMPLATE = "loop_template"  # Base loop instructions (main driving prompt)
     DESIGN_DOC = "design_doc"
     ARCHITECTURE = "architecture"
     CODING_STANDARDS = "coding_standards"
     DOMAIN_KNOWLEDGE = "domain_knowledge"
+    GUARDRAILS = "guardrails"  # Quality rules and constraints
     CUSTOM = "custom"
 
 
@@ -35,6 +42,7 @@ class InjectionPosition(str, Enum):
     """Where to inject content in the prompt.
 
     The prompt building pipeline injects content in this order:
+    0. TEMPLATE_BODY - IS the base template itself (not injected, used as template)
     1. BEFORE_PROMPT - Coding standards, system guardrails (before everything)
     2. AFTER_DESIGN_DOC - Design docs, architecture, domain knowledge
     3. [TEMPLATE CONTENT] - The base prompt template
@@ -42,6 +50,7 @@ class InjectionPosition(str, Enum):
     5. AFTER_TASK - Custom resources, custom guardrails
     """
 
+    TEMPLATE_BODY = "template_body"  # IS the base template, not injected into it
     BEFORE_PROMPT = "before_prompt"
     AFTER_DESIGN_DOC = "after_design_doc"
     BEFORE_TASK = "before_task"
@@ -50,10 +59,12 @@ class InjectionPosition(str, Enum):
 
 # Default injection positions for each resource type
 DEFAULT_POSITIONS: dict[ResourceType, InjectionPosition] = {
+    ResourceType.LOOP_TEMPLATE: InjectionPosition.TEMPLATE_BODY,
     ResourceType.DESIGN_DOC: InjectionPosition.AFTER_DESIGN_DOC,
     ResourceType.ARCHITECTURE: InjectionPosition.AFTER_DESIGN_DOC,
     ResourceType.CODING_STANDARDS: InjectionPosition.BEFORE_PROMPT,
     ResourceType.DOMAIN_KNOWLEDGE: InjectionPosition.AFTER_DESIGN_DOC,
+    ResourceType.GUARDRAILS: InjectionPosition.BEFORE_TASK,
     ResourceType.CUSTOM: InjectionPosition.AFTER_TASK,
 }
 
@@ -342,10 +353,12 @@ class ResourceManager:
             Header string like "## Design Document" or "## Architecture".
         """
         type_labels = {
+            ResourceType.LOOP_TEMPLATE: "Loop Template",
             ResourceType.DESIGN_DOC: "Design Document",
             ResourceType.ARCHITECTURE: "Architecture",
             ResourceType.CODING_STANDARDS: "Coding Standards",
             ResourceType.DOMAIN_KNOWLEDGE: "Domain Knowledge",
+            ResourceType.GUARDRAILS: "Guardrails",
             ResourceType.CUSTOM: "Additional Context",
         }
         label = type_labels.get(resource.resource_type, "Resource")
