@@ -81,7 +81,8 @@ class ImportJsonlResponse(BaseModel):
     """Response from JSONL import."""
 
     imported: int
-    skipped: int
+    skipped: int  # Duplicates already in DB
+    already_processed: int = 0  # Skipped because non-pending status (in pending_only mode)
     errors: list[str]
     total_lines: int
 
@@ -340,6 +341,10 @@ async def import_jsonl_with_format(
     workflow_id: str = Query(..., description="Parent workflow ID for imported items"),
     source_step_id: int = Query(..., description="Workflow step ID that is importing items"),
     loop_name: Optional[str] = Query(None, description="Optional loop name for tracking"),
+    import_mode: str = Query(
+        "pending_only",
+        description="Import mode: 'pending_only' (skip already processed), 'all' (preserve status), 'reset' (import all as pending)"
+    ),
     file: UploadFile = File(...),
 ):
     """Import work items from a JSONL file using a specified format.
@@ -401,6 +406,7 @@ async def import_jsonl_with_format(
             workflow_id=workflow_id,
             source_step_id=source_step_id,
             loop_name=loop_name,
+            import_mode=import_mode,
         )
 
         return ImportJsonlResponse(**result)

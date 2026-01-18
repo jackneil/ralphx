@@ -993,6 +993,8 @@ class ProjectDatabase:
         dependencies: Optional[list[str]] = None,
         phase: Optional[int] = None,
         status: str = "pending",
+        duplicate_of: Optional[str] = None,
+        skip_reason: Optional[str] = None,
     ) -> dict:
         """Create a work item.
 
@@ -1009,6 +1011,8 @@ class ProjectDatabase:
             dependencies: Optional list of item IDs this depends on.
             phase: Optional phase number for implementation batching (Phase 1, etc).
             status: Initial status (default: "pending").
+            duplicate_of: Parent item ID if this is a duplicate.
+            skip_reason: Reason for skipping (for skipped/external status).
 
         Returns:
             The created work item dict.
@@ -1021,11 +1025,13 @@ class ProjectDatabase:
                 """
                 INSERT INTO work_items
                 (id, workflow_id, source_step_id, content, title, priority, category,
-                 item_type, metadata, dependencies, phase, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 item_type, metadata, dependencies, phase, status, duplicate_of,
+                 skip_reason, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (id, workflow_id, source_step_id, content, title, priority, category,
-                 item_type, metadata_json, dependencies_json, phase, status, now, now),
+                 item_type, metadata_json, dependencies_json, phase, status, duplicate_of,
+                 skip_reason, now, now),
             )
         return self.get_work_item(id)
 
@@ -2449,6 +2455,7 @@ class ProjectDatabase:
         workflow_id: str,
         source_step_id: int,
         loop_name: Optional[str] = None,
+        import_mode: str = "pending_only",
     ) -> dict:
         """Import work items from a JSONL file.
 
@@ -2458,9 +2465,13 @@ class ProjectDatabase:
             workflow_id: Parent workflow ID for imported items.
             source_step_id: Workflow step ID that is importing these items.
             loop_name: Optional loop name for input file tracking.
+            import_mode: How to handle status during import:
+                - "pending_only": Only import items with pending status (skip already processed)
+                - "all": Import all items, preserving their status
+                - "reset": Import all items, resetting status to pending/completed
 
         Returns:
-            Dict with import results: {imported: int, skipped: int, errors: list}.
+            Dict with import results: {imported: int, skipped: int, already_processed: int, errors: list}.
 
         Raises:
             ValueError: If format not found.
@@ -2482,8 +2493,24 @@ class ProjectDatabase:
         auto_category = fmt.get("id_prefix_to_category", False)
 
         imported = 0
-        skipped = 0
+        skipped = 0  # Duplicates (already in DB)
+        already_processed = 0  # Skipped because status != pending
         errors = []
+
+        # Status mapping from source format to RalphX
+        # Source (hank-rcm style) -> RalphX status
+        STATUS_MAP = {
+            "pending": "completed",      # Ready for consumer loop to process
+            "implemented": "processed",  # Already done - don't reprocess
+            "dup": "duplicate",          # Duplicate of another item
+            "external": "skipped",       # External system handles this
+            "skipped": "skipped",        # Intentionally skipped
+            # RalphX native statuses pass through
+            "completed": "completed",
+            "processed": "processed",
+            "duplicate": "duplicate",
+            "failed": "failed",
+        }
 
         with open(path, "r") as f:
             for line_num, line in enumerate(f, 1):
@@ -2527,18 +2554,42 @@ class ProjectDatabase:
                     category = category_map.get(prefix, prefix)
                 item["category"] = category
 
-                # Status mapping (use `or` to handle explicit None values)
-                status = item.get("status") or "pending"
-                if status == "implemented":
-                    status = "completed"
-                item["status"] = status
+                # Get source status and map to RalphX status
+                source_status = item.get("status") or raw.get("status") or "pending"
+                ralphx_status = STATUS_MAP.get(source_status, "completed")
+
+                # Handle import mode
+                if import_mode == "pending_only":
+                    # Only import pending items
+                    if source_status not in ("pending", None, ""):
+                        already_processed += 1
+                        continue
+                    ralphx_status = "completed"  # Ready for processing
+                elif import_mode == "reset":
+                    # Import all, but reset to ready-for-processing state
+                    ralphx_status = "completed"
+                # else: import_mode == "all" - preserve status as mapped
+
+                item["status"] = ralphx_status
 
                 # Extract metadata fields not in mapping
                 metadata = {}
-                metadata_fields = ["acceptance_criteria", "impl_notes", "passes", "notes"]
+                metadata_fields = [
+                    "acceptance_criteria", "impl_notes", "passes", "notes",
+                    "implemented_at", "dup_of", "external_product", "skip_reason"
+                ]
                 for field in metadata_fields:
                     if field in raw:
                         metadata[field] = raw[field]
+
+                # Handle special status fields
+                if source_status == "dup" and raw.get("dup_of"):
+                    item["duplicate_of"] = raw["dup_of"]
+                if source_status == "external" and raw.get("external_product"):
+                    item["skip_reason"] = f"external:{raw['external_product']}"
+                if source_status == "skipped" and raw.get("skip_reason"):
+                    item["skip_reason"] = raw["skip_reason"]
+
                 if metadata:
                     item["metadata"] = metadata
 
@@ -2559,7 +2610,9 @@ class ProjectDatabase:
                         priority=item.get("priority"),
                         category=item.get("category"),
                         metadata=item.get("metadata"),
-                        status=item.get("status") or "pending",
+                        status=item.get("status") or "completed",
+                        duplicate_of=item.get("duplicate_of"),
+                        skip_reason=item.get("skip_reason"),
                     )
                     imported += 1
                 except Exception as e:
@@ -2576,9 +2629,10 @@ class ProjectDatabase:
 
         return {
             "imported": imported,
-            "skipped": skipped,
+            "skipped": skipped,  # Duplicates already in DB
+            "already_processed": already_processed,  # Skipped due to non-pending status
             "errors": errors,
-            "total_lines": imported + skipped + len(errors),
+            "total_lines": imported + skipped + already_processed + len(errors),
         }
 
     def seed_defaults_if_empty(self) -> bool:
