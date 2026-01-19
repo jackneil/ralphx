@@ -44,7 +44,17 @@ jobs:
       - name: Verify package contents
         run: |
           pip install dist/*.whl
-          python -c "from pathlib import Path; import ralphx; p = Path(ralphx.__file__).parent / 'static' / 'index.html'; assert p.exists(), f'Missing {p}'"
+          python -c "
+          from pathlib import Path
+          import ralphx
+          static = Path(ralphx.__file__).parent / 'static'
+          index = static / 'index.html'
+          assets = static / 'assets'
+          assert index.exists(), f'Missing {index}'
+          assert assets.exists() and assets.is_dir(), f'Missing assets directory {assets}'
+          print(f'Verified: {index}')
+          print(f'Verified: {assets}')
+          "
           echo "Package includes frontend static files"
 
   test:

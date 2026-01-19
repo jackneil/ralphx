@@ -39,6 +39,22 @@ jobs:
       - name: Build package
         run: python -m build
 
+      - name: Verify package contents
+        run: |
+          pip install dist/*.whl
+          python -c "
+          from pathlib import Path
+          import ralphx
+          static = Path(ralphx.__file__).parent / 'static'
+          index = static / 'index.html'
+          assets = static / 'assets'
+          assert index.exists(), f'Missing {index}'
+          assert assets.exists() and assets.is_dir(), f'Missing assets directory {assets}'
+          print(f'Verified: {index}')
+          print(f'Verified: {assets}')
+          "
+          echo "Package includes frontend static files"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:

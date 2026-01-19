@@ -294,8 +294,10 @@ async def root():
 
 # Static files and SPA routing
 if FRONTEND_DIR.exists():
-    # Serve static assets
-    app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
+    # Serve static assets (only if assets directory exists)
+    _assets_dir = FRONTEND_DIR / "assets"
+    if _assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=_assets_dir), name="assets")
 
     # Catch-all for SPA routing (must be last)
     @app.get("/{full_path:path}")
