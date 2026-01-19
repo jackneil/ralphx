@@ -34,53 +34,43 @@ RalphX lets you define autonomous AI workflows in YAML and run them with Claude 
 
 ## Quick Start
 
-Choose the path that fits your workflow:
+RalphX is designed to work with Claude Code. Just ask Claude to set it up for you.
 
-### Path A: Web Dashboard (Visual Users)
+### Ask Claude Code (Recommended)
 
-The easiest way to get started. Run loops and monitor them in your browser.
+Copy this prompt into Claude Code:
+
+> "Install RalphX using conda and register this project. Then show me how to create my first workflow."
+
+Claude will handle environment setup, installation, and project registration.
+
+### Manual Installation
+
+If you prefer to install manually:
 
 ```bash
+# Create conda environment (we use conda, not venv)
+conda create -n ralphx python=3.11 -y
+conda activate ralphx
+
 # Install RalphX
 pip install ralphx
 
-# Register your project directory
+# Register your project and start the dashboard
 ralphx add /path/to/your/project
-
-# Start the dashboard
 ralphx serve
-
-# Open http://localhost:8765 in your browser
+# Open http://localhost:8765
 ```
 
-### Path B: Claude Code + MCP (Power Users)
+### MCP Integration (Optional)
 
-Let Claude Code manage your loops through natural language.
+Let Claude Code manage your loops through natural language:
 
 ```bash
-# Install RalphX
-pip install ralphx
-
-# Add RalphX as an MCP server to Claude Code
+# Add RalphX as an MCP server
 claude mcp add ralphx -- ralphx mcp
 
-# Now Claude Code can manage loops via natural language!
-# Example: "List my RalphX projects" or "Start the planning loop"
-```
-
-### Path C: CLI Only (Automation)
-
-For scripts, CI/CD, or when you prefer the command line.
-
-```bash
-# Install RalphX
-pip install ralphx
-
-# Register your project
-ralphx add /path/to/your/project
-
-# Run a loop directly
-ralphx run my_loop --project my-project
+# Now ask Claude: "List my RalphX projects" or "Start the planning loop"
 ```
 
 ---

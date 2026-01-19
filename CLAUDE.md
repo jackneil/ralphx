@@ -1,8 +1,28 @@
 # Claude Preferences for RalphX Development
 
+## Core Philosophy: Claude Code First
+
+RalphX is a **Claude Code-first product**. When documenting or explaining how to do things:
+
+1. **Always provide a Claude Code prompt first** - Users should be able to copy a prompt into Claude Code to get things done
+2. **Manual commands are secondary** - Only show manual bash commands as a fallback or for reference
+3. **README, Wiki, and docs should lead with prompts** - e.g., "Ask Claude Code: 'Install RalphX and set it up for my project'"
+
+Example of good documentation:
+```
+## Quick Start
+
+Ask Claude Code:
+> "Install RalphX using conda and register this project"
+
+Or manually:
+conda create -n ralphx python=3.11 && conda activate ralphx && pip install ralphx
+```
+
 ## Python Environment
 
-- **Use the `ralphx` conda environment**: All Python code should run in the ralphx environment. We use miniconda.
+- **Always use conda (miniconda)** - Never use venv or virtualenv. We standardize on conda.
+- **Use the `ralphx` conda environment**: All Python code should run in the ralphx environment.
   ```bash
   conda activate ralphx
   ```
