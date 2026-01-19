@@ -43,6 +43,7 @@ dependencies = [
     "rich>=13.0",
     "watchfiles>=0.20",
     "httpx>=0.24",
+    "python-multipart>=0.0.6",
 ]
 
 [project.optional-dependencies]
