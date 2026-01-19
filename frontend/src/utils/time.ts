@@ -71,8 +71,8 @@ export function formatLocalFull(timestamp: string | null | undefined): string {
 }
 
 // Format as relative time (e.g., "2h ago", "3d ago")
-export function formatRelativeTime(timestamp: string | null | undefined): string {
-  if (!timestamp) return ''
+export function formatRelativeTime(timestamp: string | null | undefined, defaultValue: string = ''): string {
+  if (!timestamp) return defaultValue
   const date = parseAsUTC(timestamp)
   const now = new Date()
   const diffMs = now.getTime() - date.getTime()
@@ -83,7 +83,7 @@ export function formatRelativeTime(timestamp: string | null | undefined): string
 
   if (diffSec < 60) return 'just now'
   if (diffMin < 60) return `${diffMin}m ago`
-  if (diffHour < 24) return `${diffHour}h ago`
+  if (diffHour < 48) return `${diffHour}h ago`
   if (diffDay < 7) return `${diffDay}d ago`
   return formatLocalDate(timestamp)
 }

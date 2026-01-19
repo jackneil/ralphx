@@ -11,6 +11,7 @@ import RunHistory from './pages/RunHistory'
 import Settings from './pages/Settings'
 import Logs from './pages/Logs'
 import WorkflowDetail from './pages/WorkflowDetail'
+import StepDetail from './pages/StepDetail'
 import ProjectDashboard from './pages/ProjectDashboard'
 import Wiki from './pages/Wiki'
 
@@ -34,6 +35,7 @@ function App() {
         {/* Workflow pages */}
         <Route path="projects/:slug/workflows" element={<Navigate to=".." replace />} />
         <Route path="projects/:slug/workflows/:workflowId" element={<WorkflowDetail />} />
+        <Route path="projects/:slug/workflows/:workflowId/steps/:stepNumber" element={<StepDetail />} />
         <Route path="projects/:slug/workflows/:workflowId/edit" element={<WorkflowEdit />} />
         <Route path="projects/:slug/workflows/:workflowId/items" element={<WorkflowItems />} />
         <Route path="projects/:slug/workflows/:workflowId/resources" element={<WorkflowResources />} />

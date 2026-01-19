@@ -5,7 +5,6 @@ import {
   getWorkflow,
   startWorkflow,
   stopWorkflow,
-  advanceWorkflowStep,
   archiveWorkflow,
   runSpecificStep,
   listWorkflowResources,
@@ -13,10 +12,9 @@ import {
 } from '../api'
 import type { Workflow, ImportJsonlResponse, WorkflowResource } from '../api'
 import WorkflowTimeline from '../components/workflow/WorkflowTimeline'
+import WorkflowStatusBar from '../components/workflow/WorkflowStatusBar'
 import WorkflowItemsTab from '../components/workflow/WorkflowItemsTab'
-import PlanningChat from '../components/planning/PlanningChat'
 import ImportJsonlModal from '../components/workflow/ImportJsonlModal'
-import SessionHistory from '../components/SessionHistory'
 
 export default function WorkflowDetail() {
   const { slug, workflowId } = useParams<{ slug: string; workflowId: string }>()
@@ -29,7 +27,6 @@ export default function WorkflowDetail() {
   const [actionLoading, setActionLoading] = useState(false)
   const [showImport, setShowImport] = useState(false)
   const [importResult, setImportResult] = useState<ImportJsonlResponse | null>(null)
-  const [selectedStepNumber, setSelectedStepNumber] = useState<number | null>(null)
   const [activeTab, setActiveTab] = useState<'steps' | 'items'>('steps')
   const [itemsSourceStepId, setItemsSourceStepId] = useState<number | undefined>(undefined)
 
@@ -65,13 +62,13 @@ export default function WorkflowDetail() {
 
   const handleStartClick = async () => {
     const result = await Swal.fire({
-      title: 'Start Workflow?',
+      title: 'Run Entire Workflow?',
       text: 'This will begin executing the workflow from the current step.',
       icon: 'question',
       showCancelButton: true,
       confirmButtonColor: 'var(--color-primary)',
       cancelButtonColor: 'var(--color-slate)',
-      confirmButtonText: 'Start',
+      confirmButtonText: 'Run Full Workflow',
       cancelButtonText: 'Cancel',
       background: 'var(--color-surface)',
       color: 'var(--color-text-primary)',
@@ -124,19 +121,6 @@ export default function WorkflowDetail() {
     }
   }
 
-  const handleAdvance = async (skipCurrent: boolean = false) => {
-    if (!slug || !workflowId) return
-    setActionLoading(true)
-    try {
-      const updated = await advanceWorkflowStep(slug, workflowId, { skip_current: skipCurrent })
-      setWorkflow(updated)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to advance workflow')
-    } finally {
-      setActionLoading(false)
-    }
-  }
-
   const handleArchive = async () => {
     if (!slug || !workflowId) return
 
@@ -177,7 +161,7 @@ export default function WorkflowDetail() {
       showCancelButton: true,
       confirmButtonColor: 'var(--color-primary)',
       cancelButtonColor: 'var(--color-slate)',
-      confirmButtonText: 'Run',
+      confirmButtonText: 'Run Step',
       cancelButtonText: 'Cancel',
       background: 'var(--color-surface)',
       color: 'var(--color-text-primary)',
@@ -194,6 +178,11 @@ export default function WorkflowDetail() {
     } finally {
       setActionLoading(false)
     }
+  }
+
+  const handleStopStep = async (_stepNumber: number) => {
+    // For now, stopping a step stops the whole workflow
+    await handleStop()
   }
 
   const handleViewItems = (stepId: number) => {
@@ -250,15 +239,6 @@ export default function WorkflowDetail() {
   // Defensive: ensure steps array exists (TypeScript says required, but runtime could differ)
   const steps = workflow.steps || []
 
-  const currentStep = steps.find(s => s.step_number === workflow.current_step)
-
-  // Selected step for viewing logs (defaults to current step)
-  const effectiveSelectedStep = selectedStepNumber ?? workflow.current_step
-  const selectedStep = steps.find(s => s.step_number === effectiveSelectedStep) || currentStep
-
-  const isInteractiveStep = selectedStep?.step_type === 'interactive'
-  const isAutonomousStep = selectedStep?.step_type === 'autonomous'
-
   // Check if anything is ACTUALLY running (not just workflow status)
   // This is the source of truth - if any step has an active run, something is running
   const isActuallyRunning = steps.some(s => s.has_active_run === true)
@@ -310,33 +290,35 @@ export default function WorkflowDetail() {
           </div>
 
           <div className="flex items-center space-x-3">
-            {/* Run button - show when nothing is running and workflow isn't completed */}
+            {/* Run Workflow button - show when nothing is running and workflow isn't completed */}
             {canRun && (
               <button
                 onClick={handleStartClick}
                 disabled={actionLoading}
+                title="Execute all steps in sequence from the current position"
                 className="flex items-center space-x-2 px-4 py-2 bg-green-600 text-white rounded hover:bg-green-500 transition-colors disabled:opacity-50"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <span>Run</span>
+                <span>Run Full Workflow</span>
               </button>
             )}
 
-            {/* Stop button - show only when something is actually running */}
+            {/* Stop Workflow button - show only when something is actually running */}
             {canStop && (
               <button
                 onClick={handleStop}
                 disabled={actionLoading}
+                title="Stop all running steps immediately"
                 className="flex items-center space-x-2 px-4 py-2 bg-red-600 text-white rounded hover:bg-red-500 transition-colors disabled:opacity-50"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
                 </svg>
-                <span>Stop</span>
+                <span>Stop Workflow</span>
               </button>
             )}
 
@@ -356,6 +338,7 @@ export default function WorkflowDetail() {
 
             <button
               onClick={() => navigate(`/projects/${slug}/workflows/${workflowId}/edit`)}
+              title="Modify workflow steps, resources, and configuration"
               className="flex items-center space-x-2 px-4 py-2 bg-gray-700 text-gray-300 rounded hover:bg-gray-600 transition-colors"
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -367,7 +350,7 @@ export default function WorkflowDetail() {
             <button
               onClick={handleArchive}
               className="flex items-center space-x-2 px-4 py-2 bg-gray-700 text-gray-300 rounded hover:bg-gray-600 transition-colors"
-              title="Archive workflow"
+              title="Move workflow to archive (can be restored later)"
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
@@ -440,106 +423,38 @@ export default function WorkflowDetail() {
         </div>
       )}
 
-      {/* Steps Tab Content */}
+      {/* Steps Tab Content - Full width with status bar on top */}
       {activeTab === 'steps' && (
-        <>
-          {/* Resource Summary + Step Navigation */}
-          <div className="mb-8">
-            <WorkflowTimeline
-              steps={steps}
-              currentStep={workflow.current_step}
-              selectedStep={effectiveSelectedStep}
-              resources={resources}
-              projectSlug={slug}
-              workflowId={workflowId}
-              onStepSelect={(stepNum) => setSelectedStepNumber(stepNum)}
-              onRunStep={handleRunStep}
-              onItemsClick={handleViewItems}
-              onResourceUpdate={handleResourceUpdate}
-              isRunning={actionLoading}
-            />
+        <div>
+          {/* Status bar with metrics and resources */}
+          <WorkflowStatusBar
+            workflow={workflow}
+            resources={resources}
+            projectSlug={slug!}
+            workflowId={workflowId!}
+            onResourceUpdate={handleResourceUpdate}
+          />
+
+          {/* Steps section header */}
+          <div className="text-xs font-semibold text-[var(--color-text-muted)] uppercase tracking-wider mb-3">
+            Steps
           </div>
 
-          {/* Current Step Content - Full Width */}
-          <div className="space-y-6">
-          {selectedStep && (
-            <div className="card">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-xl font-semibold text-white">
-                  Step {selectedStep.step_number}: {selectedStep.name}
-                </h2>
-                {selectedStep.step_number === workflow.current_step && selectedStep.config?.skippable && selectedStep.status === 'active' && (
-                  <button
-                    onClick={() => handleAdvance(true)}
-                    disabled={actionLoading}
-                    className="text-sm text-gray-400 hover:text-white"
-                  >
-                    Skip this step
-                  </button>
-                )}
-              </div>
-
-              {selectedStep.config?.description && (
-                <p className="text-gray-400 mb-6">{selectedStep.config.description}</p>
-              )}
-
-              {/* Interactive Step: Show Chat (only for current active step) */}
-              {isInteractiveStep && selectedStep.step_number === workflow.current_step && selectedStep.status === 'active' && (
-                <PlanningChat
-                  projectSlug={slug!}
-                  workflowId={workflowId!}
-                  onComplete={loadWorkflow}
-                />
-              )}
-
-              {/* Autonomous Step: Always show session logs if loop_name exists */}
-              {isAutonomousStep && selectedStep.loop_name && (
-                <SessionHistory
-                  projectSlug={slug!}
-                  loopName={selectedStep.loop_name}
-                  enabled={true}
-                />
-              )}
-
-              {/* Autonomous Step: No loop configured yet */}
-              {isAutonomousStep && !selectedStep.loop_name && selectedStep.status === 'pending' && (
-                <div className="text-center py-8 text-gray-400">
-                  <p>This autonomous step hasn't been configured yet.</p>
-                </div>
-              )}
-
-              {/* Pending Interactive Step */}
-              {isInteractiveStep && selectedStep.status === 'pending' && (
-                <div className="text-center py-8 text-gray-400">
-                  <p>This step hasn't started yet.</p>
-                  {workflow.status === 'draft' && selectedStep.step_number === 1 && (
-                    <button
-                      onClick={handleStartClick}
-                      className="mt-4 px-6 py-2 bg-primary-600 text-white rounded hover:bg-primary-500 transition-colors"
-                    >
-                      Start Workflow
-                    </button>
-                  )}
-                </div>
-              )}
-
-              {/* Completed Interactive Step */}
-              {isInteractiveStep && selectedStep.status === 'completed' && (
-                <div className="text-center py-8">
-                  <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-green-900/30 flex items-center justify-center">
-                    <svg className="w-8 h-8 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                    </svg>
-                  </div>
-                  <p className="text-green-400">Step completed!</p>
-                </div>
-              )}
-            </div>
-          )}
+          {/* Step list */}
+          <WorkflowTimeline
+            steps={steps}
+            currentStep={workflow.current_step}
+            projectSlug={slug!}
+            workflowId={workflowId!}
+            onRunStep={handleRunStep}
+            onStopStep={handleStopStep}
+            onItemsClick={handleViewItems}
+            isRunning={actionLoading}
+          />
 
           {/* Workflow Completed */}
           {workflow.status === 'completed' && (
-            <div className="card text-center py-8">
+            <div className="card text-center py-8 mt-6">
               <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-blue-900/30 flex items-center justify-center">
                 <svg className="w-8 h-8 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -549,8 +464,7 @@ export default function WorkflowDetail() {
               <p className="text-gray-400">All steps have been completed successfully.</p>
             </div>
           )}
-          </div>
-        </>
+        </div>
       )}
 
       {/* Import JSONL Modal */}
