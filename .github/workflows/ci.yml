@@ -1,8 +1,10 @@
-name: Publish to PyPI
+name: CI
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
   build:
@@ -39,24 +41,25 @@ jobs:
       - name: Build package
         run: python -m build
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
+      - name: Verify package contents
+        run: |
+          pip install dist/*.whl
+          python -c "from pathlib import Path; import ralphx; p = Path(ralphx.__file__).parent / 'static' / 'index.html'; assert p.exists(), f'Missing {p}'"
+          echo "Package includes frontend static files"
 
-  publish:
-    needs: build
+  test:
     runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
+      - uses: actions/checkout@v4
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest tests/ -v

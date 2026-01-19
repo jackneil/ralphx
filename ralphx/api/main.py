@@ -31,8 +31,13 @@ from ralphx.api.routes import auth, config, files, filesystem, imports, items, l
 from ralphx.core.auth import restore_orphaned_backup
 from ralphx.core.workspace import ensure_workspace
 
-# Frontend dist directory (relative to this file)
-FRONTEND_DIR = Path(__file__).parent.parent.parent / "frontend" / "dist"
+# Frontend static files directory
+# Check two locations: package static dir (pip install) and dev frontend/dist
+_PACKAGE_STATIC_DIR = Path(__file__).parent.parent / "static"
+_DEV_FRONTEND_DIR = Path(__file__).parent.parent.parent / "frontend" / "dist"
+
+# Use package static dir if it exists (pip install), otherwise dev dir
+FRONTEND_DIR = _PACKAGE_STATIC_DIR if _PACKAGE_STATIC_DIR.exists() else _DEV_FRONTEND_DIR
 
 # Token refresh interval: 30 minutes (aggressive to keep tokens fresh)
 TOKEN_REFRESH_INTERVAL = 1800
