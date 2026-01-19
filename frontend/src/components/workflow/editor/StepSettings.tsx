@@ -258,7 +258,7 @@ export default function StepSettings({ step, onChange }: StepSettingsProps) {
               </label>
               <select
                 value={step.config?.model || 'opus'}
-                onChange={(e) => updateConfig({ model: e.target.value })}
+                onChange={(e) => updateConfig({ model: e.target.value as 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m' })}
                 className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-primary-500"
               >
                 <option value="opus">Opus (Most Capable)</option>

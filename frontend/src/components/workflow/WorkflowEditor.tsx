@@ -44,7 +44,7 @@ interface EditingStep {
   skippable: boolean
   // New fields for autonomous steps
   loopType?: string
-  model?: 'sonnet' | 'opus' | 'haiku'
+  model?: 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m'
   timeout?: number
   allowedTools?: string[]
   // Loop limits (autonomous steps only)
@@ -397,7 +397,7 @@ export default function WorkflowEditor({
       skippable: step.config?.skippable || false,
       // Load autonomous config
       loopType: step.config?.loopType || 'implementation',
-      model: (step.config?.model as 'sonnet' | 'opus' | 'haiku') || 'sonnet',
+      model: (step.config?.model as 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m') || 'sonnet',
       timeout: step.config?.timeout || 300,
       allowedTools: step.config?.allowedTools || [],
       // Loop limits
@@ -1024,7 +1024,7 @@ export default function WorkflowEditor({
                             </label>
                             <select
                               value={editingStep.model || 'sonnet'}
-                              onChange={(e) => setEditingStep({ ...editingStep, model: e.target.value as 'sonnet' | 'opus' | 'haiku' })}
+                              onChange={(e) => setEditingStep({ ...editingStep, model: e.target.value as 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m' })}
                               className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-primary-500"
                             >
                               <option value="sonnet">Sonnet (Balanced)</option>

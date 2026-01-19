@@ -1312,7 +1312,7 @@ export interface WorkflowStep {
   config?: {
     description?: string
     loopType?: string
-    model?: 'sonnet' | 'opus' | 'haiku'
+    model?: 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m'
     timeout?: number
     allowedTools?: string[]
     inputs?: string[]
@@ -1496,7 +1496,7 @@ export async function createWorkflowStep(
     description?: string
     loop_type?: string
     skippable?: boolean
-    model?: 'sonnet' | 'opus' | 'haiku'
+    model?: 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m'
     timeout?: number
     allowed_tools?: string[]
     // Loop limits (autonomous steps only)
@@ -1521,7 +1521,7 @@ export async function updateWorkflowStep(
     description?: string
     loop_type?: string
     skippable?: boolean
-    model?: 'sonnet' | 'opus' | 'haiku'
+    model?: 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m'
     timeout?: number
     allowed_tools?: string[]
     // Loop limits (autonomous steps only)
