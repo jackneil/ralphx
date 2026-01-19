@@ -1,37 +1,47 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Link, useParams, useNavigate } from 'react-router-dom'
+import Swal from 'sweetalert2'
 import {
   getWorkflow,
   startWorkflow,
-  pauseWorkflow,
+  stopWorkflow,
   advanceWorkflowStep,
-  deleteWorkflow,
+  archiveWorkflow,
+  runSpecificStep,
+  listWorkflowResources,
+  updateWorkflowResource,
 } from '../api'
-import type { Workflow, ImportJsonlResponse } from '../api'
+import type { Workflow, ImportJsonlResponse, WorkflowResource } from '../api'
 import WorkflowTimeline from '../components/workflow/WorkflowTimeline'
-import StepCard from '../components/workflow/StepCard'
+import WorkflowItemsTab from '../components/workflow/WorkflowItemsTab'
 import PlanningChat from '../components/planning/PlanningChat'
-import WorkflowEditor from '../components/workflow/WorkflowEditor'
 import ImportJsonlModal from '../components/workflow/ImportJsonlModal'
+import SessionHistory from '../components/SessionHistory'
 
 export default function WorkflowDetail() {
   const { slug, workflowId } = useParams<{ slug: string; workflowId: string }>()
   const navigate = useNavigate()
 
   const [workflow, setWorkflow] = useState<Workflow | null>(null)
+  const [resources, setResources] = useState<WorkflowResource[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [actionLoading, setActionLoading] = useState(false)
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
-  const [showEditor, setShowEditor] = useState(false)
   const [showImport, setShowImport] = useState(false)
   const [importResult, setImportResult] = useState<ImportJsonlResponse | null>(null)
+  const [selectedStepNumber, setSelectedStepNumber] = useState<number | null>(null)
+  const [activeTab, setActiveTab] = useState<'steps' | 'items'>('steps')
+  const [itemsSourceStepId, setItemsSourceStepId] = useState<number | undefined>(undefined)
 
   const loadWorkflow = useCallback(async () => {
     if (!slug || !workflowId) return
     try {
-      const data = await getWorkflow(slug, workflowId)
+      const [data, resourcesData] = await Promise.all([
+        getWorkflow(slug, workflowId),
+        listWorkflowResources(slug, workflowId),
+      ])
       setWorkflow(data)
+      setResources(resourcesData)
       setError(null) // Clear any previous errors on successful load
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load workflow')
@@ -53,7 +63,26 @@ export default function WorkflowDetail() {
     return () => clearInterval(interval)
   }, [workflow, loadWorkflow])
 
-  const handleStart = async () => {
+  const handleStartClick = async () => {
+    const result = await Swal.fire({
+      title: 'Start Workflow?',
+      text: 'This will begin executing the workflow from the current step.',
+      icon: 'question',
+      showCancelButton: true,
+      confirmButtonColor: 'var(--color-primary)',
+      cancelButtonColor: 'var(--color-slate)',
+      confirmButtonText: 'Start',
+      cancelButtonText: 'Cancel',
+      background: 'var(--color-surface)',
+      color: 'var(--color-text-primary)',
+    })
+
+    if (result.isConfirmed) {
+      await handleConfirmStart()
+    }
+  }
+
+  const handleConfirmStart = async () => {
     if (!slug || !workflowId) return
     setActionLoading(true)
     try {
@@ -66,14 +95,30 @@ export default function WorkflowDetail() {
     }
   }
 
-  const handlePause = async () => {
+  const handleStop = async () => {
     if (!slug || !workflowId) return
+
+    const result = await Swal.fire({
+      title: 'Stop Workflow?',
+      text: 'This will stop the current execution. You can resume later.',
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonColor: 'var(--color-rose)',
+      cancelButtonColor: 'var(--color-slate)',
+      confirmButtonText: 'Stop',
+      cancelButtonText: 'Cancel',
+      background: 'var(--color-surface)',
+      color: 'var(--color-text-primary)',
+    })
+
+    if (!result.isConfirmed) return
+
     setActionLoading(true)
     try {
-      const updated = await pauseWorkflow(slug, workflowId)
+      const updated = await stopWorkflow(slug, workflowId)
       setWorkflow(updated)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to pause workflow')
+      setError(err instanceof Error ? err.message : 'Failed to stop workflow')
     } finally {
       setActionLoading(false)
     }
@@ -92,16 +137,80 @@ export default function WorkflowDetail() {
     }
   }
 
-  const handleDelete = async () => {
+  const handleArchive = async () => {
     if (!slug || !workflowId) return
+
+    const result = await Swal.fire({
+      title: 'Archive Workflow?',
+      text: 'This workflow will be moved to the archive. You can restore it later from project settings.',
+      icon: 'info',
+      showCancelButton: true,
+      confirmButtonColor: 'var(--color-primary)',
+      cancelButtonColor: 'var(--color-slate)',
+      confirmButtonText: 'Archive',
+      cancelButtonText: 'Cancel',
+      background: 'var(--color-surface)',
+      color: 'var(--color-text-primary)',
+    })
+
+    if (!result.isConfirmed) return
+
     setActionLoading(true)
     try {
-      await deleteWorkflow(slug, workflowId)
+      await archiveWorkflow(slug, workflowId)
       navigate(`/projects/${slug}/workflows`)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete workflow')
+      setError(err instanceof Error ? err.message : 'Failed to archive workflow')
       setActionLoading(false)
     }
+  }
+
+  const handleRunStep = async (stepNumber: number) => {
+    if (!slug || !workflowId) return
+
+    const stepName = (workflow?.steps || []).find(s => s.step_number === stepNumber)?.name || `Step ${stepNumber}`
+
+    const result = await Swal.fire({
+      title: 'Run Step?',
+      text: `Start executing "${stepName}"?`,
+      icon: 'question',
+      showCancelButton: true,
+      confirmButtonColor: 'var(--color-primary)',
+      cancelButtonColor: 'var(--color-slate)',
+      confirmButtonText: 'Run',
+      cancelButtonText: 'Cancel',
+      background: 'var(--color-surface)',
+      color: 'var(--color-text-primary)',
+    })
+
+    if (!result.isConfirmed) return
+
+    setActionLoading(true)
+    try {
+      const updated = await runSpecificStep(slug, workflowId, stepNumber)
+      setWorkflow(updated)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to run step')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  const handleViewItems = (stepId: number) => {
+    setItemsSourceStepId(stepId)
+    setActiveTab('items')
+  }
+
+  const handleResourceUpdate = async (resourceId: number, content: string, expectedUpdatedAt: string) => {
+    if (!slug || !workflowId) return
+
+    await updateWorkflowResource(slug, workflowId, resourceId, {
+      content,
+      expected_updated_at: expectedUpdatedAt,
+    })
+
+    // Reload to get updated resources
+    await loadWorkflow()
   }
 
   if (loading) {
@@ -138,15 +247,44 @@ export default function WorkflowDetail() {
     )
   }
 
-  const currentStep = workflow.steps.find(s => s.step_number === workflow.current_step)
-  const isInteractiveStep = currentStep?.step_type === 'interactive'
-  const isAutonomousStep = currentStep?.step_type === 'autonomous'
+  // Defensive: ensure steps array exists (TypeScript says required, but runtime could differ)
+  const steps = workflow.steps || []
+
+  const currentStep = steps.find(s => s.step_number === workflow.current_step)
+
+  // Selected step for viewing logs (defaults to current step)
+  const effectiveSelectedStep = selectedStepNumber ?? workflow.current_step
+  const selectedStep = steps.find(s => s.step_number === effectiveSelectedStep) || currentStep
+
+  const isInteractiveStep = selectedStep?.step_type === 'interactive'
+  const isAutonomousStep = selectedStep?.step_type === 'autonomous'
+
+  // Check if anything is ACTUALLY running (not just workflow status)
+  // This is the source of truth - if any step has an active run, something is running
+  const isActuallyRunning = steps.some(s => s.has_active_run === true)
+
+  // Map workflow.status to display status
+  const getDisplayStatus = () => {
+    if (workflow.status === 'active') {
+      return isActuallyRunning ? 'running' : 'idle'
+    }
+    return workflow.status
+  }
+
+  const displayStatus = getDisplayStatus()
+
+  // Determine what button to show based on actual execution state
+  const canRun = workflow.status !== 'completed' && !isActuallyRunning
+  const canStop = isActuallyRunning
 
   const statusColors: Record<string, string> = {
     draft: 'bg-gray-600',
-    active: 'bg-green-600',
+    running: 'bg-green-600',
+    idle: 'bg-amber-600',
+    active: 'bg-green-600', // Keep for fallback
     paused: 'bg-yellow-600',
     completed: 'bg-blue-600',
+    failed: 'bg-red-600',
   }
 
   return (
@@ -166,15 +304,16 @@ export default function WorkflowDetail() {
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-4">
             <h1 className="text-3xl font-bold text-white">{workflow.name}</h1>
-            <span className={`px-3 py-1 rounded-full text-sm font-medium text-white ${statusColors[workflow.status]}`}>
-              {workflow.status.charAt(0).toUpperCase() + workflow.status.slice(1)}
+            <span className={`px-3 py-1 rounded-full text-sm font-medium text-white ${statusColors[displayStatus]}`}>
+              {displayStatus.charAt(0).toUpperCase() + displayStatus.slice(1)}
             </span>
           </div>
 
           <div className="flex items-center space-x-3">
-            {workflow.status === 'draft' && (
+            {/* Run button - show when nothing is running and workflow isn't completed */}
+            {canRun && (
               <button
-                onClick={handleStart}
+                onClick={handleStartClick}
                 disabled={actionLoading}
                 className="flex items-center space-x-2 px-4 py-2 bg-green-600 text-white rounded hover:bg-green-500 transition-colors disabled:opacity-50"
               >
@@ -182,33 +321,22 @@ export default function WorkflowDetail() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <span>Start Workflow</span>
+                <span>Run</span>
               </button>
             )}
 
-            {workflow.status === 'active' && (
+            {/* Stop button - show only when something is actually running */}
+            {canStop && (
               <button
-                onClick={handlePause}
+                onClick={handleStop}
                 disabled={actionLoading}
-                className="flex items-center space-x-2 px-4 py-2 bg-yellow-600 text-white rounded hover:bg-yellow-500 transition-colors disabled:opacity-50"
+                className="flex items-center space-x-2 px-4 py-2 bg-red-600 text-white rounded hover:bg-red-500 transition-colors disabled:opacity-50"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
                 </svg>
-                <span>Pause</span>
-              </button>
-            )}
-
-            {workflow.status === 'paused' && (
-              <button
-                onClick={handleStart}
-                disabled={actionLoading}
-                className="flex items-center space-x-2 px-4 py-2 bg-green-600 text-white rounded hover:bg-green-500 transition-colors disabled:opacity-50"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                </svg>
-                <span>Resume</span>
+                <span>Stop</span>
               </button>
             )}
 
@@ -227,7 +355,7 @@ export default function WorkflowDetail() {
             )}
 
             <button
-              onClick={() => setShowEditor(true)}
+              onClick={() => navigate(`/projects/${slug}/workflows/${workflowId}/edit`)}
               className="flex items-center space-x-2 px-4 py-2 bg-gray-700 text-gray-300 rounded hover:bg-gray-600 transition-colors"
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -237,12 +365,14 @@ export default function WorkflowDetail() {
             </button>
 
             <button
-              onClick={() => setShowDeleteConfirm(true)}
+              onClick={handleArchive}
               className="flex items-center space-x-2 px-4 py-2 bg-gray-700 text-gray-300 rounded hover:bg-gray-600 transition-colors"
+              title="Archive workflow"
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
               </svg>
+              <span>Archive</span>
             </button>
           </div>
         </div>
@@ -266,25 +396,79 @@ export default function WorkflowDetail() {
         </div>
       )}
 
-      {/* Timeline */}
-      <div className="mb-8">
-        <WorkflowTimeline
-          steps={workflow.steps}
-          currentStep={workflow.current_step}
-        />
+      {/* Tab Bar */}
+      <div className="flex border-b border-[var(--color-border)] mb-6">
+        <button
+          onClick={() => setActiveTab('steps')}
+          className={`px-4 py-3 text-sm font-medium transition-colors relative
+            ${activeTab === 'steps'
+              ? 'text-cyan-400'
+              : 'text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)]'}`}
+        >
+          Steps
+          {activeTab === 'steps' && (
+            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-cyan-500" />
+          )}
+        </button>
+        <button
+          onClick={() => { setActiveTab('items'); setItemsSourceStepId(undefined); }}
+          className={`px-4 py-3 text-sm font-medium transition-colors relative flex items-center gap-2
+            ${activeTab === 'items'
+              ? 'text-cyan-400'
+              : 'text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)]'}`}
+        >
+          Items
+          {steps.reduce((sum, s) => sum + (s.items_generated || 0), 0) > 0 && (
+            <span className="px-1.5 py-0.5 text-xs rounded-full bg-cyan-500/20 text-cyan-400">
+              {steps.reduce((sum, s) => sum + (s.items_generated || 0), 0)}
+            </span>
+          )}
+          {activeTab === 'items' && (
+            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-cyan-500" />
+          )}
+        </button>
       </div>
 
-      {/* Current Step Content */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Main Content */}
-        <div className="lg:col-span-2">
-          {currentStep && (
+      {/* Items Tab Content */}
+      {activeTab === 'items' && (
+        <div className="card">
+          <WorkflowItemsTab
+            projectSlug={slug!}
+            workflowId={workflowId!}
+            sourceStepId={itemsSourceStepId}
+          />
+        </div>
+      )}
+
+      {/* Steps Tab Content */}
+      {activeTab === 'steps' && (
+        <>
+          {/* Resource Summary + Step Navigation */}
+          <div className="mb-8">
+            <WorkflowTimeline
+              steps={steps}
+              currentStep={workflow.current_step}
+              selectedStep={effectiveSelectedStep}
+              resources={resources}
+              projectSlug={slug}
+              workflowId={workflowId}
+              onStepSelect={(stepNum) => setSelectedStepNumber(stepNum)}
+              onRunStep={handleRunStep}
+              onItemsClick={handleViewItems}
+              onResourceUpdate={handleResourceUpdate}
+              isRunning={actionLoading}
+            />
+          </div>
+
+          {/* Current Step Content - Full Width */}
+          <div className="space-y-6">
+          {selectedStep && (
             <div className="card">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-xl font-semibold text-white">
-                  Step {currentStep.step_number}: {currentStep.name}
+                  Step {selectedStep.step_number}: {selectedStep.name}
                 </h2>
-                {currentStep.config?.skippable && currentStep.status === 'active' && (
+                {selectedStep.step_number === workflow.current_step && selectedStep.config?.skippable && selectedStep.status === 'active' && (
                   <button
                     onClick={() => handleAdvance(true)}
                     disabled={actionLoading}
@@ -295,12 +479,12 @@ export default function WorkflowDetail() {
                 )}
               </div>
 
-              {currentStep.config?.description && (
-                <p className="text-gray-400 mb-6">{currentStep.config.description}</p>
+              {selectedStep.config?.description && (
+                <p className="text-gray-400 mb-6">{selectedStep.config.description}</p>
               )}
 
-              {/* Interactive Step: Show Chat */}
-              {isInteractiveStep && currentStep.status === 'active' && (
+              {/* Interactive Step: Show Chat (only for current active step) */}
+              {isInteractiveStep && selectedStep.step_number === workflow.current_step && selectedStep.status === 'active' && (
                 <PlanningChat
                   projectSlug={slug!}
                   workflowId={workflowId!}
@@ -308,48 +492,29 @@ export default function WorkflowDetail() {
                 />
               )}
 
-              {/* Autonomous Step: Show Loop Progress */}
-              {isAutonomousStep && currentStep.status === 'active' && workflow.status === 'active' && (
-                <div className="text-center py-8">
-                  <div className="inline-flex items-center space-x-3 text-gray-400">
-                    <svg className="w-6 h-6 animate-spin" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                    <span>Running autonomous step...</span>
-                  </div>
-                  {currentStep.loop_name && (
-                    <p className="mt-4 text-sm text-gray-500">
-                      Loop: {currentStep.loop_name}
-                    </p>
-                  )}
+              {/* Autonomous Step: Always show session logs if loop_name exists */}
+              {isAutonomousStep && selectedStep.loop_name && (
+                <SessionHistory
+                  projectSlug={slug!}
+                  loopName={selectedStep.loop_name}
+                  enabled={true}
+                />
+              )}
+
+              {/* Autonomous Step: No loop configured yet */}
+              {isAutonomousStep && !selectedStep.loop_name && selectedStep.status === 'pending' && (
+                <div className="text-center py-8 text-gray-400">
+                  <p>This autonomous step hasn't been configured yet.</p>
                 </div>
               )}
 
-              {/* Autonomous Step: Paused */}
-              {isAutonomousStep && currentStep.status === 'active' && workflow.status === 'paused' && (
-                <div className="text-center py-8">
-                  <div className="inline-flex items-center space-x-3 text-yellow-400">
-                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                    <span>Workflow paused</span>
-                  </div>
-                  {currentStep.loop_name && (
-                    <p className="mt-4 text-sm text-gray-500">
-                      Loop: {currentStep.loop_name}
-                    </p>
-                  )}
-                </div>
-              )}
-
-              {/* Pending Step */}
-              {currentStep.status === 'pending' && (
+              {/* Pending Interactive Step */}
+              {isInteractiveStep && selectedStep.status === 'pending' && (
                 <div className="text-center py-8 text-gray-400">
                   <p>This step hasn't started yet.</p>
-                  {workflow.status === 'draft' && (
+                  {workflow.status === 'draft' && selectedStep.step_number === 1 && (
                     <button
-                      onClick={handleStart}
+                      onClick={handleStartClick}
                       className="mt-4 px-6 py-2 bg-primary-600 text-white rounded hover:bg-primary-500 transition-colors"
                     >
                       Start Workflow
@@ -358,8 +523,8 @@ export default function WorkflowDetail() {
                 </div>
               )}
 
-              {/* Completed Step */}
-              {currentStep.status === 'completed' && (
+              {/* Completed Interactive Step */}
+              {isInteractiveStep && selectedStep.status === 'completed' && (
                 <div className="text-center py-8">
                   <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-green-900/30 flex items-center justify-center">
                     <svg className="w-8 h-8 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -384,68 +549,8 @@ export default function WorkflowDetail() {
               <p className="text-gray-400">All steps have been completed successfully.</p>
             </div>
           )}
-        </div>
-
-        {/* Sidebar: All Steps */}
-        <div className="space-y-4">
-          <h3 className="text-lg font-semibold text-white">All Steps</h3>
-          {workflow.steps.map((step) => (
-            <StepCard
-              key={step.id}
-              step={step}
-              isCurrent={step.step_number === workflow.current_step}
-              onEdit={() => setShowEditor(true)}
-            />
-          ))}
-        </div>
-      </div>
-
-      {/* Delete Confirmation Modal */}
-      {showDeleteConfirm && (
-        <div
-          className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
-          onClick={() => setShowDeleteConfirm(false)}
-          onKeyDown={(e) => e.key === 'Escape' && setShowDeleteConfirm(false)}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="delete-dialog-title"
-        >
-          <div className="card max-w-md w-full mx-4" onClick={(e) => e.stopPropagation()}>
-            <h3 id="delete-dialog-title" className="text-xl font-semibold text-white mb-4">Delete Workflow?</h3>
-            <p className="text-gray-400 mb-6">
-              This will permanently delete the workflow "{workflow.name}" and all its steps.
-              This action cannot be undone.
-            </p>
-            <div className="flex justify-end space-x-3">
-              <button
-                onClick={() => setShowDeleteConfirm(false)}
-                className="px-4 py-2 bg-gray-700 text-gray-300 rounded hover:bg-gray-600 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleDelete}
-                disabled={actionLoading}
-                className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-500 transition-colors disabled:opacity-50"
-              >
-                Delete
-              </button>
-            </div>
           </div>
-        </div>
-      )}
-
-      {/* Workflow Editor Modal */}
-      {showEditor && (
-        <WorkflowEditor
-          workflow={workflow}
-          projectSlug={slug!}
-          onClose={() => setShowEditor(false)}
-          onSave={(updated) => {
-            setWorkflow(updated)
-            setShowEditor(false)
-          }}
-        />
+        </>
       )}
 
       {/* Import JSONL Modal */}
@@ -453,7 +558,7 @@ export default function WorkflowDetail() {
         <ImportJsonlModal
           projectSlug={slug!}
           workflowId={workflowId!}
-          steps={workflow.steps}
+          steps={steps}
           onClose={() => setShowImport(false)}
           onImported={(result) => {
             setImportResult(result)

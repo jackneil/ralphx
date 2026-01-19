@@ -3,7 +3,7 @@
 import uuid
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from ralphx.core.database import Database
@@ -15,6 +15,19 @@ router = APIRouter()
 # ============================================================================
 # Request/Response Models
 # ============================================================================
+
+
+class ItemStatusBreakdown(BaseModel):
+    """Breakdown of work items by status."""
+
+    total: int = 0
+    pending: int = 0
+    in_progress: int = 0
+    completed: int = 0
+    skipped: int = 0
+    failed: int = 0
+    duplicate: int = 0
+    rejected: int = 0
 
 
 class WorkflowStepResponse(BaseModel):
@@ -31,6 +44,16 @@ class WorkflowStepResponse(BaseModel):
     artifacts: Optional[dict] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+    archived_at: Optional[str] = None  # NULL = active, non-NULL = archived (soft delete)
+    has_active_run: bool = False  # True if there's a run in 'running' status
+    # Progress tracking
+    iterations_completed: int = 0  # Total iterations completed across all runs
+    iterations_target: Optional[int] = None  # Target iterations (from config), None = unlimited
+    current_run_iterations: int = 0  # Iterations in current/latest run
+    items_generated: int = 0  # Total items generated (e.g., user stories)
+    has_guardrails: bool = False  # Whether this step has guardrails configured
+    # Input items (for consumer steps - items from previous step)
+    input_items: Optional[ItemStatusBreakdown] = None
 
 
 class WorkflowResponse(BaseModel):
@@ -44,7 +67,11 @@ class WorkflowResponse(BaseModel):
     current_step: int
     created_at: str
     updated_at: str
+    archived_at: Optional[str] = None  # NULL = active, non-NULL = archived timestamp
     steps: list[WorkflowStepResponse] = []
+    # Resource indicators
+    has_design_doc: bool = False  # Whether workflow has a design document attached
+    guardrails_count: int = 0  # Number of guardrails attached to workflow
 
 
 class WorkflowTemplateStep(BaseModel):
@@ -101,9 +128,13 @@ class CreateStepRequest(BaseModel):
     loop_type: Optional[str] = None
     skippable: bool = False
     # Autonomous step execution settings (step config overrides template defaults)
-    model: Optional[str] = Field(None, pattern=r"^(sonnet|opus|haiku)$")
+    model: Optional[str] = Field(None, pattern=r"^(sonnet|sonnet-1m|opus|haiku)$")
     timeout: Optional[int] = Field(None, ge=60, le=7200)  # 1min to 2hr
     allowed_tools: Optional[list[str]] = None
+    # Loop limits (autonomous steps only)
+    max_iterations: Optional[int] = Field(None, ge=0, le=10000)  # 0 = unlimited
+    cooldown_between_iterations: Optional[int] = Field(None, ge=0, le=300)  # seconds
+    max_consecutive_errors: Optional[int] = Field(None, ge=1, le=100)
 
 
 class UpdateStepRequest(BaseModel):
@@ -118,9 +149,13 @@ class UpdateStepRequest(BaseModel):
     loop_type: Optional[str] = None
     skippable: Optional[bool] = None
     # Autonomous step execution settings (step config overrides template defaults)
-    model: Optional[str] = Field(None, pattern=r"^(sonnet|opus|haiku)$")
+    model: Optional[str] = Field(None, pattern=r"^(sonnet|sonnet-1m|opus|haiku)$")
     timeout: Optional[int] = Field(None, ge=60, le=7200)  # 1min to 2hr
     allowed_tools: Optional[list[str]] = None
+    # Loop limits (autonomous steps only)
+    max_iterations: Optional[int] = Field(None, ge=0, le=10000)  # 0 = unlimited
+    cooldown_between_iterations: Optional[int] = Field(None, ge=0, le=300)  # seconds
+    max_consecutive_errors: Optional[int] = Field(None, ge=1, le=100)
 
 
 # Valid tools for autonomous steps
@@ -199,9 +234,128 @@ def _generate_namespace(name: str) -> str:
 
 
 def _workflow_to_response(
-    workflow: dict, steps: list[dict]
+    workflow: dict, steps: list[dict], pdb: Optional[ProjectDatabase] = None
 ) -> WorkflowResponse:
-    """Convert workflow and steps to response model."""
+    """Convert workflow and steps to response model.
+
+    Args:
+        workflow: Workflow dict from database.
+        steps: List of step dicts from database.
+        pdb: Optional ProjectDatabase to check for active runs and progress.
+    """
+    # Build step progress info if database is provided
+    step_progress: dict[int, dict] = {}
+    has_design_doc = False
+    guardrails_count = 0
+
+    if pdb:
+        # Get workflow resources to check for design doc and guardrails
+        try:
+            workflow_resources = pdb.list_workflow_resources(
+                workflow["id"], enabled_only=True
+            )
+            has_design_doc = any(
+                r.get("resource_type") == "design_doc" for r in workflow_resources
+            )
+            guardrails_count = sum(
+                1 for r in workflow_resources if r.get("resource_type") == "guardrails"
+            )
+        except Exception:
+            # Don't fail if resources can't be fetched
+            pass
+
+        # Get all runs for this workflow to calculate progress
+        all_runs = pdb.list_runs(workflow_id=workflow["id"], limit=1000)
+
+        # Get item counts grouped by source step ID and status
+        # Note: get_workflow_item_counts returns {step_id: {status: count}}
+        item_counts_by_step_id: dict[int, dict[str, int]] = {}
+        try:
+            item_counts_by_step_id = pdb.get_workflow_item_counts(workflow["id"])
+        except Exception:
+            pass
+
+        # Build mapping from step_number to step_id for looking up source items
+        step_number_to_id = {s.get("step_number"): s.get("id") for s in steps}
+
+        for step in steps:
+            step_id = step["id"]
+            step_runs = [r for r in all_runs if r.get("step_id") == step_id]
+
+            # Calculate totals
+            total_iterations = sum(
+                r.get("iterations_completed", 0) or 0 for r in step_runs
+            )
+            total_items = sum(
+                r.get("items_generated", 0) or 0 for r in step_runs
+            )
+
+            # Check for active run
+            running_run = next(
+                (r for r in step_runs if r.get("status") == "running"), None
+            )
+
+            # Get iterations target from config
+            config = step.get("config") or {}
+            iterations_target = config.get("max_iterations")
+
+            # Check for step-level guardrails
+            step_has_guardrails = False
+            try:
+                step_resources = pdb.list_step_resources(step_id)
+                step_has_guardrails = any(
+                    r.get("resource_type") == "guardrails" for r in step_resources
+                )
+            except Exception:
+                pass
+
+            # Build input items breakdown for consumer steps
+            # Consumer steps consume items from the previous step (step_number - 1)
+            input_items = None
+            step_number = step.get("step_number", 0)
+            loop_type = (step.get("config") or {}).get("loopType", "")
+
+            # Check if this is a consumer step (implementation type)
+            if step_number > 1 and loop_type in ("consumer", "implementation"):
+                # Get items from the previous step (source)
+                # We need to use the step_id (not step_number) to look up items
+                source_step_number = step_number - 1
+                source_step_id = step_number_to_id.get(source_step_number)
+                if source_step_id:
+                    item_stats = item_counts_by_step_id.get(source_step_id, {})
+                    if item_stats:
+                        total = sum(item_stats.values())
+                        # Status mapping for display:
+                        # - "completed" in DB = ready for consumer (display as "pending")
+                        # - "processed" in DB = already done (display as "completed")
+                        # - "pending" in DB = not yet ready (shouldn't happen much)
+                        input_items = {
+                            "total": total,
+                            # "completed" in DB means ready-to-process, so count as pending for display
+                            "pending": item_stats.get("pending", 0) + item_stats.get("completed", 0),
+                            "in_progress": item_stats.get("in_progress", 0),
+                            # "processed" in DB means actually done
+                            "completed": item_stats.get("processed", 0),
+                            "skipped": item_stats.get("skipped", 0),
+                            "failed": item_stats.get("failed", 0),
+                            "duplicate": item_stats.get("duplicate", 0),
+                            "rejected": item_stats.get("rejected", 0),
+                        }
+
+            step_progress[step_id] = {
+                "has_active_run": running_run is not None,
+                "iterations_completed": total_iterations,
+                "iterations_target": iterations_target,
+                "current_run_iterations": (
+                    running_run.get("iterations_completed", 0) or 0
+                    if running_run
+                    else 0
+                ),
+                "items_generated": total_items,
+                "has_guardrails": step_has_guardrails or guardrails_count > 0,
+                "input_items": input_items,
+            }
+
     return WorkflowResponse(
         id=workflow["id"],
         template_id=workflow.get("template_id"),
@@ -211,6 +365,7 @@ def _workflow_to_response(
         current_step=workflow["current_step"],
         created_at=workflow["created_at"],
         updated_at=workflow["updated_at"],
+        archived_at=workflow.get("archived_at"),
         steps=[
             WorkflowStepResponse(
                 id=s["id"],
@@ -224,9 +379,44 @@ def _workflow_to_response(
                 artifacts=s.get("artifacts"),
                 started_at=s.get("started_at"),
                 completed_at=s.get("completed_at"),
+                has_active_run=step_progress.get(s["id"], {}).get("has_active_run", False),
+                iterations_completed=step_progress.get(s["id"], {}).get("iterations_completed", 0),
+                iterations_target=step_progress.get(s["id"], {}).get("iterations_target"),
+                current_run_iterations=step_progress.get(s["id"], {}).get("current_run_iterations", 0),
+                items_generated=step_progress.get(s["id"], {}).get("items_generated", 0),
+                has_guardrails=step_progress.get(s["id"], {}).get("has_guardrails", False),
+                input_items=step_progress.get(s["id"], {}).get("input_items"),
             )
             for s in steps
         ],
+        has_design_doc=has_design_doc,
+        guardrails_count=guardrails_count,
+    )
+
+
+def _step_to_response(step: dict, pdb: Optional[ProjectDatabase] = None) -> WorkflowStepResponse:
+    """Convert a step dict to WorkflowStepResponse.
+
+    Args:
+        step: Step dictionary from database.
+        pdb: Optional ProjectDatabase for fetching additional info like active runs.
+
+    Returns:
+        WorkflowStepResponse with basic step data.
+    """
+    return WorkflowStepResponse(
+        id=step["id"],
+        workflow_id=step["workflow_id"],
+        step_number=step["step_number"],
+        name=step["name"],
+        step_type=step["step_type"],
+        status=step["status"],
+        config=step.get("config"),
+        loop_name=step.get("loop_name"),
+        artifacts=step.get("artifacts"),
+        started_at=step.get("started_at"),
+        completed_at=step.get("completed_at"),
+        archived_at=step.get("archived_at"),
     )
 
 
@@ -282,14 +472,27 @@ async def get_workflow_template(slug: str, template_id: str):
 
 
 @router.get("/workflows", response_model=list[WorkflowResponse])
-async def list_workflows(slug: str, status_filter: Optional[str] = None):
-    """List all workflows for a project."""
+async def list_workflows(
+    slug: str,
+    status_filter: Optional[str] = None,
+    include_archived: bool = Query(False, description="Include archived workflows"),
+    archived_only: bool = Query(False, description="Only return archived workflows"),
+):
+    """List all workflows for a project.
+
+    By default, archived workflows are excluded. Use include_archived=true
+    to include them, or archived_only=true to only see archived workflows.
+    """
     pdb = _get_project_db(slug)
-    workflows = pdb.list_workflows(status=status_filter)
+    workflows = pdb.list_workflows(
+        status=status_filter,
+        include_archived=include_archived,
+        archived_only=archived_only,
+    )
     result = []
     for w in workflows:
         steps = pdb.list_workflow_steps(w["id"])
-        result.append(_workflow_to_response(w, steps))
+        result.append(_workflow_to_response(w, steps, pdb))
     return result
 
 
@@ -350,7 +553,7 @@ async def create_workflow(slug: str, request: CreateWorkflowRequest):
     # Inherit auto-inherit resources from project library
     pdb.inherit_project_resources_to_workflow(workflow_id)
 
-    return _workflow_to_response(workflow, created_steps)
+    return _workflow_to_response(workflow, created_steps, pdb)
 
 
 @router.get("/workflows/{workflow_id}", response_model=WorkflowResponse)
@@ -364,7 +567,7 @@ async def get_workflow(slug: str, workflow_id: str):
             detail=f"Workflow '{workflow_id}' not found",
         )
     steps = pdb.list_workflow_steps(workflow_id)
-    return _workflow_to_response(workflow, steps)
+    return _workflow_to_response(workflow, steps, pdb)
 
 
 @router.patch("/workflows/{workflow_id}", response_model=WorkflowResponse)
@@ -389,18 +592,85 @@ async def update_workflow(slug: str, workflow_id: str, request: UpdateWorkflowRe
         workflow = pdb.get_workflow(workflow_id)
 
     steps = pdb.list_workflow_steps(workflow_id)
-    return _workflow_to_response(workflow, steps)
+    return _workflow_to_response(workflow, steps, pdb)
 
 
-@router.delete("/workflows/{workflow_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_workflow(slug: str, workflow_id: str):
-    """Delete a workflow."""
+@router.post("/workflows/{workflow_id}/archive", response_model=WorkflowResponse)
+async def archive_workflow(slug: str, workflow_id: str):
+    """Archive a workflow (soft delete).
+
+    Archived workflows are hidden from the default list but can be restored.
+    """
     pdb = _get_project_db(slug)
-    if not pdb.get_workflow(workflow_id):
+    workflow = pdb.get_workflow(workflow_id)
+    if not workflow:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Workflow '{workflow_id}' not found",
         )
+
+    if workflow.get("archived_at"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Workflow is already archived",
+        )
+
+    pdb.archive_workflow(workflow_id)
+
+    # Return updated workflow
+    workflow = pdb.get_workflow(workflow_id)
+    steps = pdb.list_workflow_steps(workflow_id)
+    return _workflow_to_response(workflow, steps, pdb)
+
+
+@router.post("/workflows/{workflow_id}/restore", response_model=WorkflowResponse)
+async def restore_workflow(slug: str, workflow_id: str):
+    """Restore an archived workflow."""
+    pdb = _get_project_db(slug)
+    workflow = pdb.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow '{workflow_id}' not found",
+        )
+
+    if not workflow.get("archived_at"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Workflow is not archived",
+        )
+
+    pdb.restore_workflow(workflow_id)
+
+    # Return updated workflow
+    workflow = pdb.get_workflow(workflow_id)
+    steps = pdb.list_workflow_steps(workflow_id)
+    return _workflow_to_response(workflow, steps, pdb)
+
+
+@router.delete("/workflows/{workflow_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_workflow(slug: str, workflow_id: str):
+    """Permanently delete a workflow.
+
+    IMPORTANT: Workflow must be archived first. This prevents accidental deletion.
+    To delete a workflow:
+    1. First archive it: POST /workflows/{id}/archive
+    2. Then delete it: DELETE /workflows/{id}
+    """
+    pdb = _get_project_db(slug)
+    workflow = pdb.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow '{workflow_id}' not found",
+        )
+
+    if not workflow.get("archived_at"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete active workflow. Archive it first using POST /workflows/{id}/archive",
+        )
+
     pdb.delete_workflow(workflow_id)
 
 
@@ -468,7 +738,7 @@ async def advance_workflow_step(
     # Return updated workflow
     workflow = pdb.get_workflow(workflow_id)
     steps = pdb.list_workflow_steps(workflow_id)
-    return _workflow_to_response(workflow, steps)
+    return _workflow_to_response(workflow, steps, pdb)
 
 
 @router.post("/workflows/{workflow_id}/start", response_model=WorkflowResponse)
@@ -531,7 +801,7 @@ async def start_workflow(slug: str, workflow_id: str):
     # Return updated workflow
     workflow = pdb.get_workflow(workflow_id)
     steps = pdb.list_workflow_steps(workflow_id)
-    return _workflow_to_response(workflow, steps)
+    return _workflow_to_response(workflow, steps, pdb)
 
 
 @router.post("/workflows/{workflow_id}/run-step", response_model=WorkflowResponse)
@@ -606,7 +876,85 @@ async def run_workflow_step(slug: str, workflow_id: str):
     # Return updated workflow
     workflow = pdb.get_workflow(workflow_id)
     steps = pdb.list_workflow_steps(workflow_id)
-    return _workflow_to_response(workflow, steps)
+    return _workflow_to_response(workflow, steps, pdb)
+
+
+@router.post("/workflows/{workflow_id}/run-specific-step/{step_number}", response_model=WorkflowResponse)
+async def run_specific_step(slug: str, workflow_id: str, step_number: int):
+    """Run a specific step out of order.
+
+    This allows jumping to and running any step, not just the current one.
+    The step will be activated and its execution started.
+    For autonomous steps, this triggers the loop execution.
+    """
+    import asyncio
+    from ralphx.core.project import Project
+    from ralphx.core.workflow_executor import WorkflowExecutor
+
+    db = Database()
+    project = db.get_project(slug)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {slug}",
+        )
+
+    pdb = ProjectDatabase(project["path"])
+    workflow = pdb.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow '{workflow_id}' not found",
+        )
+
+    # Allow running steps when workflow is draft, active, or paused
+    if workflow["status"] not in ("draft", "active", "paused"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot run steps on workflow in status '{workflow['status']}'",
+        )
+
+    # Find the target step
+    steps = pdb.list_workflow_steps(workflow_id)
+    target_step = None
+    for s in steps:
+        if s["step_number"] == step_number:
+            target_step = s
+            break
+
+    if not target_step:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Step {step_number} not found in workflow",
+        )
+
+    # Update workflow to active status and set current step
+    pdb.update_workflow(
+        workflow_id,
+        status="active",
+        current_step=step_number,
+    )
+
+    # Start the target step if not already active
+    if target_step["status"] != "active":
+        pdb.start_workflow_step(target_step["id"])
+
+    # If autonomous step, trigger the loop execution
+    if target_step["step_type"] == "autonomous":
+        project_obj = Project.from_dict(project)
+        executor = WorkflowExecutor(
+            project=project_obj,
+            db=pdb,
+            workflow_id=workflow_id,
+        )
+        # Refresh step data after starting
+        target_step = pdb.get_workflow_step(target_step["id"])
+        asyncio.create_task(executor._start_autonomous_step(target_step))
+
+    # Return updated workflow
+    workflow = pdb.get_workflow(workflow_id)
+    steps = pdb.list_workflow_steps(workflow_id)
+    return _workflow_to_response(workflow, steps, pdb)
 
 
 @router.post("/workflows/{workflow_id}/pause", response_model=WorkflowResponse)
@@ -630,7 +978,52 @@ async def pause_workflow(slug: str, workflow_id: str):
 
     workflow = pdb.get_workflow(workflow_id)
     steps = pdb.list_workflow_steps(workflow_id)
-    return _workflow_to_response(workflow, steps)
+    return _workflow_to_response(workflow, steps, pdb)
+
+
+@router.post("/workflows/{workflow_id}/stop", response_model=WorkflowResponse)
+async def stop_workflow(slug: str, workflow_id: str):
+    """Stop an active or paused workflow completely.
+
+    This will:
+    - Mark all running runs as aborted
+    - Stop the workflow entirely
+    """
+    from datetime import datetime
+
+    pdb = _get_project_db(slug)
+    workflow = pdb.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow '{workflow_id}' not found",
+        )
+
+    if workflow["status"] not in ["active", "paused"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot stop workflow in status '{workflow['status']}'",
+        )
+
+    # Mark all running/paused runs as aborted
+    runs = pdb.list_runs(status=["running", "paused"])
+    for run in runs:
+        # Only abort runs belonging to this workflow
+        if run.get("workflow_id") == workflow_id:
+            pdb.update_run(
+                run["id"],
+                status="aborted",
+                completed_at=datetime.utcnow().isoformat(),
+                error_message="Workflow stopped by user",
+            )
+
+    # Mark workflow as paused (can be restarted later)
+    # Using 'paused' instead of 'completed' so user can resume if needed
+    pdb.update_workflow(workflow_id, status="paused")
+
+    workflow = pdb.get_workflow(workflow_id)
+    steps = pdb.list_workflow_steps(workflow_id)
+    return _workflow_to_response(workflow, steps, pdb)
 
 
 # ============================================================================
@@ -661,6 +1054,12 @@ async def create_step(slug: str, workflow_id: str, request: CreateStepRequest):
             autonomous_fields_sent.append("timeout")
         if request.allowed_tools is not None:
             autonomous_fields_sent.append("allowed_tools")
+        if request.max_iterations is not None:
+            autonomous_fields_sent.append("max_iterations")
+        if request.cooldown_between_iterations is not None:
+            autonomous_fields_sent.append("cooldown_between_iterations")
+        if request.max_consecutive_errors is not None:
+            autonomous_fields_sent.append("max_consecutive_errors")
         if autonomous_fields_sent:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -682,6 +1081,13 @@ async def create_step(slug: str, workflow_id: str, request: CreateStepRequest):
             config["timeout"] = request.timeout
         if validated_tools is not None:
             config["allowedTools"] = validated_tools
+        # Loop limits
+        if request.max_iterations is not None:
+            config["max_iterations"] = request.max_iterations
+        if request.cooldown_between_iterations is not None:
+            config["cooldown_between_iterations"] = request.cooldown_between_iterations
+        if request.max_consecutive_errors is not None:
+            config["max_consecutive_errors"] = request.max_consecutive_errors
 
     # Create step atomically (step_number calculated inside transaction)
     step = pdb.create_workflow_step_atomic(
@@ -740,6 +1146,12 @@ async def update_step(slug: str, workflow_id: str, step_id: int, request: Update
             autonomous_fields_sent.append("timeout")
         if request.allowed_tools is not None:
             autonomous_fields_sent.append("allowed_tools")
+        if request.max_iterations is not None:
+            autonomous_fields_sent.append("max_iterations")
+        if request.cooldown_between_iterations is not None:
+            autonomous_fields_sent.append("cooldown_between_iterations")
+        if request.max_consecutive_errors is not None:
+            autonomous_fields_sent.append("max_consecutive_errors")
         if autonomous_fields_sent:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -771,11 +1183,21 @@ async def update_step(slug: str, workflow_id: str, step_id: int, request: Update
             config_updates["timeout"] = request.timeout
         if validated_tools is not None:
             config_updates["allowedTools"] = validated_tools
+        # Loop limits
+        if request.max_iterations is not None:
+            config_updates["max_iterations"] = request.max_iterations
+        if request.cooldown_between_iterations is not None:
+            config_updates["cooldown_between_iterations"] = request.cooldown_between_iterations
+        if request.max_consecutive_errors is not None:
+            config_updates["max_consecutive_errors"] = request.max_consecutive_errors
     elif request.step_type == "interactive":
         # Changing from autonomous to interactive: clear autonomous-only config
         config_updates["model"] = None
         config_updates["timeout"] = None
         config_updates["allowedTools"] = None
+        config_updates["max_iterations"] = None
+        config_updates["cooldown_between_iterations"] = None
+        config_updates["max_consecutive_errors"] = None
 
     if config_updates:
         current_config = step.get("config") or {}
@@ -803,9 +1225,114 @@ async def update_step(slug: str, workflow_id: str, step_id: int, request: Update
     )
 
 
+@router.post("/workflows/{workflow_id}/steps/{step_id}/archive", response_model=WorkflowStepResponse)
+async def archive_step(slug: str, workflow_id: str, step_id: int):
+    """Archive a workflow step (soft delete). Step can be restored later.
+
+    The step keeps its original step_number so it can be restored to
+    its original position. Remaining active steps are NOT renumbered.
+    """
+    pdb = _get_project_db(slug)
+
+    # Validate workflow exists
+    workflow = pdb.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow '{workflow_id}' not found",
+        )
+
+    # Validate step exists AND belongs to this workflow (prevents cross-workflow manipulation)
+    step = pdb.get_workflow_step(step_id)
+    if not step or step["workflow_id"] != workflow_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Step '{step_id}' not found in workflow '{workflow_id}'",
+        )
+
+    # Check not already archived
+    if step.get("archived_at"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Step is already archived",
+        )
+
+    # Archive (does NOT renumber - preserves original position for restore)
+    pdb.archive_workflow_step(step_id)
+
+    # Return updated step
+    step = pdb.get_workflow_step(step_id)
+    return _step_to_response(step, pdb)
+
+
+@router.post("/workflows/{workflow_id}/steps/{step_id}/restore", response_model=WorkflowStepResponse)
+async def restore_step(slug: str, workflow_id: str, step_id: int):
+    """Restore an archived step to its original position.
+
+    Returns 409 Conflict if the original position is now occupied by another step.
+    """
+    pdb = _get_project_db(slug)
+
+    # Validate workflow exists
+    workflow = pdb.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow '{workflow_id}' not found",
+        )
+
+    # Validate step exists AND belongs to this workflow
+    step = pdb.get_workflow_step(step_id)
+    if not step or step["workflow_id"] != workflow_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Step '{step_id}' not found in workflow '{workflow_id}'",
+        )
+
+    # Check is archived
+    if not step.get("archived_at"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Step is not archived",
+        )
+
+    # Restore to original position (raises ValueError if position occupied)
+    try:
+        restored = pdb.restore_workflow_step(step_id)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        )
+
+    return _step_to_response(restored, pdb)
+
+
+@router.get("/workflows/{workflow_id}/steps/archived", response_model=list[WorkflowStepResponse])
+async def list_archived_steps(slug: str, workflow_id: str):
+    """List archived steps for a workflow (recycle bin view)."""
+    pdb = _get_project_db(slug)
+
+    workflow = pdb.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow '{workflow_id}' not found",
+        )
+
+    archived = pdb.list_archived_steps(workflow_id)
+    return [_step_to_response(s, pdb) for s in archived]
+
+
 @router.delete("/workflows/{workflow_id}/steps/{step_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_step(slug: str, workflow_id: str, step_id: int):
-    """Delete a workflow step."""
+    """Permanently delete a workflow step.
+
+    IMPORTANT: Step must be archived first. This prevents accidental permanent deletion.
+    To delete a step:
+    1. First archive it: POST /workflows/{workflow_id}/steps/{step_id}/archive
+    2. Then delete it: DELETE /workflows/{workflow_id}/steps/{step_id}
+    """
     pdb = _get_project_db(slug)
     workflow = pdb.get_workflow(workflow_id)
     if not workflow:
@@ -821,7 +1348,15 @@ async def delete_step(slug: str, workflow_id: str, step_id: int):
             detail=f"Step '{step_id}' not found in workflow '{workflow_id}'",
         )
 
-    # Delete step and renumber atomically in a single transaction
+    # MUST be archived first (safety: prevents accidental permanent deletion)
+    if not step.get("archived_at"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot permanently delete active step. Archive it first using POST /workflows/{workflow_id}/steps/{step_id}/archive",
+        )
+
+    # Delete step (no renumbering - step number gaps are acceptable to avoid
+    # UNIQUE constraint collisions with archived steps)
     pdb.delete_workflow_step_atomic(step_id, workflow_id)
 
 
@@ -852,7 +1387,7 @@ async def reorder_steps(slug: str, workflow_id: str, request: ReorderStepsReques
     # Return updated workflow
     workflow = pdb.get_workflow(workflow_id)
     steps = pdb.list_workflow_steps(workflow_id)
-    return _workflow_to_response(workflow, steps)
+    return _workflow_to_response(workflow, steps, pdb)
 
 
 # ============================================================================
@@ -894,6 +1429,27 @@ class UpdateWorkflowResourceRequest(BaseModel):
     content: Optional[str] = None
     file_path: Optional[str] = None
     enabled: Optional[bool] = None
+    expected_updated_at: Optional[str] = None  # For optimistic locking
+
+
+class ResourceVersionResponse(BaseModel):
+    """Response model for a single resource version."""
+
+    id: int
+    workflow_resource_id: int
+    version_number: int
+    content: Optional[str] = None
+    name: Optional[str] = None
+    created_at: str
+
+
+class VersionListResponse(BaseModel):
+    """Paginated response for version list."""
+
+    versions: list[ResourceVersionResponse]
+    total: int
+    limit: int
+    offset: int
 
 
 @router.get("/workflows/{workflow_id}/resources", response_model=list[WorkflowResourceResponse])
@@ -967,7 +1523,11 @@ async def get_workflow_resource(slug: str, workflow_id: str, resource_id: int):
 async def update_workflow_resource(
     slug: str, workflow_id: str, resource_id: int, request: UpdateWorkflowResourceRequest
 ):
-    """Update a workflow resource."""
+    """Update a workflow resource.
+
+    Supports optimistic locking via expected_updated_at. If provided and the
+    resource has been modified since that timestamp, returns 409 Conflict.
+    """
     pdb = _get_project_db(slug)
 
     resource = pdb.get_workflow_resource(resource_id)
@@ -983,7 +1543,16 @@ async def update_workflow_resource(
         content=request.content,
         file_path=request.file_path,
         enabled=request.enabled,
+        expected_updated_at=request.expected_updated_at,
     )
+
+    # Check for optimistic locking conflict
+    if updated.get("conflict"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Resource was modified in another session. Reload to see the latest version.",
+        )
+
     return WorkflowResourceResponse(**updated)
 
 
@@ -1000,6 +1569,82 @@ async def delete_workflow_resource(slug: str, workflow_id: str, resource_id: int
         )
 
     pdb.delete_workflow_resource(resource_id)
+
+
+@router.get(
+    "/workflows/{workflow_id}/resources/{resource_id}/versions",
+    response_model=VersionListResponse,
+)
+async def list_resource_versions(
+    slug: str,
+    workflow_id: str,
+    resource_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """List version history for a workflow resource.
+
+    Returns paginated list of previous versions, newest first.
+    """
+    pdb = _get_project_db(slug)
+
+    # Verify resource exists and belongs to workflow
+    resource = pdb.get_workflow_resource(resource_id)
+    if not resource or resource["workflow_id"] != workflow_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Resource '{resource_id}' not found in workflow '{workflow_id}'",
+        )
+
+    versions, total = pdb.list_resource_versions(resource_id, limit=limit, offset=offset)
+
+    return VersionListResponse(
+        versions=[ResourceVersionResponse(**v) for v in versions],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post(
+    "/workflows/{workflow_id}/resources/{resource_id}/versions/{version_id}/restore",
+    response_model=WorkflowResourceResponse,
+)
+async def restore_resource_version(
+    slug: str, workflow_id: str, resource_id: int, version_id: int
+):
+    """Restore a workflow resource to a previous version.
+
+    Creates a new version snapshot of the current state, then overwrites
+    the resource with the old version's content and name.
+    """
+    pdb = _get_project_db(slug)
+
+    # Verify resource exists and belongs to workflow
+    resource = pdb.get_workflow_resource(resource_id)
+    if not resource or resource["workflow_id"] != workflow_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Resource '{resource_id}' not found in workflow '{workflow_id}'",
+        )
+
+    # Verify version exists
+    version = pdb.get_resource_version(version_id)
+    if not version or version["workflow_resource_id"] != resource_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Version '{version_id}' not found for resource '{resource_id}'",
+        )
+
+    # Restore the version
+    restored = pdb.restore_resource_version(resource_id, version_id)
+    if not restored:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to restore version",
+        )
+
+    return WorkflowResourceResponse(**restored)
 
 
 @router.post("/workflows/{workflow_id}/resources/import/{project_resource_id}", response_model=WorkflowResourceResponse)

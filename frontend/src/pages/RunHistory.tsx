@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { listRuns, getRun, getProject } from '../api'
+import { formatLocalFull } from '../utils/time'
 import { useDashboardStore } from '../stores/dashboard'
 import SessionTail from '../components/SessionTail'
 
@@ -176,7 +177,7 @@ export default function RunHistory() {
                 <div className="flex items-center space-x-4 text-sm text-gray-400">
                   <span>{run.iterations_completed} iterations</span>
                   <span>{run.items_processed} items</span>
-                  <span>{new Date(run.started_at).toLocaleString()}</span>
+                  <span>{formatLocalFull(run.started_at)}</span>
                   <svg
                     className={`w-5 h-5 transition-transform ${expandedRunId === run.id ? 'rotate-180' : ''}`}
                     fill="none"
@@ -241,7 +242,7 @@ export default function RunHistory() {
                   <div className="mt-4 pt-4 border-t border-gray-600 text-xs text-gray-500">
                     <div>Run ID: {run.id}</div>
                     {run.ended_at && (
-                      <div>Ended: {new Date(run.ended_at).toLocaleString()}</div>
+                      <div>Ended: {formatLocalFull(run.ended_at)}</div>
                     )}
                   </div>
                 </div>

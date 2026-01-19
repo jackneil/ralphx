@@ -15,9 +15,24 @@ export default function ActiveWorkflowCard({ workflow, projectSlug }: ActiveWork
   const currentStep = steps.find(s => s.step_number === workflow.current_step)
   const isInteractive = currentStep?.step_type === 'interactive'
 
+  // Determine if workflow is actually running vs just "active"
+  const isActuallyRunning = steps.some(s => s.has_active_run === true)
+
+  // Map workflow.status to display status
+  const getDisplayStatus = () => {
+    if (workflow.status === 'active') {
+      return isActuallyRunning ? 'running' : 'idle'
+    }
+    return workflow.status
+  }
+
+  const displayStatus = getDisplayStatus()
+
   const statusColors: Record<string, string> = {
     draft: 'bg-gray-600 text-gray-200',
-    active: 'bg-green-600 text-green-100',
+    running: 'bg-green-600 text-green-100',
+    idle: 'bg-amber-600 text-amber-100',
+    active: 'bg-green-600 text-green-100', // Keep for fallback
     paused: 'bg-yellow-600 text-yellow-100',
     completed: 'bg-blue-600 text-blue-100',
     failed: 'bg-red-600 text-red-100',
@@ -57,8 +72,8 @@ export default function ActiveWorkflowCard({ workflow, projectSlug }: ActiveWork
             Step {workflow.current_step} of {totalSteps}
           </p>
         </div>
-        <span className={`text-xs px-2 py-1 rounded ${statusColors[workflow.status] || statusColors.draft}`}>
-          {workflow.status}
+        <span className={`text-xs px-2 py-1 rounded ${statusColors[displayStatus] || statusColors.draft}`}>
+          {displayStatus.charAt(0).toUpperCase() + displayStatus.slice(1)}
         </span>
       </div>
 
@@ -95,7 +110,7 @@ export default function ActiveWorkflowCard({ workflow, projectSlug }: ActiveWork
             <span className="truncate">{step.name}</span>
             {step.step_number === workflow.current_step && (
               <span className="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-gray-700 text-gray-300">
-                {isInteractive ? 'Interactive' : 'Running'}
+                {step.has_active_run ? 'Running' : isInteractive ? 'Interactive' : 'Ready'}
               </span>
             )}
           </div>

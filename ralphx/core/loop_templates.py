@@ -624,6 +624,9 @@ def generate_simple_planning_config(
     name: str,
     display_name: str = "Planning",
     description: str = "",
+    max_iterations: Optional[int] = None,
+    cooldown_between_iterations: Optional[int] = None,
+    max_consecutive_errors: Optional[int] = None,
 ) -> str:
     """Generate YAML config for a simple planning loop.
 
@@ -631,11 +634,19 @@ def generate_simple_planning_config(
         name: Unique loop ID (auto-generated, e.g., planning-20260115_1).
         display_name: User-facing name (can be duplicated across loops).
         description: Optional user-provided description.
+        max_iterations: Override for max iterations (default: 100).
+        cooldown_between_iterations: Override for cooldown in seconds (default: 5).
+        max_consecutive_errors: Override for max consecutive errors (default: 5).
 
     Returns:
         YAML configuration string.
     """
     desc_line = description if description else "Generate user stories from design documents"
+
+    # Apply defaults if not specified
+    max_iter = max_iterations if max_iterations is not None else 100
+    cooldown = cooldown_between_iterations if cooldown_between_iterations is not None else 5
+    max_errors = max_consecutive_errors if max_consecutive_errors is not None else 5
 
     return f"""name: {name}
 display_name: "{display_name}"
@@ -664,10 +675,10 @@ context:
   inputs_dir: inputs/
 
 limits:
-  max_iterations: 100
+  max_iterations: {max_iter}
   max_runtime_seconds: 28800
-  max_consecutive_errors: 5
-  cooldown_between_iterations: 5
+  max_consecutive_errors: {max_errors}
+  cooldown_between_iterations: {cooldown}
 """
 
 
@@ -676,6 +687,9 @@ def generate_simple_implementation_config(
     namespace: Optional[str] = None,
     display_name: str = "Implementation",
     description: str = "",
+    max_iterations: Optional[int] = None,
+    cooldown_between_iterations: Optional[int] = None,
+    max_consecutive_errors: Optional[int] = None,
 ) -> str:
     """Generate YAML config for a simple implementation loop.
 
@@ -684,12 +698,20 @@ def generate_simple_implementation_config(
         namespace: Namespace to consume stories from.
         display_name: User-facing name (can be duplicated across loops).
         description: Optional user-provided description.
+        max_iterations: Override for max iterations (default: 50).
+        cooldown_between_iterations: Override for cooldown in seconds (default: 5).
+        max_consecutive_errors: Override for max consecutive errors (default: 3).
 
     Returns:
         YAML configuration string.
     """
     source_section = f"    source: {namespace}" if namespace else ""
     desc_line = description if description else "Implement user stories as working code"
+
+    # Apply defaults if not specified
+    max_iter = max_iterations if max_iterations is not None else 50
+    cooldown = cooldown_between_iterations if cooldown_between_iterations is not None else 5
+    max_errors = max_consecutive_errors if max_consecutive_errors is not None else 3
 
     return f"""name: {name}
 display_name: "{display_name}"
@@ -729,8 +751,8 @@ context:
   inputs_dir: inputs/
 
 limits:
-  max_iterations: 50
+  max_iterations: {max_iter}
   max_runtime_seconds: 28800
-  max_consecutive_errors: 3
-  cooldown_between_iterations: 5
+  max_consecutive_errors: {max_errors}
+  cooldown_between_iterations: {cooldown}
 """

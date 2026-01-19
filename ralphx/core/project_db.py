@@ -24,7 +24,7 @@ from typing import Any, Iterator, Optional
 
 
 # Schema version for project DB
-PROJECT_SCHEMA_VERSION = 8
+PROJECT_SCHEMA_VERSION = 15
 
 # Namespace validation pattern: lowercase, alphanumeric, underscores, dashes, max 64 chars
 # Must start with a letter
@@ -71,7 +71,9 @@ CREATE TABLE IF NOT EXISTS runs (
     completed_at TIMESTAMP,
     iterations_completed INTEGER DEFAULT 0,
     items_generated INTEGER DEFAULT 0,
-    error_message TEXT
+    error_message TEXT,
+    executor_pid INTEGER,                   -- PID of executor process for stale detection
+    last_activity_at TIMESTAMP              -- Last activity timestamp for stale detection
 );
 
 -- Sessions table
@@ -86,9 +88,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     items_added TEXT
 );
 
+-- Session events table (stores parsed events for history and streaming)
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,           -- text, tool_call, tool_result, error, init, complete
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    content TEXT,                       -- For text events
+    tool_name TEXT,                     -- For tool events
+    tool_input TEXT,                    -- JSON for tool input
+    tool_result TEXT,                   -- For tool results
+    error_message TEXT,                 -- For error events
+    raw_data TEXT                       -- Full JSON for debugging
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
+
 -- Work items table (every item belongs to a workflow, created by a step)
+-- Primary key is (id, workflow_id) so same item ID can exist in different workflows
 CREATE TABLE IF NOT EXISTS work_items (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,                       -- Item ID (unique within workflow)
     workflow_id TEXT NOT NULL,              -- Parent workflow
     source_step_id INTEGER NOT NULL,        -- Step that created this item
     priority INTEGER,
@@ -102,15 +121,15 @@ CREATE TABLE IF NOT EXISTS work_items (
     claimed_by TEXT,
     claimed_at TIMESTAMP,
     processed_at TIMESTAMP,
-    phase_1_group BOOLEAN DEFAULT FALSE,
-    phase_1_order INTEGER,
+    implemented_commit TEXT,                -- Git commit SHA where item was implemented
     -- Phase and dependency fields
     dependencies TEXT,  -- JSON array of item IDs
     phase INTEGER,      -- Assigned phase number (for batching)
     duplicate_of TEXT,  -- Parent item ID if DUPLICATE status
     skip_reason TEXT,   -- Reason if SKIPPED status
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, workflow_id)
 );
 
 -- Checkpoints table
@@ -282,7 +301,8 @@ CREATE TABLE IF NOT EXISTS workflows (
     status TEXT DEFAULT 'draft',            -- draft, active, paused, completed
     current_step INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    archived_at TIMESTAMP                   -- NULL = active, non-NULL = archived
 );
 
 -- Workflow steps (e.g., Planning, Story Generation, Implementation)
@@ -299,6 +319,7 @@ CREATE TABLE IF NOT EXISTS workflow_steps (
     artifacts JSON,                         -- Outputs from this step
     started_at TIMESTAMP,
     completed_at TIMESTAMP,
+    archived_at TIMESTAMP,                  -- NULL = active, non-NULL = archived (soft delete)
     FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE,
     UNIQUE(workflow_id, step_number)
 );
@@ -331,6 +352,17 @@ CREATE TABLE IF NOT EXISTS workflow_resources (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
+);
+
+-- Workflow resource version history (for undo/restore)
+CREATE TABLE IF NOT EXISTS workflow_resource_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_resource_id INTEGER NOT NULL,
+    version_number INTEGER NOT NULL,
+    content TEXT,
+    name TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (workflow_resource_id) REFERENCES workflow_resources(id) ON DELETE CASCADE
 );
 
 -- Step-level resource overrides (per-step configuration)
@@ -367,6 +399,15 @@ CREATE TABLE IF NOT EXISTS project_resources (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Project-level settings (singleton row per project)
+CREATE TABLE IF NOT EXISTS project_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),  -- Singleton: only one row allowed
+    auto_inherit_guardrails BOOLEAN DEFAULT TRUE,
+    require_design_doc BOOLEAN DEFAULT FALSE,
+    architecture_first_mode BOOLEAN DEFAULT FALSE,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Cascade delete triggers for tables without FK constraints
 -- (loops, runs, work_items have workflow_id but no FK)
 CREATE TRIGGER IF NOT EXISTS cascade_delete_workflow_loops
@@ -399,7 +440,7 @@ CREATE INDEX IF NOT EXISTS idx_work_items_priority ON work_items(priority);
 CREATE INDEX IF NOT EXISTS idx_work_items_created ON work_items(created_at);
 CREATE INDEX IF NOT EXISTS idx_work_items_workflow ON work_items(workflow_id, source_step_id, status);
 CREATE INDEX IF NOT EXISTS idx_work_items_claimed ON work_items(claimed_by, claimed_at);
-CREATE INDEX IF NOT EXISTS idx_work_items_phase_1 ON work_items(phase_1_group, phase_1_order);
+CREATE INDEX IF NOT EXISTS idx_work_items_phase ON work_items(phase);
 
 -- Loops indexes
 CREATE INDEX IF NOT EXISTS idx_loops_workflow ON loops(workflow_id, step_id);
@@ -436,6 +477,7 @@ CREATE INDEX IF NOT EXISTS idx_planning_sessions_status ON planning_sessions(sta
 CREATE INDEX IF NOT EXISTS idx_workflow_resources_workflow ON workflow_resources(workflow_id, resource_type);
 CREATE INDEX IF NOT EXISTS idx_workflow_resources_type ON workflow_resources(resource_type, enabled);
 CREATE INDEX IF NOT EXISTS idx_project_resources_type ON project_resources(resource_type, auto_inherit);
+CREATE INDEX IF NOT EXISTS idx_resource_versions ON workflow_resource_versions(workflow_resource_id, version_number DESC);
 
 -- Step resources indexes
 CREATE INDEX IF NOT EXISTS idx_step_resources_step ON workflow_step_resources(step_id, mode);
@@ -581,6 +623,41 @@ class ProjectDatabase:
         # Migration from v7 to v8: Add workflow_step_resources table
         if from_version == 7:
             self._migrate_v7_to_v8(conn)
+            from_version = 8  # Continue to next migration
+
+        # Migration from v8 to v9: Change work_items primary key to composite (id, workflow_id)
+        if from_version == 8:
+            self._migrate_v8_to_v9(conn)
+            from_version = 9  # Continue to next migration
+
+        # Migration from v9 to v10: Add session_events table
+        if from_version == 9:
+            self._migrate_v9_to_v10(conn)
+            from_version = 10  # Continue to next migration
+
+        # Migration from v10 to v11: Add stale detection fields to runs
+        if from_version == 10:
+            self._migrate_v10_to_v11(conn)
+            from_version = 11  # Continue to next migration
+
+        # Migration from v11 to v12: Add archived_at to workflows
+        if from_version == 11:
+            self._migrate_v11_to_v12(conn)
+            from_version = 12  # Continue to next migration
+
+        # Migration from v12 to v13: Add archived_at to workflow_steps
+        if from_version == 12:
+            self._migrate_v12_to_v13(conn)
+            from_version = 13  # Continue to next migration
+
+        # Migration from v13 to v14: Add project_settings table
+        if from_version == 13:
+            self._migrate_v13_to_v14(conn)
+            from_version = 14  # Continue to next migration
+
+        # Migration from v14 to v15: Add workflow_resource_versions table
+        if from_version == 14:
+            self._migrate_v14_to_v15(conn)
 
         # Seed workflow templates for fresh databases
         self._seed_workflow_templates(conn)
@@ -712,6 +789,177 @@ class ProjectDatabase:
             ON workflow_step_resources(workflow_resource_id)
         """)
 
+    def _migrate_v8_to_v9(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v8 to v9.
+
+        Changes:
+        - work_items primary key from (id) to composite (id, workflow_id)
+          This allows same item IDs to exist in different workflows.
+        - Added implemented_commit field to track which git commit implemented the item
+        """
+        # SQLite doesn't support ALTER TABLE to change primary key
+        # We need to recreate the table with the new schema
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS work_items_new (
+                id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                source_step_id INTEGER NOT NULL,
+                priority INTEGER,
+                content TEXT NOT NULL,
+                title TEXT,
+                status TEXT DEFAULT 'pending',
+                category TEXT,
+                tags TEXT,
+                metadata TEXT,
+                item_type TEXT DEFAULT 'item',
+                claimed_by TEXT,
+                claimed_at TIMESTAMP,
+                processed_at TIMESTAMP,
+                implemented_commit TEXT,
+                dependencies TEXT,
+                phase INTEGER,
+                duplicate_of TEXT,
+                skip_reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id, workflow_id)
+            )
+        """)
+
+        # Copy data from old table (dropping phase_1_* columns, adding implemented_commit)
+        conn.execute("""
+            INSERT OR IGNORE INTO work_items_new (
+                id, workflow_id, source_step_id, priority, content, title,
+                status, category, tags, metadata, item_type, claimed_by,
+                claimed_at, processed_at, implemented_commit,
+                dependencies, phase, duplicate_of, skip_reason,
+                created_at, updated_at
+            )
+            SELECT
+                id, workflow_id, source_step_id, priority, content, title,
+                status, category, tags, metadata, item_type, claimed_by,
+                claimed_at, processed_at, NULL,
+                dependencies, phase, duplicate_of, skip_reason,
+                created_at, updated_at
+            FROM work_items
+        """)
+
+        # Drop the trigger that references work_items before dropping the table
+        conn.execute("DROP TRIGGER IF EXISTS cascade_delete_workflow_items")
+
+        # Drop old table and rename new one
+        conn.execute("DROP TABLE work_items")
+        conn.execute("ALTER TABLE work_items_new RENAME TO work_items")
+
+        # Recreate indexes
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_work_items_workflow
+            ON work_items(workflow_id, status)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_work_items_source_step
+            ON work_items(source_step_id)
+        """)
+
+        # Recreate the trigger for the new table
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS cascade_delete_workflow_items
+                AFTER DELETE ON workflows
+                FOR EACH ROW
+            BEGIN
+                DELETE FROM work_items WHERE workflow_id = OLD.id;
+            END;
+        """)
+
+    def _migrate_v9_to_v10(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v9 to v10.
+
+        Adds:
+        - session_events table for storing parsed session events for history
+        """
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS session_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                content TEXT,
+                tool_name TEXT,
+                tool_input TEXT,
+                tool_result TEXT,
+                error_message TEXT,
+                raw_data TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_events_session
+            ON session_events(session_id)
+        """)
+
+    def _migrate_v10_to_v11(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v10 to v11.
+
+        Adds:
+        - executor_pid column to runs for stale process detection
+        - last_activity_at column to runs for inactivity detection
+        """
+        conn.execute("ALTER TABLE runs ADD COLUMN executor_pid INTEGER")
+        conn.execute("ALTER TABLE runs ADD COLUMN last_activity_at TIMESTAMP")
+
+    def _migrate_v11_to_v12(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v11 to v12.
+
+        Adds:
+        - archived_at column to workflows for soft delete (archiving)
+        """
+        conn.execute("ALTER TABLE workflows ADD COLUMN archived_at TIMESTAMP")
+
+    def _migrate_v12_to_v13(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v12 to v13.
+
+        Adds:
+        - archived_at column to workflow_steps for soft delete (archiving)
+        """
+        conn.execute("ALTER TABLE workflow_steps ADD COLUMN archived_at TIMESTAMP")
+
+    def _migrate_v13_to_v14(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v13 to v14.
+
+        Adds:
+        - project_settings table for project-level default settings
+        """
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS project_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                auto_inherit_guardrails BOOLEAN DEFAULT TRUE,
+                require_design_doc BOOLEAN DEFAULT FALSE,
+                architecture_first_mode BOOLEAN DEFAULT FALSE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+    def _migrate_v14_to_v15(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v14 to v15.
+
+        Adds:
+        - workflow_resource_versions table for resource version history
+        """
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS workflow_resource_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_resource_id INTEGER NOT NULL,
+                version_number INTEGER NOT NULL,
+                content TEXT,
+                name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (workflow_resource_id) REFERENCES workflow_resources(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_resource_versions
+            ON workflow_resource_versions(workflow_resource_id, version_number DESC)
+        """)
+
     # ========== Loops ==========
 
     def create_loop(
@@ -828,10 +1076,20 @@ class ProjectDatabase:
     def list_runs(
         self,
         loop_name: Optional[str] = None,
-        status: Optional[str] = None,
+        status: Optional[str | list[str]] = None,
+        workflow_id: Optional[str] = None,
+        step_id: Optional[int] = None,
         limit: int = 100,
     ) -> list[dict]:
-        """List runs with optional filters."""
+        """List runs with optional filters.
+
+        Args:
+            loop_name: Filter by loop name.
+            status: Filter by status. Can be a single status string or a list of statuses.
+            workflow_id: Filter by workflow ID.
+            step_id: Filter by step ID.
+            limit: Maximum number of runs to return.
+        """
         with self._reader() as conn:
             query = "SELECT * FROM runs WHERE 1=1"
             params: list[Any] = []
@@ -840,8 +1098,19 @@ class ProjectDatabase:
                 query += " AND loop_name = ?"
                 params.append(loop_name)
             if status:
-                query += " AND status = ?"
-                params.append(status)
+                if isinstance(status, list):
+                    placeholders = ", ".join("?" * len(status))
+                    query += f" AND status IN ({placeholders})"
+                    params.extend(status)
+                else:
+                    query += " AND status = ?"
+                    params.append(status)
+            if workflow_id:
+                query += " AND workflow_id = ?"
+                params.append(workflow_id)
+            if step_id:
+                query += " AND step_id = ?"
+                params.append(step_id)
 
             query += " ORDER BY started_at DESC LIMIT ?"
             params.append(limit)
@@ -851,7 +1120,7 @@ class ProjectDatabase:
 
     _RUN_UPDATE_COLS = frozenset({
         "status", "completed_at", "iterations_completed",
-        "items_generated", "error_message"
+        "items_generated", "error_message", "executor_pid", "last_activity_at"
     })
 
     def update_run(self, id: str, **kwargs) -> bool:
@@ -930,6 +1199,23 @@ class ProjectDatabase:
             row = cursor.fetchone()
             return dict(row) if row else None
 
+    def update_session_status(self, session_id: str, status: str) -> bool:
+        """Update session status.
+
+        Args:
+            session_id: Session to update.
+            status: New status (running, completed, error).
+
+        Returns:
+            True if session was updated, False if not found.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "UPDATE sessions SET status = ? WHERE session_id = ?",
+                (status, session_id),
+            )
+            return cursor.rowcount > 0
+
     def list_sessions(
         self,
         run_id: Optional[str] = None,
@@ -976,6 +1262,125 @@ class ProjectDatabase:
                 (*kwargs.values(), session_id),
             )
             return cursor.rowcount > 0
+
+    # ========== Session Events ==========
+
+    def add_session_event(
+        self,
+        session_id: str,
+        event_type: str,
+        content: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        tool_input: Optional[dict] = None,
+        tool_result: Optional[str] = None,
+        error_message: Optional[str] = None,
+        raw_data: Optional[dict] = None,
+    ) -> int:
+        """Add an event to a session.
+
+        Args:
+            session_id: Session UUID.
+            event_type: Event type (text, tool_call, tool_result, error, init, complete).
+            content: Text content for text events.
+            tool_name: Tool name for tool events.
+            tool_input: Tool input dict for tool_call events.
+            tool_result: Result string for tool_result events.
+            error_message: Error message for error events.
+            raw_data: Full raw data dict for debugging.
+
+        Returns:
+            The ID of the created event.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO session_events (
+                    session_id, event_type, content, tool_name,
+                    tool_input, tool_result, error_message, raw_data
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    event_type,
+                    content,
+                    tool_name,
+                    json.dumps(tool_input) if tool_input else None,
+                    tool_result,
+                    error_message,
+                    json.dumps(raw_data) if raw_data else None,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_session_events(
+        self,
+        session_id: str,
+        after_id: Optional[int] = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Get events for a session.
+
+        Args:
+            session_id: Session UUID.
+            after_id: Only return events with ID greater than this (for polling).
+            limit: Maximum number of events to return.
+
+        Returns:
+            List of event dicts.
+        """
+        with self._reader() as conn:
+            if after_id:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM session_events
+                    WHERE session_id = ? AND id > ?
+                    ORDER BY id ASC LIMIT ?
+                    """,
+                    (session_id, after_id, limit),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM session_events
+                    WHERE session_id = ?
+                    ORDER BY id ASC LIMIT ?
+                    """,
+                    (session_id, limit),
+                )
+
+            events = []
+            for row in cursor.fetchall():
+                event = dict(row)
+                # Parse JSON fields
+                if event.get("tool_input"):
+                    try:
+                        event["tool_input"] = json.loads(event["tool_input"])
+                    except json.JSONDecodeError:
+                        pass
+                if event.get("raw_data"):
+                    try:
+                        event["raw_data"] = json.loads(event["raw_data"])
+                    except json.JSONDecodeError:
+                        pass
+                events.append(event)
+            return events
+
+    def get_session_event_count(self, session_id: str) -> int:
+        """Get the count of events for a session.
+
+        Args:
+            session_id: Session UUID.
+
+        Returns:
+            Number of events.
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?",
+                (session_id,),
+            )
+            return cursor.fetchone()[0]
 
     # ========== Work Items ==========
 
@@ -1060,7 +1465,7 @@ class ProjectDatabase:
         category: Optional[str] = None,
         workflow_id: Optional[str] = None,
         source_step_id: Optional[int] = None,
-        phase_1_group: Optional[bool] = None,
+        phase: Optional[int] = None,
         unclaimed_only: bool = False,
         limit: int = 100,
         offset: int = 0,
@@ -1072,7 +1477,7 @@ class ProjectDatabase:
             category: Filter by category.
             workflow_id: Filter by parent workflow.
             source_step_id: Filter by source workflow step.
-            phase_1_group: Filter by Phase 1 implementation grouping.
+            phase: Filter by phase number (for batching).
             unclaimed_only: If True, only return items not claimed by any loop.
             limit: Maximum items to return.
             offset: Pagination offset.
@@ -1097,9 +1502,9 @@ class ProjectDatabase:
             if source_step_id is not None:
                 conditions.append("source_step_id = ?")
                 params.append(source_step_id)
-            if phase_1_group is not None:
-                conditions.append("phase_1_group = ?")
-                params.append(phase_1_group)
+            if phase is not None:
+                conditions.append("phase = ?")
+                params.append(phase)
             if unclaimed_only:
                 conditions.append("claimed_by IS NULL")
 
@@ -1135,9 +1540,8 @@ class ProjectDatabase:
 
     _WORK_ITEM_UPDATE_COLS = frozenset({
         "content", "title", "priority", "status", "category", "tags", "metadata",
-        "item_type", "claimed_by", "claimed_at", "processed_at",
-        "phase_1_group", "phase_1_order", "dependencies", "phase", "duplicate_of",
-        "skip_reason", "updated_at"
+        "item_type", "claimed_by", "claimed_at", "processed_at", "implemented_commit",
+        "dependencies", "phase", "duplicate_of", "skip_reason", "updated_at"
     })
 
     def update_work_item(self, id: str, **kwargs) -> bool:
@@ -1559,19 +1963,32 @@ class ProjectDatabase:
             )
             return cursor.rowcount > 0
 
-    def mark_items_phase_1(self, item_ids: list[str], orders: Optional[dict[str, int]] = None) -> int:
-        """Mark items as part of Phase 1 group."""
+    def set_items_phase(
+        self,
+        item_ids: list[str],
+        workflow_id: str,
+        phase: int,
+    ) -> int:
+        """Set the phase number for a batch of items.
+
+        Args:
+            item_ids: List of item IDs to update.
+            workflow_id: Workflow the items belong to.
+            phase: Phase number to assign.
+
+        Returns:
+            Number of items updated.
+        """
         with self._writer() as conn:
             count = 0
             for item_id in item_ids:
-                order = orders.get(item_id) if orders else None
                 cursor = conn.execute(
                     """
                     UPDATE work_items
-                    SET phase_1_group = TRUE, phase_1_order = ?, updated_at = ?
-                    WHERE id = ?
+                    SET phase = ?, updated_at = ?
+                    WHERE id = ? AND workflow_id = ?
                     """,
-                    (order, datetime.utcnow().isoformat(), item_id),
+                    (phase, datetime.utcnow().isoformat(), item_id, workflow_id),
                 )
                 count += cursor.rowcount
             return count
@@ -2474,10 +2891,15 @@ class ProjectDatabase:
             Dict with import results: {imported: int, skipped: int, already_processed: int, errors: list}.
 
         Raises:
-            ValueError: If format not found.
+            ValueError: If format not found or invalid import_mode.
             FileNotFoundError: If file doesn't exist.
         """
         from pathlib import Path as P
+
+        # Validate import_mode
+        valid_modes = ("pending_only", "all", "reset")
+        if import_mode not in valid_modes:
+            raise ValueError(f"Invalid import_mode '{import_mode}'. Must be one of: {valid_modes}")
 
         # Get format
         fmt = self.get_import_format(format_id)
@@ -2599,14 +3021,21 @@ class ProjectDatabase:
                     skipped += 1
                     continue
 
+                # Generate title from content if not provided
+                # Truncate story text to first 100 chars for title
+                content = item.get("content") or ""
+                title = item.get("title")
+                if not title and content:
+                    title = content[:100] + ("..." if len(content) > 100 else "")
+
                 # Create work item
                 try:
                     self.create_work_item(
                         id=item_id,
                         workflow_id=workflow_id,
                         source_step_id=source_step_id,
-                        content=item.get("content") or "",
-                        title=item.get("title"),
+                        content=content,
+                        title=title,
                         priority=item.get("priority"),
                         category=item.get("category"),
                         metadata=item.get("metadata"),
@@ -2890,8 +3319,17 @@ class ProjectDatabase:
         self,
         status: Optional[str] = None,
         namespace: Optional[str] = None,
+        include_archived: bool = False,
+        archived_only: bool = False,
     ) -> list[dict]:
-        """List workflows with optional filters."""
+        """List workflows with optional filters.
+
+        Args:
+            status: Filter by workflow status.
+            namespace: Filter by namespace.
+            include_archived: If True, include archived workflows.
+            archived_only: If True, only return archived workflows.
+        """
         with self._reader() as conn:
             conditions = ["1=1"]
             params: list[Any] = []
@@ -2903,6 +3341,12 @@ class ProjectDatabase:
                 conditions.append("namespace = ?")
                 params.append(namespace)
 
+            # Handle archived filtering
+            if archived_only:
+                conditions.append("archived_at IS NOT NULL")
+            elif not include_archived:
+                conditions.append("archived_at IS NULL")
+
             cursor = conn.execute(
                 f"""SELECT * FROM workflows
                     WHERE {' AND '.join(conditions)}
@@ -2910,6 +3354,57 @@ class ProjectDatabase:
                 params,
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def archive_workflow(self, id: str) -> bool:
+        """Archive a workflow (soft delete).
+
+        Args:
+            id: Workflow ID.
+
+        Returns:
+            True if workflow was archived, False if not found.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "UPDATE workflows SET archived_at = CURRENT_TIMESTAMP WHERE id = ? AND archived_at IS NULL",
+                (id,),
+            )
+            return cursor.rowcount > 0
+
+    def restore_workflow(self, id: str) -> bool:
+        """Restore an archived workflow.
+
+        Args:
+            id: Workflow ID.
+
+        Returns:
+            True if workflow was restored, False if not found or not archived.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "UPDATE workflows SET archived_at = NULL WHERE id = ? AND archived_at IS NOT NULL",
+                (id,),
+            )
+            return cursor.rowcount > 0
+
+    def is_workflow_archived(self, id: str) -> Optional[bool]:
+        """Check if a workflow is archived.
+
+        Args:
+            id: Workflow ID.
+
+        Returns:
+            True if archived, False if active, None if not found.
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT archived_at FROM workflows WHERE id = ?",
+                (id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return row["archived_at"] is not None
 
     _WORKFLOW_UPDATE_COLS = frozenset({
         "name", "status", "current_step"
@@ -3057,10 +3552,26 @@ class ProjectDatabase:
         content: Optional[str] = None,
         file_path: Optional[str] = None,
         enabled: Optional[bool] = None,
-    ) -> Optional[dict]:
-        """Update a workflow resource."""
+        expected_updated_at: Optional[str] = None,
+    ) -> dict:
+        """Update a workflow resource with optimistic locking and versioning.
+
+        Args:
+            id: Resource ID to update.
+            name: New name (optional).
+            content: New content (optional).
+            file_path: New file path (optional).
+            enabled: New enabled state (optional).
+            expected_updated_at: If provided, verifies the resource hasn't been
+                modified since this timestamp. Returns dict with 'conflict' key
+                if timestamps don't match.
+
+        Returns:
+            Updated resource dict, or {'conflict': True, 'current': <resource>}
+            if optimistic locking fails.
+        """
         updates = []
-        params = []
+        params: list[Any] = []
 
         if name is not None:
             updates.append("name = ?")
@@ -3076,17 +3587,211 @@ class ProjectDatabase:
             params.append(enabled)
 
         if not updates:
-            return self.get_workflow_resource(id)
-
-        updates.append("updated_at = CURRENT_TIMESTAMP")
-        params.append(id)
+            return self.get_workflow_resource(id) or {}
 
         with self._writer() as conn:
+            # Get current state for versioning and optimistic lock check
+            cursor = conn.execute(
+                "SELECT * FROM workflow_resources WHERE id = ?", (id,)
+            )
+            current = cursor.fetchone()
+            if not current:
+                return {}
+
+            current_dict = dict(current)
+
+            # Optimistic locking check
+            if expected_updated_at is not None:
+                if current_dict.get("updated_at") != expected_updated_at:
+                    return {"conflict": True, "current": current_dict}
+
+            # Check if content or name is actually changing
+            new_content = content if content is not None else current_dict.get("content")
+            new_name = name if name is not None else current_dict.get("name")
+            content_changed = new_content != current_dict.get("content")
+            name_changed = new_name != current_dict.get("name")
+
+            # Only create version if content or name actually changed
+            if content_changed or name_changed:
+                # Get next version number
+                cursor = conn.execute(
+                    """SELECT COALESCE(MAX(version_number), 0) + 1
+                       FROM workflow_resource_versions
+                       WHERE workflow_resource_id = ?""",
+                    (id,),
+                )
+                next_version = cursor.fetchone()[0]
+
+                # Create version snapshot of current state BEFORE updating
+                conn.execute(
+                    """INSERT INTO workflow_resource_versions
+                       (workflow_resource_id, version_number, content, name)
+                       VALUES (?, ?, ?, ?)""",
+                    (id, next_version, current_dict.get("content"), current_dict.get("name")),
+                )
+
+            # Now update the resource with high-precision timestamp
+            # Using Python datetime for microsecond precision (CURRENT_TIMESTAMP is second-only)
+            from datetime import datetime
+            high_precision_ts = datetime.utcnow().isoformat(timespec="microseconds")
+            updates.append("updated_at = ?")
+            params.append(high_precision_ts)
+            params.append(id)
+
             conn.execute(
                 f"UPDATE workflow_resources SET {', '.join(updates)} WHERE id = ?",
                 params,
             )
-            return self.get_workflow_resource(id)
+
+        # Cleanup old versions (outside transaction - failure doesn't roll back edit)
+        try:
+            self._cleanup_old_versions(id, keep_count=50)
+        except Exception:
+            pass  # Cleanup failure shouldn't affect the update
+
+        return self.get_workflow_resource(id) or {}
+
+    def _cleanup_old_versions(self, resource_id: int, keep_count: int = 50) -> int:
+        """Delete old versions beyond the retention limit.
+
+        Args:
+            resource_id: Workflow resource ID.
+            keep_count: Number of recent versions to keep.
+
+        Returns:
+            Number of versions deleted.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """DELETE FROM workflow_resource_versions
+                   WHERE workflow_resource_id = ?
+                     AND id NOT IN (
+                       SELECT id FROM workflow_resource_versions
+                       WHERE workflow_resource_id = ?
+                       ORDER BY version_number DESC
+                       LIMIT ?
+                     )""",
+                (resource_id, resource_id, keep_count),
+            )
+            return cursor.rowcount
+
+    def list_resource_versions(
+        self,
+        resource_id: int,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[dict], int]:
+        """List version history for a workflow resource.
+
+        Args:
+            resource_id: Workflow resource ID.
+            limit: Max versions to return.
+            offset: Number of versions to skip.
+
+        Returns:
+            Tuple of (list of version dicts, total count).
+        """
+        with self._reader() as conn:
+            # Get total count
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM workflow_resource_versions WHERE workflow_resource_id = ?",
+                (resource_id,),
+            )
+            total = cursor.fetchone()[0]
+
+            # Get paginated versions (newest first)
+            cursor = conn.execute(
+                """SELECT * FROM workflow_resource_versions
+                   WHERE workflow_resource_id = ?
+                   ORDER BY version_number DESC
+                   LIMIT ? OFFSET ?""",
+                (resource_id, limit, offset),
+            )
+            versions = [dict(row) for row in cursor.fetchall()]
+
+            return versions, total
+
+    def get_resource_version(self, version_id: int) -> Optional[dict]:
+        """Get a specific version by ID.
+
+        Args:
+            version_id: Version record ID.
+
+        Returns:
+            Version dict or None if not found.
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM workflow_resource_versions WHERE id = ?",
+                (version_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def restore_resource_version(self, resource_id: int, version_id: int) -> Optional[dict]:
+        """Restore a workflow resource to a previous version.
+
+        This creates a new version snapshot of the current state, then
+        overwrites the resource with the old version's content and name.
+
+        Args:
+            resource_id: Workflow resource ID.
+            version_id: Version ID to restore.
+
+        Returns:
+            Updated resource dict, or None if not found.
+        """
+        with self._writer() as conn:
+            # Get the version to restore
+            cursor = conn.execute(
+                "SELECT * FROM workflow_resource_versions WHERE id = ? AND workflow_resource_id = ?",
+                (version_id, resource_id),
+            )
+            version = cursor.fetchone()
+            if not version:
+                return None
+
+            version_dict = dict(version)
+
+            # Get current resource state
+            cursor = conn.execute(
+                "SELECT * FROM workflow_resources WHERE id = ?",
+                (resource_id,),
+            )
+            current = cursor.fetchone()
+            if not current:
+                return None
+
+            current_dict = dict(current)
+
+            # Create version snapshot of current state BEFORE restoring
+            cursor = conn.execute(
+                """SELECT COALESCE(MAX(version_number), 0) + 1
+                   FROM workflow_resource_versions
+                   WHERE workflow_resource_id = ?""",
+                (resource_id,),
+            )
+            next_version = cursor.fetchone()[0]
+
+            conn.execute(
+                """INSERT INTO workflow_resource_versions
+                   (workflow_resource_id, version_number, content, name)
+                   VALUES (?, ?, ?, ?)""",
+                (resource_id, next_version, current_dict.get("content"), current_dict.get("name")),
+            )
+
+            # Restore the old version's content and name
+            # Using Python datetime for microsecond precision (CURRENT_TIMESTAMP is second-only)
+            from datetime import datetime
+            high_precision_ts = datetime.utcnow().isoformat(timespec="microseconds")
+            conn.execute(
+                """UPDATE workflow_resources
+                   SET content = ?, name = ?, updated_at = ?
+                   WHERE id = ?""",
+                (version_dict.get("content"), version_dict.get("name"), high_precision_ts, resource_id),
+            )
+
+        return self.get_workflow_resource(resource_id)
 
     def delete_workflow_resource(self, id: int) -> bool:
         """Delete a workflow resource and any step-level overrides referencing it."""
@@ -3469,6 +4174,90 @@ class ProjectDatabase:
 
         return created
 
+    # ========== Project Settings ==========
+
+    def get_project_settings(self) -> dict:
+        """Get project-level default settings.
+
+        Returns a singleton settings row. Creates with defaults if not exists.
+
+        Returns:
+            Settings dict with keys:
+            - auto_inherit_guardrails: bool
+            - require_design_doc: bool
+            - architecture_first_mode: bool
+            - updated_at: timestamp
+        """
+        with self._reader() as conn:
+            cursor = conn.execute("SELECT * FROM project_settings WHERE id = 1")
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+
+        # Create default settings if not exists
+        with self._writer() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO project_settings (id, auto_inherit_guardrails, require_design_doc, architecture_first_mode)
+                VALUES (1, TRUE, FALSE, FALSE)
+            """)
+
+        # Re-fetch after insert
+        with self._reader() as conn:
+            cursor = conn.execute("SELECT * FROM project_settings WHERE id = 1")
+            row = cursor.fetchone()
+            return dict(row) if row else {
+                "id": 1,
+                "auto_inherit_guardrails": True,
+                "require_design_doc": False,
+                "architecture_first_mode": False,
+                "updated_at": None,
+            }
+
+    def update_project_settings(
+        self,
+        auto_inherit_guardrails: Optional[bool] = None,
+        require_design_doc: Optional[bool] = None,
+        architecture_first_mode: Optional[bool] = None,
+    ) -> dict:
+        """Update project-level default settings.
+
+        Args:
+            auto_inherit_guardrails: Auto-inherit shared guardrails to new workflows.
+            require_design_doc: Require design document before implementation steps.
+            architecture_first_mode: Enable architecture-first mode for new projects.
+
+        Returns:
+            Updated settings dict.
+        """
+        # Ensure settings row exists
+        self.get_project_settings()
+
+        updates = []
+        params = []
+
+        if auto_inherit_guardrails is not None:
+            updates.append("auto_inherit_guardrails = ?")
+            params.append(auto_inherit_guardrails)
+        if require_design_doc is not None:
+            updates.append("require_design_doc = ?")
+            params.append(require_design_doc)
+        if architecture_first_mode is not None:
+            updates.append("architecture_first_mode = ?")
+            params.append(architecture_first_mode)
+
+        if not updates:
+            return self.get_project_settings()
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+
+        with self._writer() as conn:
+            conn.execute(
+                f"UPDATE project_settings SET {', '.join(updates)} WHERE id = 1",
+                params,
+            )
+
+        return self.get_project_settings()
+
     # ========== Workflow Steps ==========
 
     def create_workflow_step(
@@ -3565,15 +4354,26 @@ class ProjectDatabase:
             return None
 
     def get_workflow_step_by_number(
-        self, workflow_id: str, step_number: int
+        self, workflow_id: str, step_number: int, include_archived: bool = False
     ) -> Optional[dict]:
-        """Get workflow step by workflow ID and step number."""
+        """Get workflow step by workflow ID and step number.
+
+        Args:
+            workflow_id: The workflow ID.
+            step_number: The step number (1-based).
+            include_archived: If True, may return archived steps. Default False.
+
+        Returns:
+            Step dictionary if found, None otherwise.
+        """
         with self._reader() as conn:
-            cursor = conn.execute(
-                """SELECT * FROM workflow_steps
-                   WHERE workflow_id = ? AND step_number = ?""",
-                (workflow_id, step_number),
-            )
+            if include_archived:
+                query = """SELECT * FROM workflow_steps
+                           WHERE workflow_id = ? AND step_number = ?"""
+            else:
+                query = """SELECT * FROM workflow_steps
+                           WHERE workflow_id = ? AND step_number = ? AND archived_at IS NULL"""
+            cursor = conn.execute(query, (workflow_id, step_number))
             row = cursor.fetchone()
             if row:
                 result = dict(row)
@@ -3584,12 +4384,51 @@ class ProjectDatabase:
                 return result
             return None
 
-    def list_workflow_steps(self, workflow_id: str) -> list[dict]:
-        """List all steps for a workflow."""
+    def list_workflow_steps(
+        self, workflow_id: str, include_archived: bool = False
+    ) -> list[dict]:
+        """List all steps for a workflow.
+
+        Args:
+            workflow_id: The workflow ID.
+            include_archived: If True, include archived steps. Default is False.
+
+        Returns:
+            List of step dictionaries, ordered by step_number.
+        """
+        with self._reader() as conn:
+            if include_archived:
+                query = """SELECT * FROM workflow_steps
+                           WHERE workflow_id = ?
+                           ORDER BY step_number"""
+            else:
+                query = """SELECT * FROM workflow_steps
+                           WHERE workflow_id = ? AND archived_at IS NULL
+                           ORDER BY step_number"""
+            cursor = conn.execute(query, (workflow_id,))
+            results = []
+            for row in cursor.fetchall():
+                result = dict(row)
+                if result.get("config"):
+                    result["config"] = json.loads(result["config"])
+                if result.get("artifacts"):
+                    result["artifacts"] = json.loads(result["artifacts"])
+                results.append(result)
+            return results
+
+    def list_archived_steps(self, workflow_id: str) -> list[dict]:
+        """List all archived steps for a workflow (for trash/recycle bin view).
+
+        Args:
+            workflow_id: The workflow ID.
+
+        Returns:
+            List of archived step dictionaries, ordered by original step_number.
+        """
         with self._reader() as conn:
             cursor = conn.execute(
                 """SELECT * FROM workflow_steps
-                   WHERE workflow_id = ?
+                   WHERE workflow_id = ? AND archived_at IS NOT NULL
                    ORDER BY step_number""",
                 (workflow_id,),
             )
@@ -3602,6 +4441,85 @@ class ProjectDatabase:
                     result["artifacts"] = json.loads(result["artifacts"])
                 results.append(result)
             return results
+
+    def archive_workflow_step(self, step_id: int) -> bool:
+        """Archive a workflow step (soft delete).
+
+        Does NOT renumber remaining steps - the archived step keeps its
+        original step_number so it can be restored to its original position.
+
+        Args:
+            step_id: ID of the step to archive.
+
+        Returns:
+            True if step was archived, False if not found or already archived.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE workflow_steps
+                   SET archived_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND archived_at IS NULL""",
+                (step_id,),
+            )
+            return cursor.rowcount > 0
+
+    def restore_workflow_step(self, step_id: int) -> dict:
+        """Restore an archived step to its original position.
+
+        The step keeps its original step_number. If that position is now
+        occupied by another step, raises ValueError with details.
+
+        Args:
+            step_id: ID of the step to restore.
+
+        Returns:
+            The restored step dictionary.
+
+        Raises:
+            ValueError: If step not found, not archived, or position is occupied.
+        """
+        with self._writer() as conn:
+            # Get the archived step
+            cursor = conn.execute(
+                """SELECT * FROM workflow_steps
+                   WHERE id = ? AND archived_at IS NOT NULL""",
+                (step_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Step not found or not archived")
+
+            step = dict(row)
+
+            # Check if original position is still available
+            conflict = conn.execute(
+                """SELECT id, name FROM workflow_steps
+                   WHERE workflow_id = ? AND step_number = ? AND archived_at IS NULL""",
+                (step["workflow_id"], step["step_number"]),
+            ).fetchone()
+
+            if conflict:
+                raise ValueError(
+                    f"Position {step['step_number']} is now occupied by step "
+                    f"'{conflict['name']}'. Reorder steps first to make room."
+                )
+
+            # Restore the step
+            conn.execute(
+                "UPDATE workflow_steps SET archived_at = NULL WHERE id = ?",
+                (step_id,),
+            )
+
+            # Return the restored step
+            cursor = conn.execute(
+                "SELECT * FROM workflow_steps WHERE id = ?", (step_id,)
+            )
+            result = dict(cursor.fetchone())
+            if result.get("config"):
+                result["config"] = json.loads(result["config"])
+            if result.get("artifacts"):
+                result["artifacts"] = json.loads(result["artifacts"])
+            return result
 
     _STEP_UPDATE_COLS = frozenset({
         "status", "loop_name", "artifacts", "started_at", "completed_at",
@@ -3645,10 +4563,11 @@ class ProjectDatabase:
             return cursor.rowcount > 0
 
     def delete_workflow_step_atomic(self, step_id: int, workflow_id: str) -> bool:
-        """Delete a workflow step and renumber remaining steps atomically.
+        """Delete a workflow step permanently.
 
-        Combines delete and renumber in a single transaction to prevent
-        race conditions.
+        Note: Does NOT renumber remaining steps. This avoids UNIQUE constraint
+        collisions with archived steps that retain their original step_number
+        for restoration purposes. Step number gaps are acceptable.
 
         Args:
             step_id: ID of the step to delete.
@@ -3667,83 +4586,96 @@ class ProjectDatabase:
             cursor = conn.execute(
                 "DELETE FROM workflow_steps WHERE id = ?", (step_id,)
             )
-            deleted = cursor.rowcount > 0
-
-            if deleted:
-                # Renumber remaining steps within the same transaction
-                cursor = conn.execute(
-                    """SELECT id FROM workflow_steps
-                       WHERE workflow_id = ?
-                       ORDER BY step_number""",
-                    (workflow_id,),
-                )
-                remaining_ids = [row[0] for row in cursor.fetchall()]
-
-                # Use negative step numbers first to avoid unique constraint violations
-                for i, sid in enumerate(remaining_ids, 1):
-                    conn.execute(
-                        "UPDATE workflow_steps SET step_number = ? WHERE id = ?",
-                        (-i, sid),
-                    )
-                # Then set to final positive values
-                for i, sid in enumerate(remaining_ids, 1):
-                    conn.execute(
-                        "UPDATE workflow_steps SET step_number = ? WHERE id = ?",
-                        (i, sid),
-                    )
-
-            return deleted
+            return cursor.rowcount > 0
 
     def renumber_workflow_steps(self, workflow_id: str) -> None:
-        """Renumber all steps in a workflow sequentially starting from 1.
+        """Renumber ACTIVE steps in a workflow, skipping step numbers used by archived steps.
 
-        Note: Fetches steps INSIDE the write lock to ensure atomicity.
+        Note: Archived steps keep their original step_number for restoration purposes.
+        Active steps will be renumbered sequentially, skipping any step numbers
+        that are occupied by archived steps.
+
+        Example: If archived step has step_number=2, active steps will be numbered 1, 3, 4, ...
         """
         with self._writer() as conn:
-            # Fetch steps inside the transaction to ensure consistency
+            # Get step numbers used by archived steps (to skip them)
+            cursor = conn.execute(
+                """SELECT step_number FROM workflow_steps
+                   WHERE workflow_id = ? AND archived_at IS NOT NULL""",
+                (workflow_id,),
+            )
+            archived_numbers = {row[0] for row in cursor.fetchall()}
+
+            # Fetch ACTIVE steps only
             cursor = conn.execute(
                 """SELECT id FROM workflow_steps
-                   WHERE workflow_id = ?
+                   WHERE workflow_id = ? AND archived_at IS NULL
                    ORDER BY step_number""",
                 (workflow_id,),
             )
             step_ids = [row[0] for row in cursor.fetchall()]
 
+            # Calculate new step numbers, skipping archived positions
+            new_numbers = []
+            next_num = 1
+            for _ in step_ids:
+                while next_num in archived_numbers:
+                    next_num += 1
+                new_numbers.append(next_num)
+                next_num += 1
+
             # Use negative step numbers first to avoid unique constraint violations
-            for i, step_id in enumerate(step_ids, 1):
+            for i, step_id in enumerate(step_ids):
                 conn.execute(
                     "UPDATE workflow_steps SET step_number = ? WHERE id = ?",
-                    (-i, step_id),
+                    (-(i + 1), step_id),
                 )
             # Then set to final positive values
-            for i, step_id in enumerate(step_ids, 1):
+            for step_id, new_num in zip(step_ids, new_numbers):
                 conn.execute(
                     "UPDATE workflow_steps SET step_number = ? WHERE id = ?",
-                    (i, step_id),
+                    (new_num, step_id),
                 )
 
     def reorder_workflow_steps_atomic(self, workflow_id: str, step_ids: list[int]) -> None:
         """Atomically reorder workflow steps according to the given step ID order.
 
         Uses negative temporary step numbers to avoid unique constraint violations
-        during reordering.
+        during reordering. Skips step numbers occupied by archived steps.
 
         Args:
             workflow_id: The workflow ID
-            step_ids: List of step IDs in their new order
+            step_ids: List of step IDs in their new order (must be active steps only)
         """
         with self._writer() as conn:
+            # Get step numbers used by archived steps (to skip them)
+            cursor = conn.execute(
+                """SELECT step_number FROM workflow_steps
+                   WHERE workflow_id = ? AND archived_at IS NOT NULL""",
+                (workflow_id,),
+            )
+            archived_numbers = {row[0] for row in cursor.fetchall()}
+
+            # Calculate new step numbers, skipping archived positions
+            new_numbers = []
+            next_num = 1
+            for _ in step_ids:
+                while next_num in archived_numbers:
+                    next_num += 1
+                new_numbers.append(next_num)
+                next_num += 1
+
             # First pass: set all step numbers to negative temporaries
             for i, step_id in enumerate(step_ids, 1):
                 conn.execute(
                     "UPDATE workflow_steps SET step_number = ? WHERE id = ? AND workflow_id = ?",
                     (-i, step_id, workflow_id),
                 )
-            # Second pass: set to final positive values
-            for i, step_id in enumerate(step_ids, 1):
+            # Second pass: set to final positive values, skipping archived numbers
+            for step_id, new_num in zip(step_ids, new_numbers):
                 conn.execute(
                     "UPDATE workflow_steps SET step_number = ? WHERE id = ? AND workflow_id = ?",
-                    (i, step_id, workflow_id),
+                    (new_num, step_id, workflow_id),
                 )
 
     def start_workflow_step(self, id: int) -> bool:

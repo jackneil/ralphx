@@ -86,6 +86,7 @@ async def event_generator(
             session_manager=session_manager,
             session_id=session_id,
             project_path=project_path,
+            project_db=project_db,
             from_beginning=from_beginning,
         ):
             yield sse_event
@@ -123,7 +124,10 @@ async def event_generator(
                         session_manager=session_manager,
                         session_id=session.session_id,
                         project_path=project_path,
+                        project_db=project_db,
                         from_beginning=from_beginning,
+                        run_id=run.get("id"),
+                        iteration=session.iteration,
                     ):
                         yield sse_event
                     return
@@ -149,15 +153,21 @@ async def _tail_session(
     session_manager: SessionManager,
     session_id: str,
     project_path: str,
+    project_db,
     from_beginning: bool = True,
+    run_id: Optional[str] = None,
+    iteration: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
-    """Tail a specific session file.
+    """Tail a specific session file, storing events to DB for history.
 
     Args:
         session_manager: Session manager instance.
         session_id: Session UUID.
         project_path: Project directory path.
+        project_db: ProjectDatabase for storing events.
         from_beginning: Start from file beginning.
+        run_id: Run ID for this session.
+        iteration: Iteration number for this session.
 
     Yields:
         SSE formatted events.
@@ -175,42 +185,147 @@ async def _tail_session(
         })
         return
 
+    # Get session info if not provided
+    if run_id is None or iteration is None:
+        session_info = session_manager.get_session(session_id)
+        if session_info:
+            run_id = run_id or session_info.run_id
+            iteration = iteration if iteration is not None else session_info.iteration
+
+    # Metadata to include in each event
+    event_meta = {
+        "run_id": run_id,
+        "iteration": iteration,
+        "session_id": session_id,
+    }
+
+    # First, send any historical events from DB
+    existing_events = project_db.get_session_events(session_id)
+    last_db_event_id = 0
+
+    for db_event in existing_events:
+        last_db_event_id = db_event.get("id", 0)
+        event_type = db_event.get("event_type", "unknown")
+
+        if event_type == "text":
+            yield await format_sse("text", {
+                "content": db_event.get("content", ""),
+                **event_meta,
+            })
+        elif event_type == "tool_call":
+            yield await format_sse("tool_call", {
+                "name": db_event.get("tool_name"),
+                "input": db_event.get("tool_input"),
+                **event_meta,
+            })
+        elif event_type == "tool_result":
+            yield await format_sse("tool_result", {
+                "name": db_event.get("tool_name"),
+                "result": db_event.get("tool_result"),
+                **event_meta,
+            })
+        elif event_type == "error":
+            yield await format_sse("error", {
+                "message": db_event.get("error_message"),
+                **event_meta,
+            })
+        elif event_type == "init":
+            yield await format_sse("init", {
+                "data": db_event.get("raw_data"),
+                **event_meta,
+            })
+        elif event_type == "complete":
+            yield await format_sse("complete", event_meta)
+            return  # Session already complete
+
     yield await format_sse("session_start", {
         "session_id": session_id,
         "file": str(session_file),
+        "history_events": len(existing_events),
+        "run_id": run_id,
+        "iteration": iteration,
     })
 
+    # Now tail the file for new events, starting from where DB left off
+    # If we have history, start from end of file to avoid duplicates
     tailer = SessionTailer(
         session_path=session_file,
-        from_beginning=from_beginning,
+        from_beginning=from_beginning and len(existing_events) == 0,
     )
 
     try:
         async for event in tailer.tail():
+            # Skip UNKNOWN events (like queue-operation, user messages)
+            if event.type == SessionEventType.UNKNOWN:
+                continue
+
+            # Store event to DB for history
             if event.type == SessionEventType.TEXT:
-                yield await format_sse("text", {"content": event.text})
+                project_db.add_session_event(
+                    session_id=session_id,
+                    event_type="text",
+                    content=event.text,
+                )
+                yield await format_sse("text", {
+                    "content": event.text,
+                    **event_meta,
+                })
 
             elif event.type == SessionEventType.TOOL_CALL:
+                project_db.add_session_event(
+                    session_id=session_id,
+                    event_type="tool_call",
+                    tool_name=event.tool_name,
+                    tool_input=event.tool_input,
+                )
                 yield await format_sse("tool_call", {
                     "name": event.tool_name,
                     "input": event.tool_input,
+                    **event_meta,
                 })
 
             elif event.type == SessionEventType.TOOL_RESULT:
+                project_db.add_session_event(
+                    session_id=session_id,
+                    event_type="tool_result",
+                    tool_name=event.tool_name,
+                    tool_result=event.tool_result[:1000] if event.tool_result else None,
+                )
                 yield await format_sse("tool_result", {
                     "name": event.tool_name,
                     "result": event.tool_result[:1000] if event.tool_result else None,
+                    **event_meta,
                 })
 
             elif event.type == SessionEventType.ERROR:
-                yield await format_sse("error", {"message": event.error_message})
+                project_db.add_session_event(
+                    session_id=session_id,
+                    event_type="error",
+                    error_message=event.error_message,
+                )
+                yield await format_sse("error", {
+                    "message": event.error_message,
+                    **event_meta,
+                })
 
             elif event.type == SessionEventType.COMPLETE:
-                yield await format_sse("complete", {})
+                project_db.add_session_event(
+                    session_id=session_id,
+                    event_type="complete",
+                )
+                yield await format_sse("complete", event_meta)
                 break
 
             elif event.type == SessionEventType.INIT:
-                yield await format_sse("init", {"data": event.raw_data})
+                project_db.add_session_event(
+                    session_id=session_id,
+                    event_type="init",
+                    raw_data=event.raw_data,
+                )
+                yield await format_sse("init", {
+                    "data": event.raw_data,
+                    **event_meta,
+                })
 
     except asyncio.CancelledError:
         tailer.stop()
@@ -380,3 +495,101 @@ async def get_session(
         "duration_seconds": session.duration_seconds,
         "items_added": session.items_added,
     }
+
+
+@router.get("/{slug}/sessions/{session_id}/events")
+async def get_session_events(
+    slug: str,
+    session_id: str,
+    after_id: Optional[int] = Query(None, description="Only return events after this ID"),
+    limit: int = Query(500, ge=1, le=1000, description="Max events to return"),
+):
+    """Get events for a session (for history/replay).
+
+    Use `after_id` for polling: pass the last received event ID to get only newer events.
+    """
+    manager, project, project_db = get_project(slug)
+
+    # Verify session exists
+    session_manager = SessionManager(project_db)
+    session = session_manager.get_session(session_id)
+
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session not found: {session_id}",
+        )
+
+    events = project_db.get_session_events(
+        session_id=session_id,
+        after_id=after_id,
+        limit=limit,
+    )
+
+    return {
+        "session_id": session_id,
+        "events": events,
+        "count": len(events),
+    }
+
+
+@router.get("/{slug}/loops/{loop_name}/events/grouped")
+async def get_grouped_events(
+    slug: str,
+    loop_name: str,
+    limit_runs: int = Query(5, ge=1, le=50, description="Max runs to return"),
+):
+    """Get events grouped by run and iteration.
+
+    Returns events organized in a tree structure:
+    - runs: { run_id: { status, iterations: { iteration: { events, session_id, is_live } } } }
+    """
+    manager, project, project_db = get_project(slug)
+    session_manager = SessionManager(project_db)
+
+    # Get recent runs for this loop
+    runs = project_db.list_runs(loop_name=loop_name, limit=limit_runs)
+
+    result = {
+        "loop_name": loop_name,
+        "runs": {},
+    }
+
+    for run in runs:
+        run_id = run.get("id")
+        run_status = run.get("status", "unknown")
+
+        # Get all sessions for this run
+        sessions = session_manager.list_sessions(run_id=run_id, limit=100)
+
+        iterations = {}
+        for session in sessions:
+            iter_num = session.iteration
+
+            # Get events for this session
+            events = project_db.get_session_events(session.session_id)
+
+            # Determine if this is the live session
+            is_live = (
+                run_status in [RunStatus.RUNNING.value, RunStatus.PAUSED.value]
+                and session == sessions[-1]  # Most recent session
+            )
+
+            iterations[iter_num] = {
+                "session_id": session.session_id,
+                "mode": session.mode,
+                "status": session.status,
+                "is_live": is_live,
+                "events": events,
+            }
+
+        result["runs"][run_id] = {
+            "status": run_status,
+            "loop_name": run.get("loop_name", loop_name),
+            "started_at": run.get("started_at"),
+            "completed_at": run.get("completed_at"),
+            "iterations_completed": run.get("iterations_completed", 0),
+            "iterations": iterations,
+        }
+
+    return result

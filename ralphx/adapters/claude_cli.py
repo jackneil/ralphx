@@ -7,7 +7,7 @@ import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 from ralphx.adapters.base import (
     AdapterEvent,
@@ -129,6 +129,7 @@ class ClaudeCLIAdapter(LLMAdapter):
         tools: Optional[list[str]] = None,
         timeout: int = 300,
         json_schema: Optional[dict] = None,
+        on_session_start: Optional[Callable[[str], None]] = None,
     ) -> ExecutionResult:
         """Execute a prompt and return the result.
 
@@ -147,6 +148,9 @@ class ClaudeCLIAdapter(LLMAdapter):
             return await self._execute_with_schema(prompt, model, tools, timeout, json_schema)
 
         # Standard streaming execution
+        import logging
+        _exec_log = logging.getLogger(__name__)
+
         result = ExecutionResult(started_at=datetime.utcnow())
         text_parts = []
         tool_calls = []
@@ -155,9 +159,12 @@ class ClaudeCLIAdapter(LLMAdapter):
             async for event in self.stream(prompt, model, tools, timeout):
                 if event.type == AdapterEvent.INIT:
                     result.session_id = event.data.get("session_id")
+                    if on_session_start and result.session_id:
+                        on_session_start(result.session_id)
                 elif event.type == AdapterEvent.TEXT:
                     if event.text:
                         text_parts.append(event.text)
+                        _exec_log.warning(f"[EXEC] Appended text part, total parts: {len(text_parts)}")
                 elif event.type == AdapterEvent.TOOL_USE:
                     tool_calls.append({
                         "name": event.tool_name,
@@ -179,6 +186,10 @@ class ClaudeCLIAdapter(LLMAdapter):
         result.text_output = "".join(text_parts)
         result.tool_calls = tool_calls
         result.session_id = self._session_id
+
+        _exec_log.warning(f"[EXEC] Final text_output: {len(result.text_output)} chars from {len(text_parts)} parts")
+        if result.text_output:
+            _exec_log.warning(f"[EXEC] text_output preview: {result.text_output[:300]}...")
 
         return result
 
@@ -387,7 +398,12 @@ class ClaudeCLIAdapter(LLMAdapter):
                         stderr_task = asyncio.create_task(drain_stderr())
 
                     if self._process.stdout:
+                        import logging
+                        _stream_log = logging.getLogger(__name__)
+                        line_count = 0
+                        text_events = 0
                         async for line in self._process.stdout:
+                            line_count += 1
                             try:
                                 line_text = line.decode(errors="replace").strip()
                             except Exception:
@@ -397,8 +413,15 @@ class ClaudeCLIAdapter(LLMAdapter):
 
                             try:
                                 data = json.loads(line_text)
+                                msg_type = data.get("type", "unknown")
+                                _stream_log.warning(f"[STREAM] Line {line_count}: type={msg_type}")
+
                                 event = self._parse_event(data)
                                 if event:
+                                    if event.type == AdapterEvent.TEXT:
+                                        text_events += 1
+                                        text_preview = (event.text or "")[:80].replace("\n", "\\n")
+                                        _stream_log.warning(f"[STREAM] TEXT #{text_events}: {len(event.text or '')} chars, preview: {text_preview}")
                                     yield event
                             except json.JSONDecodeError:
                                 # Non-JSON output, treat as plain text
@@ -406,6 +429,7 @@ class ClaudeCLIAdapter(LLMAdapter):
                                     type=AdapterEvent.TEXT,
                                     text=line_text,
                                 )
+                        _stream_log.warning(f"[STREAM] Done: {line_count} lines, {text_events} TEXT events")
 
                     # Wait for process to complete
                     await self._process.wait()
@@ -468,8 +492,8 @@ class ClaudeCLIAdapter(LLMAdapter):
         """
         msg_type = data.get("type")
 
-        # Init message with session ID
-        if msg_type == "init" or "session_id" in data:
+        # Init message with session ID (only for system/init events)
+        if msg_type in ("init", "system"):
             self._session_id = data.get("session_id")
             return StreamEvent(
                 type=AdapterEvent.INIT,
@@ -517,8 +541,10 @@ class ClaudeCLIAdapter(LLMAdapter):
             )
 
         # Assistant message with content
-        if msg_type == "assistant" and "content" in data:
-            content = data["content"]
+        # Claude Code stream-json format: {"type": "assistant", "message": {"content": [...]}}
+        if msg_type == "assistant":
+            message = data.get("message", {})
+            content = message.get("content") or data.get("content")
             if isinstance(content, list):
                 for block in content:
                     if block.get("type") == "text":
@@ -526,6 +552,15 @@ class ClaudeCLIAdapter(LLMAdapter):
                             type=AdapterEvent.TEXT,
                             text=block.get("text", ""),
                         )
+
+        # Result event contains the complete output (final message)
+        if msg_type == "result":
+            result_text = data.get("result", "")
+            if result_text:
+                return StreamEvent(
+                    type=AdapterEvent.TEXT,
+                    text=result_text,
+                )
 
         # Message completion
         if msg_type == "message_stop":

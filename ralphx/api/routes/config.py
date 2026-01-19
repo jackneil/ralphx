@@ -628,3 +628,48 @@ async def delete_project_resource(slug: str, resource_id: int):
 
     project_db.delete_project_resource(resource_id)
     return None
+
+
+# ============================================================================
+# Project Settings
+# ============================================================================
+
+
+class ProjectSettingsResponse(BaseModel):
+    """Project-level default settings."""
+
+    id: int = 1
+    auto_inherit_guardrails: bool = True
+    require_design_doc: bool = False
+    architecture_first_mode: bool = False
+    updated_at: Optional[str] = None
+
+
+class UpdateProjectSettingsRequest(BaseModel):
+    """Request to update project settings."""
+
+    auto_inherit_guardrails: Optional[bool] = None
+    require_design_doc: Optional[bool] = None
+    architecture_first_mode: Optional[bool] = None
+
+
+@router.get("/{slug}/settings", response_model=ProjectSettingsResponse)
+async def get_project_settings(slug: str):
+    """Get project-level default settings."""
+    manager, project, project_db = get_project(slug)
+
+    settings = project_db.get_project_settings()
+    return ProjectSettingsResponse(**settings)
+
+
+@router.patch("/{slug}/settings", response_model=ProjectSettingsResponse)
+async def update_project_settings(slug: str, request: UpdateProjectSettingsRequest):
+    """Update project-level default settings."""
+    manager, project, project_db = get_project(slug)
+
+    settings = project_db.update_project_settings(
+        auto_inherit_guardrails=request.auto_inherit_guardrails,
+        require_design_doc=request.require_design_doc,
+        architecture_first_mode=request.architecture_first_mode,
+    )
+    return ProjectSettingsResponse(**settings)

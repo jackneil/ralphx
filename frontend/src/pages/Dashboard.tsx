@@ -4,6 +4,7 @@ import { useDashboardStore } from '../stores/dashboard'
 import { getHealth } from '../api'
 import AddProjectDialog from '../components/AddProjectDialog'
 import { GettingStarted, EmptyState, EMPTY_STATE_ICONS } from '../components/Help'
+import { formatLocalDate } from '../utils/time'
 
 export default function Dashboard() {
   const { projects, projectsLoading, projectsError, loadProjects } = useDashboardStore()
@@ -126,7 +127,7 @@ export default function Dashboard() {
                   {project.path}
                 </p>
                 <div className="text-xs text-gray-500">
-                  Added: {new Date(project.created_at).toLocaleDateString()}
+                  Added: {formatLocalDate(project.created_at)}
                 </div>
               </Link>
             ))}

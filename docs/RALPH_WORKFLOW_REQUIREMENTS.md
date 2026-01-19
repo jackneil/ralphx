@@ -541,11 +541,14 @@ Track and display:
 - [x] Ready check system working
 - [x] Structured output parsing with JSON schema
 - [x] LoopStatus schema (run_id is string)
+- [x] Status preservation on import (maps pending/implemented/dup/external/skipped to RalphX statuses)
+- [x] Title auto-generation from story content (first 100 chars)
+- [x] Metadata preservation (acceptance_criteria, impl_notes, dup_of, external_product)
+- [x] JSONL import test coverage (13 tests in tests/test_jsonl_import.py)
 
 ### Remaining Gaps
 | Gap | Priority | Notes |
 |-----|----------|-------|
-| Status preservation on import | P0 | Need to map JSONL status to work_items status |
 | Implemented summary variable | P1 | Query processed items, format as markdown |
 | Phase/category UI filters | P2 | Add dropdowns to step config |
 | Progress tracking UI | P3 | Show session stats |

@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { updateItem, deleteItem, Item, ItemTypeConfig } from '../api'
+import { updateItem, deleteItem, Item, ItemTypeConfig, getStatusDisplayName, getStatusColor } from '../api'
+import { formatLocalFull } from '../utils/time'
 
 interface ItemCardProps {
   projectSlug: string
@@ -12,17 +13,6 @@ export default function WorkItemCard({ projectSlug, item, onUpdate, terminology 
   const [expanded, setExpanded] = useState(false)
   const [updating, setUpdating] = useState(false)
   const [error, setError] = useState<string | null>(null)
-
-  const statusColors: Record<string, string> = {
-    pending: 'bg-yellow-900 text-yellow-300',
-    in_progress: 'bg-blue-900 text-blue-300',
-    completed: 'bg-green-900 text-green-300',
-    processed: 'bg-purple-900 text-purple-300',
-    failed: 'bg-red-900 text-red-300',
-    skipped: 'bg-gray-700 text-gray-300',
-    duplicate: 'bg-orange-900 text-orange-300',
-    rejected: 'bg-red-900 text-red-300',
-  }
 
   // Get display name for item type
   const itemTypeName = terminology?.singular || item.item_type || 'item'
@@ -59,8 +49,8 @@ export default function WorkItemCard({ projectSlug, item, onUpdate, terminology 
       {/* Header */}
       <div className="flex items-start justify-between mb-2">
         <div className="flex items-center flex-wrap gap-2">
-          <span className={`text-xs px-2 py-0.5 rounded ${statusColors[item.status] || 'bg-gray-600 text-gray-300'}`}>
-            {item.status.replace('_', ' ')}
+          <span className={`text-xs px-2 py-0.5 rounded ${getStatusColor(item.status)}`}>
+            {getStatusDisplayName(item.status)}
           </span>
           {item.phase !== undefined && (
             <span className="text-xs px-2 py-0.5 rounded bg-indigo-900 text-indigo-300" title="Phase">
@@ -158,13 +148,13 @@ export default function WorkItemCard({ projectSlug, item, onUpdate, terminology 
 
           {/* Metadata */}
           <div className="text-xs text-gray-500 mb-4 space-y-1">
-            <div>Created: {new Date(item.created_at).toLocaleString()}</div>
-            <div>Updated: {new Date(item.updated_at).toLocaleString()}</div>
+            <div>Created: {formatLocalFull(item.created_at)}</div>
+            <div>Updated: {formatLocalFull(item.updated_at)}</div>
             {item.claimed_at && (
-              <div>Claimed: {new Date(item.claimed_at).toLocaleString()}</div>
+              <div>Claimed: {formatLocalFull(item.claimed_at)}</div>
             )}
             {item.processed_at && (
-              <div>Processed: {new Date(item.processed_at).toLocaleString()}</div>
+              <div>Processed: {formatLocalFull(item.processed_at)}</div>
             )}
             <div>ID: {item.id}</div>
             {item.workflow_id && <div>Workflow: {item.workflow_id}</div>}

@@ -47,6 +47,10 @@ interface EditingStep {
   model?: 'sonnet' | 'opus' | 'haiku'
   timeout?: number
   allowedTools?: string[]
+  // Loop limits (autonomous steps only)
+  maxIterations?: number
+  cooldownBetweenIterations?: number
+  maxConsecutiveErrors?: number
   // Loop name for permission editing (only set for existing autonomous steps)
   loop_name?: string
 }
@@ -301,6 +305,10 @@ export default function WorkflowEditor({
             stepData.model = step.config?.model
             stepData.timeout = step.config?.timeout
             stepData.allowed_tools = step.config?.allowedTools
+            // Loop limits
+            stepData.max_iterations = step.config?.max_iterations
+            stepData.cooldown_between_iterations = step.config?.cooldown_between_iterations
+            stepData.max_consecutive_errors = step.config?.max_consecutive_errors
           }
           const created = await createWorkflowStep(projectSlug, workflow.id, stepData)
           finalStepIds.push(created.id)
@@ -315,7 +323,10 @@ export default function WorkflowEditor({
             originalStep.config?.loopType !== step.config?.loopType ||
             originalStep.config?.model !== step.config?.model ||
             originalStep.config?.timeout !== step.config?.timeout ||
-            JSON.stringify(originalStep.config?.allowedTools) !== JSON.stringify(step.config?.allowedTools)
+            JSON.stringify(originalStep.config?.allowedTools) !== JSON.stringify(step.config?.allowedTools) ||
+            originalStep.config?.max_iterations !== step.config?.max_iterations ||
+            originalStep.config?.cooldown_between_iterations !== step.config?.cooldown_between_iterations ||
+            originalStep.config?.max_consecutive_errors !== step.config?.max_consecutive_errors
           )
           if (configChanged) {
             const updateData: Parameters<typeof updateWorkflowStep>[3] = {
@@ -330,6 +341,10 @@ export default function WorkflowEditor({
               updateData.model = step.config?.model
               updateData.timeout = step.config?.timeout
               updateData.allowed_tools = step.config?.allowedTools
+              // Loop limits
+              updateData.max_iterations = step.config?.max_iterations
+              updateData.cooldown_between_iterations = step.config?.cooldown_between_iterations
+              updateData.max_consecutive_errors = step.config?.max_consecutive_errors
             }
             await updateWorkflowStep(projectSlug, workflow.id, step.id, updateData)
           }
@@ -385,6 +400,10 @@ export default function WorkflowEditor({
       model: (step.config?.model as 'sonnet' | 'opus' | 'haiku') || 'sonnet',
       timeout: step.config?.timeout || 300,
       allowedTools: step.config?.allowedTools || [],
+      // Loop limits
+      maxIterations: step.config?.max_iterations,
+      cooldownBetweenIterations: step.config?.cooldown_between_iterations,
+      maxConsecutiveErrors: step.config?.max_consecutive_errors,
       // Include loop_name for permission editing
       loop_name: step.loop_name,
     })
@@ -409,6 +428,10 @@ export default function WorkflowEditor({
       config.model = editingStep.model
       config.timeout = editingStep.timeout
       config.allowedTools = editingStep.allowedTools
+      // Loop limits
+      config.max_iterations = editingStep.maxIterations
+      config.cooldown_between_iterations = editingStep.cooldownBetweenIterations
+      config.max_consecutive_errors = editingStep.maxConsecutiveErrors
     }
 
     const newStep: WorkflowStep = {
@@ -1047,6 +1070,71 @@ export default function WorkflowEditor({
                               max={7200}
                               className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-primary-500"
                             />
+                          </div>
+                        </div>
+
+                        {/* Loop Limits */}
+                        <div className="border-t border-gray-600 pt-4 mt-4">
+                          <div className="text-sm font-medium text-gray-300 mb-2">
+                            Loop Limits
+                          </div>
+                          <div className="grid grid-cols-3 gap-4">
+                            <div>
+                              <label className="block text-sm font-medium text-gray-400 mb-1">
+                                Max Iterations
+                              </label>
+                              <input
+                                type="number"
+                                value={editingStep.maxIterations ?? ''}
+                                onChange={(e) => setEditingStep({
+                                  ...editingStep,
+                                  maxIterations: e.target.value ? parseInt(e.target.value) : undefined
+                                })}
+                                placeholder="Default"
+                                min={0}
+                                max={10000}
+                                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-primary-500 placeholder-gray-500"
+                              />
+                              <p className="text-xs text-gray-500 mt-1">0 = unlimited</p>
+                            </div>
+
+                            <div>
+                              <label className="block text-sm font-medium text-gray-400 mb-1">
+                                Cooldown (sec)
+                              </label>
+                              <input
+                                type="number"
+                                value={editingStep.cooldownBetweenIterations ?? ''}
+                                onChange={(e) => setEditingStep({
+                                  ...editingStep,
+                                  cooldownBetweenIterations: e.target.value ? parseInt(e.target.value) : undefined
+                                })}
+                                placeholder="Default"
+                                min={0}
+                                max={300}
+                                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-primary-500 placeholder-gray-500"
+                              />
+                              <p className="text-xs text-gray-500 mt-1">Between iterations</p>
+                            </div>
+
+                            <div>
+                              <label className="block text-sm font-medium text-gray-400 mb-1">
+                                Max Errors
+                              </label>
+                              <input
+                                type="number"
+                                value={editingStep.maxConsecutiveErrors ?? ''}
+                                onChange={(e) => setEditingStep({
+                                  ...editingStep,
+                                  maxConsecutiveErrors: e.target.value ? parseInt(e.target.value) : undefined
+                                })}
+                                placeholder="Default"
+                                min={1}
+                                max={100}
+                                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-primary-500 placeholder-gray-500"
+                              />
+                              <p className="text-xs text-gray-500 mt-1">Consecutive errors</p>
+                            </div>
                           </div>
                         </div>
                       </div>

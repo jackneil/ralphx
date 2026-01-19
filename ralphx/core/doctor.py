@@ -14,12 +14,14 @@ import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from ralphx.core.checkpoint import is_pid_running
 from ralphx.core.database import Database
+from ralphx.core.project_db import ProjectDatabase
 from ralphx.core.workspace import get_workspace_path, workspace_exists
 from ralphx.models.project import Project
 from ralphx.models.run import Run, RunStatus
@@ -516,7 +518,7 @@ class ProjectDiagnostics:
             result["reason"] = "Paused"
             result["details"] = "Run is currently paused"
 
-        elif run.status == RunStatus.ACTIVE:
+        elif run.status == RunStatus.RUNNING:
             result["reason"] = "Still running or crashed"
             result["details"] = "Run may still be active or process crashed"
 
@@ -527,3 +529,145 @@ class ProjectDiagnostics:
                 result["details"] = f"Interrupted at iteration {checkpoint.get('iteration')}"
 
         return result
+
+
+def detect_stale_runs(
+    project_db: ProjectDatabase,
+    max_inactivity_minutes: int = 15,
+) -> list[dict]:
+    """Detect runs that appear stale.
+
+    A run is considered stale if:
+    - Status is RUNNING, PAUSED, or ACTIVE (any non-terminal status)
+    - AND one of:
+      - executor_pid is set and process is not running (definitive stale)
+      - last_activity_at is older than max_inactivity_minutes AND process not running
+        (handles PID reuse - a different process may have same PID)
+      - No executor_pid and no last_activity - orphan run that never got properly started
+        (if started > 5 minutes ago, something is wrong)
+      - No executor_pid and started > 1 hour ago (legacy runs without tracking)
+
+    Note on PID reuse: Operating systems reuse PIDs. If a process dies and another
+    process gets the same PID, is_pid_running() returns True. We handle this by
+    checking BOTH PID and activity timeout - if activity is stale but PID appears
+    running, it's likely PID reuse from a dead executor.
+
+    Args:
+        project_db: Project database instance.
+        max_inactivity_minutes: Max minutes without activity before considering stale.
+
+    Returns:
+        List of dictionaries with stale run information.
+    """
+    stale_runs = []
+    cutoff = datetime.utcnow() - timedelta(minutes=max_inactivity_minutes)
+    legacy_cutoff = datetime.utcnow() - timedelta(hours=1)
+    # Orphan runs without PID should be detected after 5 minutes
+    orphan_cutoff = datetime.utcnow() - timedelta(minutes=5)
+
+    # Check all non-terminal statuses (running, paused, and incorrectly set 'active')
+    runs = project_db.list_runs(status=["running", "paused", "active"])
+
+    for run in runs:
+        is_stale = False
+        reason = None
+
+        pid = run.get("executor_pid")
+        last_activity = run.get("last_activity_at")
+        started_at = run.get("started_at")
+
+        # Parse timestamps once
+        activity_time = None
+        if last_activity:
+            activity_time = (
+                datetime.fromisoformat(last_activity)
+                if isinstance(last_activity, str)
+                else last_activity
+            )
+
+        start_time = None
+        if started_at:
+            start_time = (
+                datetime.fromisoformat(started_at)
+                if isinstance(started_at, str)
+                else started_at
+            )
+
+        # Determine if PID is definitely not running
+        pid_not_running = pid and not is_pid_running(pid)
+
+        # Check 1: PID exists and definitively not running - clear stale signal
+        if pid_not_running:
+            is_stale = True
+            reason = f"Process {pid} not running"
+
+        # Check 2: Activity timeout check
+        # This catches both:
+        # - Runs where PID is running (or appears to be due to PID reuse)
+        # - Runs where activity tracking shows the executor isn't updating
+        elif activity_time and activity_time < cutoff:
+            # If PID appears running but activity is stale, likely PID reuse
+            if pid and is_pid_running(pid):
+                # PID exists and appears running but no activity - likely PID reuse
+                # Be extra cautious: only mark stale if VERY old (2x threshold)
+                extra_stale_cutoff = datetime.utcnow() - timedelta(minutes=max_inactivity_minutes * 2)
+                if activity_time < extra_stale_cutoff:
+                    is_stale = True
+                    reason = f"No activity since {last_activity} (PID {pid} may be reused)"
+            else:
+                # No PID or PID not set - simple activity timeout
+                is_stale = True
+                reason = f"No activity since {last_activity}"
+
+        # Check 3: Orphan run (no PID, no activity) that's been sitting > 5 minutes
+        # This catches runs where executor.run() was never called or failed before setting PID
+        elif not pid and not last_activity and start_time and start_time < orphan_cutoff:
+            is_stale = True
+            reason = f"Orphan run started {started_at}, never received executor PID"
+
+        # Check 4: Legacy run (no PID tracking) that's very old (> 1 hour)
+        elif not pid and start_time and start_time < legacy_cutoff:
+            is_stale = True
+            reason = f"Legacy run started {started_at}, no PID tracking"
+
+        if is_stale:
+            stale_runs.append({
+                "run_id": run["id"],
+                "loop_name": run["loop_name"],
+                "status": run["status"],
+                "reason": reason,
+                "started_at": started_at,
+                "last_activity_at": last_activity,
+                "executor_pid": pid,
+            })
+
+    return stale_runs
+
+
+def cleanup_stale_runs(
+    project_db: ProjectDatabase,
+    max_inactivity_minutes: int = 15,
+    dry_run: bool = False,
+) -> list[dict]:
+    """Mark stale runs as aborted.
+
+    Args:
+        project_db: Project database instance.
+        max_inactivity_minutes: Max minutes without activity before considering stale.
+        dry_run: If True, don't actually update, just report.
+
+    Returns:
+        List of runs that were (or would be) cleaned up.
+    """
+    stale = detect_stale_runs(project_db, max_inactivity_minutes)
+
+    if not dry_run:
+        for run in stale:
+            project_db.update_run(
+                run["run_id"],
+                status="aborted",
+                completed_at=datetime.utcnow().isoformat(),
+                error_message=f"Marked stale: {run['reason']}",
+            )
+
+    return stale

@@ -11,6 +11,7 @@ Implements the main loop execution with:
 """
 
 import asyncio
+import os
 import random
 import re
 import signal
@@ -79,6 +80,7 @@ class IterationResult:
     timeout: bool = False
     no_items_available: bool = False  # For consumer loops: no source items to process
     claimed_item: Optional[dict] = None  # For consumer loops: the item that was processed
+    generator_complete: bool = False  # For generator loops: Claude signaled completion
 
 
 # Regex patterns for extracting work items from Claude output
@@ -193,6 +195,7 @@ class LoopExecutor:
         self._iteration = 0
         self._consecutive_errors = 0
         self._items_generated = 0
+        self._no_items_streak = 0  # Consecutive iterations with 0 items (for generator completion)
         self._start_time: Optional[datetime] = None
         self._paused = False
         self._stopping = False
@@ -670,6 +673,25 @@ class LoopExecutor:
                 else:
                     template = after_design_doc + "\n\n" + template
 
+        # Get design doc content for direct substitution (hank-rcm {DESIGN_DOC} style)
+        # This finds the first design_doc type resource and uses its content
+        design_doc_content = ""
+        for resource in loop_resources:
+            if resource.get("resource_type") == "design_doc":
+                design_doc_content = resource.get("_resolved_content", "")
+                break
+        if not design_doc_content:
+            # Fallback to project-level resources
+            for resource in resource_set.resources:
+                if resource.resource_type.value == "design_doc":
+                    design_doc_content = resource.content or ""
+                    break
+
+        # Substitute {DESIGN_DOC} (hank-rcm style) - escape content to prevent injection
+        if "{DESIGN_DOC}" in template and design_doc_content:
+            escaped_design_doc = self._escape_template_vars(design_doc_content)
+            template = template.replace("{DESIGN_DOC}", escaped_design_doc)
+
         # BEFORE_TASK: Insert before the main task instruction
         # Look for {{task}} marker or insert near the end
         if before_task:
@@ -699,7 +721,7 @@ class LoopExecutor:
             title = self._escape_template_vars(
                 claimed_item.get("title") or ""
             )
-            metadata = claimed_item.get("metadata")
+            metadata = claimed_item.get("metadata") or {}
             # json.dumps does NOT escape {{ }} so we must escape the result
             metadata_json = self._escape_template_vars(
                 json.dumps(metadata) if metadata else "{}"
@@ -708,6 +730,32 @@ class LoopExecutor:
             workflow_id_val = self._escape_template_vars(
                 claimed_item.get("workflow_id", self.workflow_id)
             )
+
+            # Extract hank-rcm style fields for PROMPT_IMPL.md compatibility
+            # These match the variables used by ralph_impl.sh:
+            # - {STORY_ID}: Item ID
+            # - {PRIORITY}: Priority number
+            # - {STORY_TEXT}: Content (same as story)
+            # - {NOTES}: Implementation notes from metadata
+            # - {ACCEPTANCE_CRITERIA}: Formatted as numbered list (NOT JSON)
+            story_id = self._escape_template_vars(claimed_item.get("id") or "UNKNOWN")
+            priority = str(claimed_item.get("priority") or 50)
+            story_text = content  # Already escaped
+            notes = self._escape_template_vars(
+                metadata.get("notes") or ""
+            )
+
+            # Format acceptance_criteria as numbered list (matching ralph_impl.sh)
+            # ralph_impl.sh extracts this and formats as "1. Criterion\n2. Criterion\n..."
+            acceptance_criteria_raw = metadata.get("acceptance_criteria") or []
+            if isinstance(acceptance_criteria_raw, list):
+                acceptance_criteria_lines = []
+                for i, criterion in enumerate(acceptance_criteria_raw, 1):
+                    criterion_escaped = self._escape_template_vars(str(criterion))
+                    acceptance_criteria_lines.append(f"{i}. {criterion_escaped}")
+                acceptance_criteria = "\n".join(acceptance_criteria_lines)
+            else:
+                acceptance_criteria = str(acceptance_criteria_raw)
 
             # Substitution order: most specific first to avoid partial matches
             template = template.replace("{{input_item.metadata}}", metadata_json)
@@ -719,10 +767,21 @@ class LoopExecutor:
             template = template.replace("{{namespace}}", workflow_id_val)
             template = template.replace("{{source_loop}}", workflow_id_val)
 
+            # hank-rcm style variables (for PROMPT_IMPL.md compatibility)
+            # Using {VAR} format to match ralph_impl.sh templates exactly
+            template = template.replace("{STORY_ID}", story_id)
+            template = template.replace("{PRIORITY}", priority)
+            template = template.replace("{STORY_TEXT}", story_text)
+            template = template.replace("{NOTES}", notes)
+            template = template.replace("{ACCEPTANCE_CRITERIA}", acceptance_criteria)
+
         # Add implemented summary for consumer loops (shows what's already been done)
-        if "{{implemented_summary}}" in template and self._is_consumer_loop():
-            impl_summary = self._build_implemented_summary()
-            template = template.replace("{{implemented_summary}}", impl_summary)
+        # Support both {{implemented_summary}} (RalphX style) and {IMPLEMENTED_SUMMARY} (hank-rcm style)
+        if self._is_consumer_loop():
+            if "{{implemented_summary}}" in template or "{IMPLEMENTED_SUMMARY}" in template:
+                impl_summary = self._build_implemented_summary()
+                template = template.replace("{{implemented_summary}}", impl_summary)
+                template = template.replace("{IMPLEMENTED_SUMMARY}", impl_summary)
 
         # Add batch items context if in batch mode
         if batch_items and len(batch_items) > 1:
@@ -1179,9 +1238,18 @@ class LoopExecutor:
     def _build_implemented_summary(self) -> str:
         """Build a summary of already-processed items for this consumer loop.
 
-        Returns a formatted string showing what items have been processed and
-        their outcomes (implemented, duplicate, external, skipped, error).
-        This helps Claude understand context and avoid duplicating work.
+        Matches the format of `prd_jsonl.py implemented-summary` from hank-rcm:
+        - Groups items by CATEGORY (not by status)
+        - Shows count per category
+        - Lists implemented items with brief summaries
+        - Helps Claude understand context and avoid duplicating work
+
+        Format:
+            ## FND (12 implemented)
+            - FND-001: Core database models and migrations
+            - FND-002: Base model classes with audit fields
+            ...
+            Total implemented: 247
 
         Returns:
             Formatted summary string, or empty string if no items processed yet.
@@ -1190,72 +1258,58 @@ class LoopExecutor:
         if source_step_id is None:
             return ""
 
-        # Get items that are not pending (i.e., have been processed)
-        # Query for each status since list_work_items only supports one status filter
-        processed_items = []
-        for status_val in ["processed", "duplicate", "external", "skipped", "failed"]:
-            items, _ = self.db.list_work_items(
-                workflow_id=self.workflow_id,
-                source_step_id=source_step_id,
-                status=status_val,
-                limit=200,  # Cap at 200 items per status
-            )
-            processed_items.extend(items)
+        # Get items that have been successfully implemented (status=processed)
+        # This matches ralph_impl.sh's `implemented-summary` which only shows implemented items
+        processed_items, _ = self.db.list_work_items(
+            workflow_id=self.workflow_id,
+            source_step_id=source_step_id,
+            status="processed",
+            limit=1000,  # Get more items to show comprehensive context
+        )
 
         if not processed_items:
-            return ""
+            return "No stories implemented yet."
 
-        # Sort by processed_at time
-        processed_items.sort(key=lambda x: x.get("processed_at") or "")
-
-        # Build summary grouped by status
-        by_status: dict[str, list[dict]] = {}
+        # Group by CATEGORY (matching prd_jsonl.py implemented-summary format)
+        by_category: dict[str, list[dict]] = {}
         for item in processed_items:
-            status = item.get("status", "unknown")
-            if status not in by_status:
-                by_status[status] = []
-            by_status[status].append(item)
+            # Extract category from item or from ID prefix (e.g., "FND-001" -> "FND")
+            category = item.get("category")
+            if not category and item.get("id") and "-" in item["id"]:
+                category = item["id"].split("-")[0].upper()
+            category = category or "MISC"
 
-        lines = ["## Previously Processed Items\n"]
-        lines.append(f"Total: {len(processed_items)} item(s) already processed.\n")
+            if category not in by_category:
+                by_category[category] = []
+            by_category[category].append(item)
 
-        status_labels = {
-            "processed": "Implemented",
-            "duplicate": "Duplicates",
-            "external": "External (requires other system)",
-            "skipped": "Skipped",
-            "failed": "Failed/Error",
-        }
+        # Build summary matching prd_jsonl.py format
+        lines = []
 
-        for status_val, label in status_labels.items():
-            items = by_status.get(status_val, [])
-            if not items:
-                continue
+        # Sort categories alphabetically for consistent output
+        for category in sorted(by_category.keys()):
+            items = by_category[category]
+            lines.append(f"\n## {category} ({len(items)} implemented)")
 
-            lines.append(f"\n### {label} ({len(items)})")
-            for item in items[:50]:  # Cap display at 50 per status
+            # Show items sorted by ID
+            items_sorted = sorted(items, key=lambda x: x.get("id") or "")
+            for item in items_sorted[:30]:  # Cap at 30 per category to avoid huge prompts
                 item_id = item.get("id", "?")
-                title = item.get("title") or (item.get("content") or "")[:60]
-                if len(title) > 60:
-                    title = title[:57] + "..."
 
+                # Get brief summary: prefer implementation_summary, then title, then content
                 metadata = item.get("metadata") or {}
-                summary = metadata.get("implementation_summary", "")
-                reason = metadata.get("status_reason", "")
-                dup_of = item.get("duplicate_of", "")
+                summary = metadata.get("implementation_summary") or metadata.get("impl_notes")
+                if not summary:
+                    summary = item.get("title") or (item.get("content") or "")[:80]
+                if len(summary) > 80:
+                    summary = summary[:77] + "..."
 
-                entry = f"- **{item_id}**: {title}"
-                if summary:
-                    entry += f" — {summary[:80]}"
-                if reason and status_val in ("skipped", "external"):
-                    entry += f" (reason: {reason[:50]})"
-                if dup_of and status_val == "duplicate":
-                    entry += f" (duplicate of {dup_of})"
+                lines.append(f"- {item_id}: {summary}")
 
-                lines.append(entry)
+            if len(items) > 30:
+                lines.append(f"... and {len(items) - 30} more")
 
-            if len(items) > 50:
-                lines.append(f"... and {len(items) - 50} more")
+        lines.append(f"\nTotal implemented: {len(processed_items)}")
 
         return "\n".join(lines)
 
@@ -1377,30 +1431,57 @@ class LoopExecutor:
         # Try JSON pattern first
         import json
 
+        def extract_items_from_list(parsed: list) -> list[dict]:
+            """Extract work items from a parsed JSON list."""
+            extracted = []
+            for item in parsed:
+                if isinstance(item, dict) and 'id' in item:
+                    # Support both 'content' (RalphX style) and 'story' (hank-rcm style)
+                    item_content = item.get('content') or item.get('story')
+                    if not item_content:
+                        continue  # Skip items without content
+
+                    # Extract known fields explicitly
+                    known_fields = {
+                        'id', 'content', 'story', 'title', 'priority', 'category',
+                        'tags', 'dependencies', 'acceptance_criteria', 'complexity'
+                    }
+                    extracted.append({
+                        'id': str(item['id']),
+                        'content': str(item_content),
+                        'title': item.get('title'),
+                        'priority': item.get('priority'),
+                        'category': item.get('category'),
+                        'tags': item.get('tags'),
+                        'dependencies': item.get('dependencies'),
+                        'metadata': {k: v for k, v in item.items()
+                                     if k not in known_fields},
+                    })
+            return extracted
+
         try:
-            # Look for JSON array
-            json_match = re.search(r'\[[\s\S]*?\]', output)
+            # Try 1: Look for JSON object with stories/items array
+            # Pattern: {"stories": [...]} or {"items": [...]}
+            obj_match = re.search(r'\{[\s\S]*"(?:stories|items)"\s*:\s*\[[\s\S]*\][\s\S]*\}', output)
+            if obj_match:
+                try:
+                    parsed = json.loads(obj_match.group())
+                    if isinstance(parsed, dict):
+                        stories_list = parsed.get('stories') or parsed.get('items') or []
+                        if isinstance(stories_list, list):
+                            items = extract_items_from_list(stories_list)
+                            if items:
+                                return items
+                except json.JSONDecodeError:
+                    pass
+
+            # Try 2: Look for JSON array directly (greedy to get outer array)
+            # Use greedy matching to find the largest array
+            json_match = re.search(r'\[[\s\S]*\]', output)
             if json_match:
                 parsed = json.loads(json_match.group())
                 if isinstance(parsed, list):
-                    for item in parsed:
-                        if isinstance(item, dict) and 'id' in item and 'content' in item:
-                            # Extract known fields explicitly
-                            known_fields = {
-                                'id', 'content', 'title', 'priority', 'category',
-                                'tags', 'dependencies', 'acceptance_criteria', 'complexity'
-                            }
-                            items.append({
-                                'id': str(item['id']),
-                                'content': str(item['content']),
-                                'title': item.get('title'),
-                                'priority': item.get('priority'),
-                                'category': item.get('category'),
-                                'tags': item.get('tags'),
-                                'dependencies': item.get('dependencies'),
-                                'metadata': {k: v for k, v in item.items()
-                                             if k not in known_fields},
-                            })
+                    items = extract_items_from_list(parsed)
                     if items:
                         return items
         except (json.JSONDecodeError, ValueError):
@@ -1470,6 +1551,11 @@ class LoopExecutor:
                 )
             except Exception as e:
                 # Item may already exist (duplicate)
+                import logging
+                _save_log = logging.getLogger(__name__)
+                _save_log.warning(f"[SAVE] Failed to save item {item.get('id')}: {e}")
+                import traceback
+                _save_log.warning(f"[SAVE] Traceback: {traceback.format_exc()}")
                 self._emit_event(
                     ExecutorEvent.WARNING,
                     f"Failed to save item {item.get('id')}: {e}",
@@ -1554,12 +1640,25 @@ class LoopExecutor:
             if self._is_consumer_loop() and not self._batch_mode:
                 json_schema = IMPLEMENTATION_STATUS_SCHEMA
 
+            # Callback to register session immediately when it starts
+            # This enables live streaming in the UI before execution completes
+            def register_session_early(session_id: str) -> None:
+                if self._run:
+                    self.db.create_session(
+                        session_id=session_id,
+                        run_id=self._run.id,
+                        iteration=self._iteration,
+                        mode=mode_name,
+                        status="running",
+                    )
+
             exec_result = await self.adapter.execute(
                 prompt=prompt,
                 model=mode.model,
                 tools=mode.tools if mode.tools else None,
                 timeout=mode.timeout,
                 json_schema=json_schema,
+                on_session_start=register_session_early,
             )
 
             result.session_id = exec_result.session_id
@@ -1570,20 +1669,41 @@ class LoopExecutor:
                 result.error_message = exec_result.error_message
 
             # Extract work items from output
+            import logging
+            _log = logging.getLogger(__name__)
+            _log.warning(f"[EXTRACT] text_output len={len(exec_result.text_output) if exec_result.text_output else 0}")
             if exec_result.text_output:
+                _log.warning(f"[EXTRACT] text_output[:200]={exec_result.text_output[:200]}")
+                # Check if JSON with stories is present
+                has_stories = '"stories"' in exec_result.text_output
+                has_json_start = '```json' in exec_result.text_output or '{"stories"' in exec_result.text_output
+                _log.warning(f"[EXTRACT] has_stories={has_stories}, has_json_start={has_json_start}")
+                if has_stories:
+                    # Find and log the stories section
+                    idx = exec_result.text_output.find('"stories"')
+                    _log.warning(f"[EXTRACT] stories found at idx={idx}, context: {exec_result.text_output[max(0,idx-50):idx+200]}")
                 items = self.extract_work_items(exec_result.text_output)
+                _log.warning(f"[EXTRACT] extracted {len(items)} items")
                 if items:
                     saved = self._save_work_items(items)
                     result.items_added = items
                     self._items_generated += saved
+                    self._no_items_streak = 0  # Reset streak when items are generated
+                    _log.warning(f"[EXTRACT] saved {saved} items")
+                else:
+                    # No items generated this iteration - track for completion detection
+                    self._no_items_streak += 1
+                    _log.warning(f"[EXTRACT] no items extracted, streak={self._no_items_streak}")
 
-            # Register session
+                # Check for explicit completion signal from Claude
+                if "[GENERATION_COMPLETE]" in exec_result.text_output:
+                    result.generator_complete = True  # type: ignore
+                    _log.warning("[EXTRACT] found [GENERATION_COMPLETE] signal")
+
+            # Update session status (session was registered early via callback)
             if exec_result.session_id and self._run:
-                self.db.create_session(
+                self.db.update_session_status(
                     session_id=exec_result.session_id,
-                    run_id=self._run.id,
-                    iteration=self._iteration,
-                    mode=mode_name,
                     status="completed" if exec_result.success else "error",
                 )
 
@@ -1688,14 +1808,27 @@ class LoopExecutor:
                     f"Released {stale_released} stale item claims from crashed executors",
                 )
 
+        # Clean up stale runs before starting a new one
+        from ralphx.core.doctor import cleanup_stale_runs
+        cleaned_runs = cleanup_stale_runs(self.db, max_inactivity_minutes=15)
+        if cleaned_runs:
+            self._emit_event(
+                ExecutorEvent.WARNING,
+                f"Cleaned up {len(cleaned_runs)} stale run(s) from crashed executors",
+            )
+
         # Create run record
         run_id = f"run-{uuid.uuid4().hex[:12]}"
+        current_pid = os.getpid()
+        now = datetime.utcnow()
         self._run = Run(
             id=run_id,
             project_id=self.project.id,
             loop_name=self.config.name,
-            status=RunStatus.ACTIVE,
-            started_at=datetime.utcnow(),
+            status=RunStatus.RUNNING,
+            started_at=now,
+            executor_pid=current_pid,
+            last_activity_at=now,
         )
         self._start_time = self._run.started_at
         self._iteration = 0
@@ -1708,6 +1841,12 @@ class LoopExecutor:
             loop_name=self.config.name,
             workflow_id=self.workflow_id,
             step_id=self.step_id,
+        )
+        # Store PID and initial activity timestamp for stale detection
+        self.db.update_run(
+            run_id,
+            executor_pid=current_pid,
+            last_activity_at=now.isoformat(),
         )
 
         self._emit_event(
@@ -1797,6 +1936,28 @@ class LoopExecutor:
                         await asyncio.sleep(wait_time)
                     continue
 
+                # Check for generator loop completion (until-done mode)
+                # A generator is complete if:
+                #   1. Claude explicitly signals [GENERATION_COMPLETE], OR
+                #   2. 3+ consecutive iterations with 0 items AND max_iterations is unlimited (0 or -1)
+                if not self._is_consumer_loop():
+                    generator_done = False
+                    stop_reason = None
+
+                    if result.generator_complete:
+                        generator_done = True
+                        stop_reason = f"Generator signaled completion after {self._iteration} iterations, {self._items_generated} items"
+
+                    elif effective_max <= 0 and self._no_items_streak >= 3:
+                        # Unlimited mode (-1 or 0) and 3 consecutive empty iterations
+                        generator_done = True
+                        stop_reason = f"Generator exhausted (3 empty iterations), {self._items_generated} items generated"
+
+                    if generator_done:
+                        self._emit_event(ExecutorEvent.RUN_COMPLETED, stop_reason)
+                        self._run.status = RunStatus.COMPLETED
+                        break
+
                 # Handle Phase 1 mode progression
                 if (
                     self.config.mode_selection.strategy == ModeSelectionStrategy.PHASE_AWARE
@@ -1863,13 +2024,16 @@ class LoopExecutor:
                     duration=result.duration_seconds,
                 )
 
-                # Update run record
+                # Update run record with activity timestamp for stale detection
+                now = datetime.utcnow()
                 self._run.iterations_completed = self._iteration
                 self._run.items_generated = self._items_generated
+                self._run.last_activity_at = now
                 self.db.update_run(
                     self._run.id,
                     iterations_completed=self._iteration,
                     items_generated=self._items_generated,
+                    last_activity_at=now.isoformat(),
                 )
 
                 # Cooldown between iterations
@@ -1903,6 +2067,10 @@ class LoopExecutor:
                 error_message=self._run.error_message,
             )
 
+            # Auto-advance workflow step if run completed successfully
+            if self._run.status == RunStatus.COMPLETED:
+                self._handle_step_completion()
+
             # Stop adapter if running
             if self.adapter.is_running:
                 await self.adapter.stop()
@@ -1929,9 +2097,109 @@ class LoopExecutor:
         if self._run and self._run.status == RunStatus.PAUSED:
             self._paused = False
             self._pause_event.set()
-            self._run.status = RunStatus.ACTIVE
-            self.db.update_run(self._run.id, status="active")
+            self._run.status = RunStatus.RUNNING
+            self.db.update_run(self._run.id, status="running")
             self._emit_event(ExecutorEvent.RUN_RESUMED, "Run resumed")
+
+    def _handle_step_completion(self) -> None:
+        """Handle workflow step completion and auto-advance.
+
+        When a run completes successfully, check if the step's target iterations
+        have been met. If so, mark the step as completed and automatically start
+        the next step in the workflow.
+
+        This is called from the run() finally block when status is COMPLETED.
+        """
+        if not self.workflow_id or not self.step_id:
+            return  # Not running as part of a workflow
+
+        try:
+            # Get current step info
+            step = self.db.get_workflow_step(self.step_id)
+            if not step:
+                return
+
+            # Only auto-advance if step is still active
+            if step["status"] != "active":
+                return
+
+            # Check if step completion criteria are met
+            step_config = step.get("config") or {}
+            target_iterations = step_config.get("iterations", 0)
+
+            # Get total iterations completed across all runs for this step
+            step_runs = self.db.list_runs(workflow_id=self.workflow_id, step_id=self.step_id)
+            total_iterations = sum(r.get("iterations_completed", 0) for r in step_runs)
+
+            should_complete = False
+
+            # For generator loops with explicit completion signal or no-items streak
+            if not self._is_consumer_loop():
+                # Generator completed if:
+                # 1. Reached target iterations (target > 0 and total >= target)
+                # 2. OR ran until done (target <= 0 and we broke out of loop)
+                if target_iterations > 0:
+                    should_complete = total_iterations >= target_iterations
+                else:
+                    # Unlimited mode - completed because generator signaled done
+                    should_complete = True
+
+            # For consumer loops, step completes when all items are processed
+            else:
+                all_done, _, _ = self._check_consumer_completion()
+                should_complete = all_done
+
+            if should_complete:
+                self._emit_event(
+                    ExecutorEvent.HEARTBEAT,
+                    f"Step completed, checking for next step...",
+                    step_id=self.step_id,
+                    total_iterations=total_iterations,
+                )
+
+                # Get workflow and find next step
+                workflow = self.db.get_workflow(self.workflow_id)
+                if not workflow or workflow["status"] != "active":
+                    return
+
+                steps = self.db.list_workflow_steps(self.workflow_id)
+                current_step_num = step["step_number"]
+
+                # Find next step
+                next_step = None
+                for s in steps:
+                    if s["step_number"] == current_step_num + 1:
+                        next_step = s
+                        break
+
+                # Advance to next step atomically
+                self.db.advance_workflow_step_atomic(
+                    workflow_id=self.workflow_id,
+                    current_step_id=step["id"],
+                    next_step_id=next_step["id"] if next_step else None,
+                    skip_current=False,
+                    artifacts={"items_generated": self._items_generated},
+                )
+
+                if next_step:
+                    self._emit_event(
+                        ExecutorEvent.HEARTBEAT,
+                        f"Auto-advanced to step {next_step['step_number']}: {next_step.get('name', 'Unknown')}",
+                        next_step_id=next_step["id"],
+                        next_step_name=next_step.get("name"),
+                    )
+                else:
+                    self._emit_event(
+                        ExecutorEvent.HEARTBEAT,
+                        f"Workflow completed - no more steps",
+                    )
+
+        except Exception as e:
+            # Don't fail the run if step completion handling fails
+            self._emit_event(
+                ExecutorEvent.WARNING,
+                f"Failed to handle step completion: {e}",
+            )
 
     # ========== Git Integration ==========
 

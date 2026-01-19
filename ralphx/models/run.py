@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 class RunStatus(str, Enum):
     """Status of a loop run."""
 
-    ACTIVE = "active"
+    RUNNING = "running"
     PAUSED = "paused"
     COMPLETED = "completed"
     ERROR = "error"
@@ -23,19 +23,21 @@ class Run(BaseModel):
     id: str = Field(..., description="Unique run identifier")
     project_id: str = Field(..., description="Parent project ID")
     loop_name: str = Field(..., description="Name of the loop being run")
-    status: RunStatus = RunStatus.ACTIVE
+    status: RunStatus = RunStatus.RUNNING
     started_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
     iterations_completed: int = Field(0, ge=0)
     items_generated: int = Field(0, ge=0)
     error_message: Optional[str] = None
+    executor_pid: Optional[int] = Field(None, description="PID of executor process")
+    last_activity_at: Optional[datetime] = Field(None, description="Last activity timestamp")
 
     model_config = {"from_attributes": True}
 
     @property
     def is_active(self) -> bool:
         """Check if run is still active."""
-        return self.status == RunStatus.ACTIVE
+        return self.status == RunStatus.RUNNING
 
     @property
     def is_terminal(self) -> bool:
@@ -65,6 +67,8 @@ class Run(BaseModel):
             "iterations_completed": self.iterations_completed,
             "items_generated": self.items_generated,
             "error_message": self.error_message,
+            "executor_pid": self.executor_pid,
+            "last_activity_at": self.last_activity_at.isoformat() if self.last_activity_at else None,
         }
 
     @classmethod
@@ -88,4 +92,10 @@ class Run(BaseModel):
             iterations_completed=data.get("iterations_completed", 0),
             items_generated=data.get("items_generated", 0),
             error_message=data.get("error_message"),
+            executor_pid=data.get("executor_pid"),
+            last_activity_at=(
+                datetime.fromisoformat(data["last_activity_at"])
+                if isinstance(data.get("last_activity_at"), str) and data.get("last_activity_at")
+                else None
+            ),
         )

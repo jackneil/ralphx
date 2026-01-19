@@ -40,6 +40,9 @@ TOKEN_REFRESH_INTERVAL = 1800
 # Log cleanup interval: 24 hours
 LOG_CLEANUP_INTERVAL = 86400
 
+# Stale run cleanup interval: 2 minutes
+STALE_RUN_CLEANUP_INTERVAL = 120
+
 
 async def _token_refresh_loop():
     """Background task to refresh tokens every 30 minutes."""
@@ -74,6 +77,43 @@ async def _log_cleanup_loop():
             logger.warning(f"Log cleanup error: {e}")
 
 
+async def _stale_run_cleanup_loop():
+    """Background task to clean up stale runs every 2 minutes.
+
+    Detects runs that are stuck in 'running' status but whose executor
+    process has died (checked via PID) or hasn't had activity for too long.
+    """
+    from ralphx.core.database import Database
+    from ralphx.core.doctor import cleanup_stale_runs
+    from ralphx.core.project_db import ProjectDatabase
+
+    while True:
+        await asyncio.sleep(STALE_RUN_CLEANUP_INTERVAL)
+        try:
+            # Get all projects and clean up stale runs in each
+            db = Database()
+            projects = db.list_projects()
+
+            total_cleaned = 0
+            for project in projects:
+                try:
+                    project_path = Path(project.get("path", ""))
+                    if project_path.exists():
+                        project_db = ProjectDatabase(project_path)
+                        cleaned = cleanup_stale_runs(
+                            project_db,
+                            max_inactivity_minutes=15,
+                        )
+                        total_cleaned += len(cleaned)
+                except Exception as e:
+                    logger.debug(f"Stale run cleanup error for {project.get('slug')}: {e}")
+
+            if total_cleaned > 0:
+                logger.info(f"Stale run cleanup: marked {total_cleaned} stale runs as aborted")
+        except Exception as e:
+            logger.warning(f"Stale run cleanup error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -89,7 +129,8 @@ async def lifespan(app: FastAPI):
     # Start background tasks
     refresh_task = asyncio.create_task(_token_refresh_loop())
     cleanup_task = asyncio.create_task(_log_cleanup_loop())
-    logger.info("Started background tasks (token refresh, log cleanup)")
+    stale_run_task = asyncio.create_task(_stale_run_cleanup_loop())
+    logger.info("Started background tasks (token refresh, log cleanup, stale run cleanup)")
 
     # Log server startup
     system_log.info("startup", f"Server started (v{__version__})")
@@ -102,12 +143,17 @@ async def lifespan(app: FastAPI):
     # Shutdown: cancel background tasks
     refresh_task.cancel()
     cleanup_task.cancel()
+    stale_run_task.cancel()
     try:
         await refresh_task
     except asyncio.CancelledError:
         pass
     try:
         await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await stale_run_task
     except asyncio.CancelledError:
         pass
 

@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { getLogs, getLogStats, LogEntry, LogFilters, LogStats } from '../api'
+import { parseAsUTC } from '../utils/time'
 
 const levelColors: Record<string, string> = {
   DEBUG: 'bg-gray-600 text-gray-300',
@@ -91,12 +92,12 @@ export default function Logs() {
   }, [autoRefresh, loadLogs])
 
   const formatTimestamp = (ts: string) => {
-    const date = new Date(ts)
+    const date = parseAsUTC(ts)
     return date.toLocaleString()
   }
 
   const formatTimeAgo = (ts: string) => {
-    const seconds = Math.floor((Date.now() - new Date(ts).getTime()) / 1000)
+    const seconds = Math.floor((Date.now() - parseAsUTC(ts).getTime()) / 1000)
     if (seconds < 60) return `${seconds}s ago`
     const minutes = Math.floor(seconds / 60)
     if (minutes < 60) return `${minutes}m ago`

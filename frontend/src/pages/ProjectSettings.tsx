@@ -9,7 +9,10 @@ import {
   createProjectResource,
   updateProjectResource,
   deleteProjectResource,
+  getProjectSettings,
+  updateProjectSettings,
   ProjectResource,
+  ProjectSettings as ProjectSettingsType,
   AuthStatus,
 } from '../api'
 import { useDashboardStore } from '../stores/dashboard'
@@ -22,9 +25,11 @@ export default function ProjectSettings() {
 
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null)
   const [resources, setResources] = useState<ProjectResource[]>([])
+  const [settings, setSettings] = useState<ProjectSettingsType | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [loginLoading, setLoginLoading] = useState(false)
+  const [savingSettings, setSavingSettings] = useState(false)
 
   // Active tab
   const [activeTab, setActiveTab] = useState<SettingsTab>('auth')
@@ -51,14 +56,16 @@ export default function ProjectSettings() {
     setError(null)
 
     try {
-      const [projectData, authData, resourcesData] = await Promise.all([
+      const [projectData, authData, resourcesData, settingsData] = await Promise.all([
         getProject(slug),
         getAuthStatus(),
         listProjectResources(slug),
+        getProjectSettings(slug),
       ])
       setSelectedProject(projectData)
       setAuthStatus(authData)
       setResources(resourcesData)
+      setSettings(settingsData)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load settings')
     } finally {
@@ -165,6 +172,28 @@ export default function ProjectSettings() {
       loadData()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete resource')
+    }
+  }
+
+  const handleSettingChange = async (
+    key: 'auto_inherit_guardrails' | 'require_design_doc' | 'architecture_first_mode',
+    value: boolean
+  ) => {
+    if (!slug || !settings) return
+
+    // Optimistic update
+    setSettings({ ...settings, [key]: value })
+    setSavingSettings(true)
+
+    try {
+      const updated = await updateProjectSettings(slug, { [key]: value })
+      setSettings(updated)
+    } catch (err) {
+      // Revert on error
+      setSettings({ ...settings, [key]: !value })
+      setError(err instanceof Error ? err.message : 'Failed to save setting')
+    } finally {
+      setSavingSettings(false)
     }
   }
 
@@ -413,46 +442,68 @@ export default function ProjectSettings() {
       {activeTab === 'defaults' && (
         <div className="space-y-6">
           <div className="card">
-            <h2 className="text-lg font-semibold text-white mb-4">Default Settings for New Workflows</h2>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-white">Default Settings for New Workflows</h2>
+              {savingSettings && (
+                <span className="text-sm text-gray-400">Saving...</span>
+              )}
+            </div>
             <p className="text-sm text-gray-400 mb-4">
               These settings are applied to new workflows by default.
             </p>
 
             <div className="space-y-4">
-              <label className="flex items-center space-x-3">
+              <label className="flex items-center space-x-3 cursor-pointer">
                 <input
                   type="checkbox"
-                  defaultChecked
-                  className="w-4 h-4 rounded bg-gray-700 border-gray-600 text-primary-500 focus:ring-primary-500"
+                  checked={settings?.auto_inherit_guardrails ?? true}
+                  onChange={(e) => handleSettingChange('auto_inherit_guardrails', e.target.checked)}
+                  disabled={savingSettings}
+                  className="w-4 h-4 rounded bg-gray-700 border-gray-600 text-primary-500 focus:ring-primary-500 cursor-pointer disabled:opacity-50"
                 />
-                <span className="text-gray-300">Auto-inherit shared guardrails</span>
+                <div>
+                  <span className="text-gray-300">Auto-inherit shared guardrails</span>
+                  <p className="text-xs text-gray-500">New workflows automatically receive guardrails marked as auto-inherit</p>
+                </div>
               </label>
-              <label className="flex items-center space-x-3">
+              <label className="flex items-center space-x-3 cursor-pointer">
                 <input
                   type="checkbox"
-                  className="w-4 h-4 rounded bg-gray-700 border-gray-600 text-primary-500 focus:ring-primary-500"
+                  checked={settings?.require_design_doc ?? false}
+                  onChange={(e) => handleSettingChange('require_design_doc', e.target.checked)}
+                  disabled={savingSettings}
+                  className="w-4 h-4 rounded bg-gray-700 border-gray-600 text-primary-500 focus:ring-primary-500 cursor-pointer disabled:opacity-50"
                 />
-                <span className="text-gray-300">Require design document before implementation</span>
+                <div>
+                  <span className="text-gray-300">Require design document before implementation</span>
+                  <p className="text-xs text-gray-500">Blocks autonomous steps until a design document is attached</p>
+                </div>
               </label>
-              <label className="flex items-center space-x-3">
+              <label className="flex items-center space-x-3 cursor-pointer">
                 <input
                   type="checkbox"
-                  className="w-4 h-4 rounded bg-gray-700 border-gray-600 text-primary-500 focus:ring-primary-500"
+                  checked={settings?.architecture_first_mode ?? false}
+                  onChange={(e) => handleSettingChange('architecture_first_mode', e.target.checked)}
+                  disabled={savingSettings}
+                  className="w-4 h-4 rounded bg-gray-700 border-gray-600 text-primary-500 focus:ring-primary-500 cursor-pointer disabled:opacity-50"
                 />
-                <span className="text-gray-300">Enable architecture-first mode for new projects</span>
+                <div>
+                  <span className="text-gray-300">Enable architecture-first mode</span>
+                  <p className="text-xs text-gray-500">Prioritizes planning and design steps in new workflows</p>
+                </div>
               </label>
             </div>
           </div>
 
           <div className="p-4 bg-gray-800/50 border border-gray-700 rounded">
             <div className="flex items-start space-x-3">
-              <svg className="w-5 h-5 text-blue-400 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
+              <svg className="w-5 h-5 text-green-400 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
               <div className="text-sm text-gray-400">
-                <p className="font-medium text-gray-300 mb-1">Coming Soon</p>
+                <p className="font-medium text-gray-300 mb-1">Settings Auto-Save</p>
                 <p>
-                  Default settings will be configurable in a future update.
+                  Changes are saved automatically when you toggle a setting.
                 </p>
               </div>
             </div>

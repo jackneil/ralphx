@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import Swal from 'sweetalert2'
 import { startLoop, stopLoop, pauseLoop, resumeLoop, getLoopPhases, PhaseInfoResponse, StartLoopOptions } from '../api'
 
 interface LoopControlProps {
@@ -71,6 +72,44 @@ export default function LoopControl({
       setError(err instanceof Error ? err.message : 'Action failed')
     } finally {
       setLoading(false)
+    }
+  }
+
+  const confirmStop = async () => {
+    const result = await Swal.fire({
+      title: 'Stop Loop?',
+      text: 'This will stop the current execution. You can resume later.',
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonColor: 'var(--color-rose)',
+      cancelButtonColor: 'var(--color-slate)',
+      confirmButtonText: 'Stop',
+      cancelButtonText: 'Cancel',
+      background: 'var(--color-surface)',
+      color: 'var(--color-text-primary)',
+    })
+
+    if (result.isConfirmed) {
+      await handleAction(() => stopLoop(projectSlug, loopName))
+    }
+  }
+
+  const confirmSimpleStart = async () => {
+    const result = await Swal.fire({
+      title: 'Start Loop?',
+      text: 'This will begin executing the loop.',
+      icon: 'question',
+      showCancelButton: true,
+      confirmButtonColor: 'var(--color-primary)',
+      cancelButtonColor: 'var(--color-slate)',
+      confirmButtonText: 'Start',
+      cancelButtonText: 'Cancel',
+      background: 'var(--color-surface)',
+      color: 'var(--color-text-primary)',
+    })
+
+    if (result.isConfirmed) {
+      await handleAction(() => startLoop(projectSlug, loopName))
     }
   }
 
@@ -253,7 +292,7 @@ export default function LoopControl({
               </div>
             ) : (
               <button
-                onClick={() => handleAction(() => startLoop(projectSlug, loopName))}
+                onClick={confirmSimpleStart}
                 disabled={loading}
                 className="btn-primary disabled:opacity-50 flex items-center space-x-2"
               >
@@ -275,7 +314,7 @@ export default function LoopControl({
               <span>Pause</span>
             </button>
             <button
-              onClick={() => handleAction(() => stopLoop(projectSlug, loopName))}
+              onClick={confirmStop}
               disabled={loading}
               className="btn-danger disabled:opacity-50 flex items-center space-x-2"
             >
@@ -296,7 +335,7 @@ export default function LoopControl({
               <span>Resume</span>
             </button>
             <button
-              onClick={() => handleAction(() => stopLoop(projectSlug, loopName))}
+              onClick={confirmStop}
               disabled={loading}
               className="btn-danger disabled:opacity-50 flex items-center space-x-2"
             >

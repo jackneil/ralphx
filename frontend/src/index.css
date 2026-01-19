@@ -1,14 +1,42 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  /* Mission Control Color Palette */
+  --color-void: #0a0c10;
+  --color-deep: #0d1117;
+  --color-surface: #161b22;
+  --color-elevated: #21262d;
+  --color-border: #30363d;
+  --color-border-bright: #484f58;
+
+  /* Accent Colors */
+  --color-cyan: #00d9ff;
+  --color-cyan-dim: #00d9ff40;
+  --color-cyan-glow: #00d9ff20;
+  --color-emerald: #00ff88;
+  --color-emerald-dim: #00ff8840;
+  --color-amber: #ffb800;
+  --color-amber-dim: #ffb80040;
+  --color-rose: #ff3366;
+  --color-rose-dim: #ff336640;
+  --color-violet: #a855f7;
+  --color-violet-dim: #a855f740;
+
+  /* Text */
+  --color-text-primary: #e6edf3;
+  --color-text-secondary: #8b949e;
+  --color-text-muted: #6e7681;
+
+  font-family: 'DM Sans', system-ui, sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
+  color-scheme: dark;
+  color: var(--color-text-primary);
+  background-color: var(--color-void);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -19,38 +47,275 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  background:
+    radial-gradient(ellipse at 20% 0%, var(--color-cyan-glow) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 100%, var(--color-violet-dim) 0%, transparent 50%),
+    var(--color-void);
 }
 
+/* Mission Control Typography */
+.font-mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.font-display {
+  font-family: 'DM Sans', sans-serif;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+/* Custom Animations */
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 0 0 var(--glow-color, var(--color-cyan-dim));
+    opacity: 1;
+  }
+  50% {
+    box-shadow: 0 0 20px 4px var(--glow-color, var(--color-cyan-dim));
+    opacity: 0.8;
+  }
+}
+
+@keyframes scan-line {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+
+@keyframes terminal-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes status-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.2); }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+.animate-terminal-blink {
+  animation: terminal-blink 1s step-end infinite;
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.3s ease-out forwards;
+}
+
+.animate-status-pulse {
+  animation: status-pulse 1.5s ease-in-out infinite;
+}
+
+/* Staggered animation delays */
+.stagger-1 { animation-delay: 0.05s; }
+.stagger-2 { animation-delay: 0.1s; }
+.stagger-3 { animation-delay: 0.15s; }
+.stagger-4 { animation-delay: 0.2s; }
+.stagger-5 { animation-delay: 0.25s; }
+
 @layer components {
+  /* Mission Control Buttons */
   .btn-primary {
-    @apply px-4 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700 transition-colors;
+    @apply px-5 py-2.5 font-semibold rounded-lg transition-all duration-200;
+    background: linear-gradient(135deg, var(--color-cyan) 0%, #00b4d8 100%);
+    color: var(--color-void);
+    box-shadow: 0 0 20px var(--color-cyan-dim), inset 0 1px 0 rgba(255,255,255,0.2);
+  }
+  .btn-primary:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 0 30px var(--color-cyan-dim), 0 4px 12px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.2);
   }
 
   .btn-secondary {
-    @apply px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors;
+    @apply px-5 py-2.5 font-medium rounded-lg transition-all duration-200;
+    background: var(--color-elevated);
+    color: var(--color-text-primary);
+    border: 1px solid var(--color-border);
+  }
+  .btn-secondary:hover {
+    background: var(--color-border);
+    border-color: var(--color-border-bright);
   }
 
   .btn-danger {
-    @apply px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors;
+    @apply px-5 py-2.5 font-semibold rounded-lg transition-all duration-200;
+    background: linear-gradient(135deg, var(--color-rose) 0%, #e91e63 100%);
+    color: white;
+    box-shadow: 0 0 20px var(--color-rose-dim);
+  }
+  .btn-danger:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 0 30px var(--color-rose-dim), 0 4px 12px rgba(0,0,0,0.4);
   }
 
+  /* Mission Control Cards */
   .card {
-    @apply bg-gray-800 rounded-lg shadow-md p-4;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 1.25rem;
+    position: relative;
+    overflow: hidden;
+  }
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--color-border-bright), transparent);
   }
 
+  /* Control Panel Card */
+  .card-panel {
+    background: var(--color-deep);
+    border: 1px solid var(--color-border);
+    border-radius: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+  .card-panel::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 100%),
+      repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(255,255,255,0.01) 2px,
+        rgba(255,255,255,0.01) 4px
+      );
+    pointer-events: none;
+  }
+
+  /* Status Indicators */
   .status-running {
-    @apply text-green-400;
+    color: var(--color-emerald);
+    text-shadow: 0 0 10px var(--color-emerald-dim);
   }
-
   .status-paused {
-    @apply text-yellow-400;
+    color: var(--color-amber);
+    text-shadow: 0 0 10px var(--color-amber-dim);
   }
-
   .status-stopped {
-    @apply text-gray-400;
+    color: var(--color-text-muted);
+  }
+  .status-error {
+    color: var(--color-rose);
+    text-shadow: 0 0 10px var(--color-rose-dim);
   }
 
-  .status-error {
-    @apply text-red-400;
+  /* Status Dots */
+  .status-dot {
+    @apply w-2.5 h-2.5 rounded-full;
+  }
+  .status-dot-running {
+    background: var(--color-emerald);
+    box-shadow: 0 0 8px var(--color-emerald);
+    animation: status-pulse 1.5s ease-in-out infinite;
+  }
+  .status-dot-active {
+    background: var(--color-cyan);
+    box-shadow: 0 0 8px var(--color-cyan);
+    animation: status-pulse 1.5s ease-in-out infinite;
+  }
+  .status-dot-paused {
+    background: var(--color-amber);
+    box-shadow: 0 0 8px var(--color-amber);
+  }
+  .status-dot-aborted {
+    background: var(--color-rose);
+    box-shadow: 0 0 8px var(--color-rose);
+  }
+  .status-dot-completed {
+    background: var(--color-emerald);
+    box-shadow: 0 0 6px var(--color-emerald-dim);
+  }
+
+  /* Mission Control Badge */
+  .badge {
+    @apply px-2.5 py-1 text-xs font-semibold rounded-md uppercase tracking-wider;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .badge-active {
+    background: var(--color-cyan-dim);
+    color: var(--color-cyan);
+    border: 1px solid var(--color-cyan);
+  }
+  .badge-running {
+    background: var(--color-emerald-dim);
+    color: var(--color-emerald);
+    border: 1px solid var(--color-emerald);
+  }
+  .badge-pending {
+    background: var(--color-elevated);
+    color: var(--color-text-muted);
+    border: 1px solid var(--color-border);
+  }
+  .badge-completed {
+    background: rgba(0, 255, 136, 0.1);
+    color: var(--color-emerald);
+    border: 1px solid rgba(0, 255, 136, 0.3);
+  }
+  .badge-aborted {
+    background: var(--color-rose-dim);
+    color: var(--color-rose);
+    border: 1px solid var(--color-rose);
+  }
+
+  /* Terminal Style */
+  .terminal-text {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8125rem;
+    line-height: 1.6;
+  }
+  .terminal-prompt::before {
+    content: '❯ ';
+    color: var(--color-cyan);
+  }
+
+  /* Glow effects */
+  .glow-cyan {
+    --glow-color: var(--color-cyan-dim);
+  }
+  .glow-emerald {
+    --glow-color: var(--color-emerald-dim);
+  }
+  .glow-amber {
+    --glow-color: var(--color-amber-dim);
+  }
+  .glow-rose {
+    --glow-color: var(--color-rose-dim);
+  }
+
+  /* Scrollbar */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: var(--color-deep);
+    border-radius: 3px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: var(--color-border);
+    border-radius: 3px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: var(--color-border-bright);
   }
 }

@@ -1,4 +1,5 @@
 import type { PlanningMessage } from '../../api'
+import { formatLocalTime } from '../../utils/time'
 
 interface ChatMessageProps {
   message: PlanningMessage
@@ -113,7 +114,7 @@ export default function ChatMessage({ message, isStreaming = false }: ChatMessag
         {/* Timestamp */}
         {message.timestamp && (
           <div className={`text-xs mt-2 ${isUser ? 'text-primary-200' : 'text-gray-500'}`}>
-            {new Date(message.timestamp).toLocaleTimeString()}
+            {formatLocalTime(message.timestamp)}
           </div>
         )}
       </div>

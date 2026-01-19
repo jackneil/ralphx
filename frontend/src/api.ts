@@ -317,14 +317,17 @@ export async function createItem(
     content: string
     workflow_id: string
     source_step_id: number
+    title?: string
     category?: string
     priority?: number
+    dependencies?: string[]
     metadata?: Record<string, unknown>
   }
 ) {
   return request<{
     id: string
     content: string
+    title?: string
     status: string
     created_at: string
   }>(`/projects/${slug}/items`, {
@@ -338,20 +341,50 @@ export async function updateItem(
   itemId: string,
   data: {
     content?: string
+    title?: string
     status?: string
     category?: string
     priority?: number
+    dependencies?: string[]
     metadata?: Record<string, unknown>
   }
 ) {
   return request<{
     id: string
     content: string
+    title?: string
     status: string
     updated_at: string
   }>(`/projects/${slug}/items/${itemId}`, {
     method: 'PATCH',
     body: JSON.stringify(data),
+  })
+}
+
+export async function duplicateItem(
+  slug: string,
+  itemId: string,
+  overrides?: {
+    title?: string
+    content?: string
+    category?: string
+    priority?: number
+    dependencies?: string[]
+  }
+) {
+  // Fetch the original item
+  const original = await getItem(slug, itemId)
+
+  // Create a new item with original data + overrides
+  return createItem(slug, {
+    workflow_id: original.workflow_id,
+    source_step_id: original.source_step_id,
+    title: overrides?.title ?? (original.title ? `${original.title} (copy)` : undefined),
+    content: overrides?.content ?? original.content,
+    category: overrides?.category ?? original.category,
+    priority: overrides?.priority ?? original.priority,
+    dependencies: overrides?.dependencies ?? original.dependencies,
+    metadata: original.metadata,
   })
 }
 
@@ -1257,6 +1290,18 @@ export async function deleteLoopResource(
 // Workflows API
 // ============================================================================
 
+// Item status breakdown for workflow steps
+export interface ItemStatusBreakdown {
+  total: number
+  pending: number
+  in_progress: number
+  completed: number
+  skipped: number
+  failed: number
+  duplicate: number
+  rejected: number
+}
+
 export interface WorkflowStep {
   id: number
   workflow_id: string
@@ -1275,11 +1320,25 @@ export interface WorkflowStep {
     skippable?: boolean
     skipCondition?: string
     architecture_first?: boolean
+    // Loop limits (autonomous steps only)
+    max_iterations?: number
+    cooldown_between_iterations?: number
+    max_consecutive_errors?: number
   }
   loop_name?: string
   artifacts?: Record<string, unknown>
   started_at?: string
   completed_at?: string
+  archived_at?: string | null  // NULL = active, non-NULL = archived (soft delete)
+  has_active_run?: boolean  // True if there's a run in 'running' status
+  // Progress tracking
+  iterations_completed?: number  // Total iterations completed across all runs
+  iterations_target?: number | null  // Target iterations (from config), null = unlimited
+  current_run_iterations?: number  // Iterations in current/latest run
+  items_generated?: number  // Total items generated (e.g., user stories)
+  has_guardrails?: boolean  // Whether this step has guardrails configured
+  // Input items breakdown (for consumer steps)
+  input_items?: ItemStatusBreakdown  // Status breakdown of items from source step
 }
 
 export interface Workflow {
@@ -1291,7 +1350,11 @@ export interface Workflow {
   current_step: number
   created_at: string
   updated_at: string
+  archived_at?: string | null  // NULL = active, non-NULL = archived timestamp
   steps: WorkflowStep[]
+  // Resource indicators
+  has_design_doc?: boolean  // Whether workflow has a design document
+  guardrails_count?: number  // Number of guardrails attached
 }
 
 export interface WorkflowTemplateStep {
@@ -1322,9 +1385,20 @@ export async function getWorkflowTemplate(slug: string, templateId: string): Pro
   return request<WorkflowTemplate>(`/projects/${slug}/workflow-templates/${templateId}`)
 }
 
-export async function listWorkflows(slug: string, status?: string): Promise<Workflow[]> {
-  const params = status ? `?status_filter=${status}` : ''
-  return request<Workflow[]>(`/projects/${slug}/workflows${params}`)
+export async function listWorkflows(
+  slug: string,
+  options?: {
+    status?: string
+    include_archived?: boolean
+    archived_only?: boolean
+  }
+): Promise<Workflow[]> {
+  const searchParams = new URLSearchParams()
+  if (options?.status) searchParams.set('status_filter', options.status)
+  if (options?.include_archived) searchParams.set('include_archived', 'true')
+  if (options?.archived_only) searchParams.set('archived_only', 'true')
+  const query = searchParams.toString()
+  return request<Workflow[]>(`/projects/${slug}/workflows${query ? `?${query}` : ''}`)
 }
 
 export async function getWorkflow(slug: string, workflowId: string): Promise<Workflow> {
@@ -1358,6 +1432,18 @@ export async function deleteWorkflow(slug: string, workflowId: string): Promise<
   })
 }
 
+export async function archiveWorkflow(slug: string, workflowId: string): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows/${workflowId}/archive`, {
+    method: 'POST',
+  })
+}
+
+export async function restoreWorkflow(slug: string, workflowId: string): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows/${workflowId}/restore`, {
+    method: 'POST',
+  })
+}
+
 export async function startWorkflow(slug: string, workflowId: string): Promise<Workflow> {
   return request<Workflow>(`/projects/${slug}/workflows/${workflowId}/start`, {
     method: 'POST',
@@ -1368,6 +1454,25 @@ export async function pauseWorkflow(slug: string, workflowId: string): Promise<W
   return request<Workflow>(`/projects/${slug}/workflows/${workflowId}/pause`, {
     method: 'POST',
   })
+}
+
+export async function stopWorkflow(slug: string, workflowId: string): Promise<Workflow> {
+  return request<Workflow>(`/projects/${slug}/workflows/${workflowId}/stop`, {
+    method: 'POST',
+  })
+}
+
+export async function runSpecificStep(
+  slug: string,
+  workflowId: string,
+  stepNumber: number
+): Promise<Workflow> {
+  return request<Workflow>(
+    `/projects/${slug}/workflows/${workflowId}/run-specific-step/${stepNumber}`,
+    {
+      method: 'POST',
+    }
+  )
 }
 
 export async function advanceWorkflowStep(
@@ -1394,6 +1499,10 @@ export async function createWorkflowStep(
     model?: 'sonnet' | 'opus' | 'haiku'
     timeout?: number
     allowed_tools?: string[]
+    // Loop limits (autonomous steps only)
+    max_iterations?: number
+    cooldown_between_iterations?: number
+    max_consecutive_errors?: number
   }
 ): Promise<WorkflowStep> {
   return request<WorkflowStep>(`/projects/${slug}/workflows/${workflowId}/steps`, {
@@ -1415,12 +1524,47 @@ export async function updateWorkflowStep(
     model?: 'sonnet' | 'opus' | 'haiku'
     timeout?: number
     allowed_tools?: string[]
+    // Loop limits (autonomous steps only)
+    max_iterations?: number
+    cooldown_between_iterations?: number
+    max_consecutive_errors?: number
   }
 ): Promise<WorkflowStep> {
   return request<WorkflowStep>(`/projects/${slug}/workflows/${workflowId}/steps/${stepId}`, {
     method: 'PATCH',
     body: JSON.stringify(data),
   })
+}
+
+export async function archiveWorkflowStep(
+  slug: string,
+  workflowId: string,
+  stepId: number
+): Promise<WorkflowStep> {
+  return request<WorkflowStep>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/archive`,
+    { method: 'POST' }
+  )
+}
+
+export async function restoreWorkflowStep(
+  slug: string,
+  workflowId: string,
+  stepId: number
+): Promise<WorkflowStep> {
+  return request<WorkflowStep>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/restore`,
+    { method: 'POST' }
+  )
+}
+
+export async function listArchivedSteps(
+  slug: string,
+  workflowId: string
+): Promise<WorkflowStep[]> {
+  return request<WorkflowStep[]>(
+    `/projects/${slug}/workflows/${workflowId}/steps/archived`
+  )
 }
 
 export async function deleteWorkflowStep(
@@ -1589,6 +1733,7 @@ export async function updateWorkflowResource(
     name?: string
     content?: string
     enabled?: boolean
+    expected_updated_at?: string  // For optimistic locking
   }
 ): Promise<WorkflowResource> {
   return request<WorkflowResource>(
@@ -1608,6 +1753,53 @@ export async function deleteWorkflowResource(
   return request<void>(
     `/projects/${slug}/workflows/${workflowId}/resources/${resourceId}`,
     { method: 'DELETE' }
+  )
+}
+
+// ============================================================================
+// Resource Versioning API
+// ============================================================================
+
+export interface ResourceVersion {
+  id: number
+  workflow_resource_id: number
+  version_number: number
+  content?: string
+  name?: string
+  created_at: string
+}
+
+export interface VersionListResponse {
+  versions: ResourceVersion[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export async function listResourceVersions(
+  slug: string,
+  workflowId: string,
+  resourceId: number,
+  params?: { limit?: number; offset?: number }
+): Promise<VersionListResponse> {
+  const searchParams = new URLSearchParams()
+  if (params?.limit) searchParams.set('limit', params.limit.toString())
+  if (params?.offset) searchParams.set('offset', params.offset.toString())
+  const query = searchParams.toString()
+  return request<VersionListResponse>(
+    `/projects/${slug}/workflows/${workflowId}/resources/${resourceId}/versions${query ? `?${query}` : ''}`
+  )
+}
+
+export async function restoreResourceVersion(
+  slug: string,
+  workflowId: string,
+  resourceId: number,
+  versionId: number
+): Promise<WorkflowResource> {
+  return request<WorkflowResource>(
+    `/projects/${slug}/workflows/${workflowId}/resources/${resourceId}/versions/${versionId}/restore`,
+    { method: 'POST' }
   )
 }
 
@@ -1859,6 +2051,36 @@ export async function deleteProjectResource(
 }
 
 // ============================================================================
+// Project Settings API
+// ============================================================================
+
+export interface ProjectSettings {
+  id: number
+  auto_inherit_guardrails: boolean
+  require_design_doc: boolean
+  architecture_first_mode: boolean
+  updated_at: string | null
+}
+
+export async function getProjectSettings(slug: string): Promise<ProjectSettings> {
+  return request<ProjectSettings>(`/projects/${slug}/settings`)
+}
+
+export async function updateProjectSettings(
+  slug: string,
+  data: {
+    auto_inherit_guardrails?: boolean
+    require_design_doc?: boolean
+    architecture_first_mode?: boolean
+  }
+): Promise<ProjectSettings> {
+  return request<ProjectSettings>(`/projects/${slug}/settings`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  })
+}
+
+// ============================================================================
 // JSONL Import API
 // ============================================================================
 
@@ -1914,6 +2136,49 @@ export async function importJsonlToWorkflow(
   }
 
   return response.json()
+}
+
+// ============================================================================
+// Status Display Helpers
+// ============================================================================
+
+/**
+ * Get user-friendly display name for work item status.
+ * Internal status values are preserved for backend compatibility.
+ */
+export function getStatusDisplayName(status: string): string {
+  const names: Record<string, string> = {
+    pending: 'Queued',
+    completed: 'Ready',
+    claimed: 'In Progress',
+    in_progress: 'In Progress',
+    processed: 'Done',
+    failed: 'Failed',
+    skipped: 'Skipped',
+    duplicate: 'Duplicate',
+    external: 'External',
+    rejected: 'Rejected',
+  }
+  return names[status] || status.charAt(0).toUpperCase() + status.slice(1)
+}
+
+/**
+ * Get Tailwind CSS classes for status badge styling.
+ */
+export function getStatusColor(status: string): string {
+  const colors: Record<string, string> = {
+    pending: 'bg-blue-500/20 text-blue-400',       // Queued - blue
+    completed: 'bg-cyan-500/20 text-cyan-400',     // Ready - cyan
+    claimed: 'bg-yellow-500/20 text-yellow-400',   // In Progress - yellow
+    in_progress: 'bg-yellow-500/20 text-yellow-400',
+    processed: 'bg-green-500/20 text-green-400',   // Done - green
+    failed: 'bg-red-500/20 text-red-400',
+    skipped: 'bg-gray-500/20 text-gray-400',
+    duplicate: 'bg-orange-500/20 text-orange-400',
+    external: 'bg-purple-500/20 text-purple-400',
+    rejected: 'bg-red-500/20 text-red-400',
+  }
+  return colors[status] || 'bg-gray-500/20 text-gray-400'
 }
 
 export { APIError }

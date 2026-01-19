@@ -5,12 +5,14 @@ import ProjectWorkflowDashboard from './pages/ProjectWorkflowDashboard'
 import LoopDetail from './pages/LoopDetail'
 import WorkflowItems from './pages/WorkflowItems'
 import WorkflowResources from './pages/WorkflowResources'
+import WorkflowEdit from './pages/WorkflowEdit'
 import ProjectSettings from './pages/ProjectSettings'
 import RunHistory from './pages/RunHistory'
 import Settings from './pages/Settings'
 import Logs from './pages/Logs'
 import WorkflowDetail from './pages/WorkflowDetail'
 import ProjectDashboard from './pages/ProjectDashboard'
+import Wiki from './pages/Wiki'
 
 function App() {
   return (
@@ -32,10 +34,12 @@ function App() {
         {/* Workflow pages */}
         <Route path="projects/:slug/workflows" element={<Navigate to=".." replace />} />
         <Route path="projects/:slug/workflows/:workflowId" element={<WorkflowDetail />} />
+        <Route path="projects/:slug/workflows/:workflowId/edit" element={<WorkflowEdit />} />
         <Route path="projects/:slug/workflows/:workflowId/items" element={<WorkflowItems />} />
         <Route path="projects/:slug/workflows/:workflowId/resources" element={<WorkflowResources />} />
         <Route path="projects/:slug/workflows/:workflowId/runs" element={<RunHistory />} />
         {/* Global pages */}
+        <Route path="wiki" element={<Wiki />} />
         <Route path="logs" element={<Logs />} />
         <Route path="settings" element={<Settings />} />
       </Route>

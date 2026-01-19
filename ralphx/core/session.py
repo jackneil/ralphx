@@ -388,8 +388,10 @@ class SessionTailer:
             )
 
         # Assistant message with content array
-        if msg_type == "assistant" and "content" in data:
-            content = data["content"]
+        # Claude Code session format: content is at data["message"]["content"]
+        if msg_type == "assistant":
+            message = data.get("message", {})
+            content = message.get("content") if message else data.get("content")
             if isinstance(content, list):
                 for block in content:
                     if block.get("type") == "text":

@@ -264,18 +264,29 @@ class WorkflowExecutor:
 
         step_config = step.get("config", {})
 
+        # Extract loop limits from step config
+        max_iterations = step_config.get("max_iterations")
+        cooldown = step_config.get("cooldown_between_iterations")
+        max_errors = step_config.get("max_consecutive_errors")
+
         # Generate YAML config based on loop type
         if loop_type == "generator":
             config_yaml = generate_simple_planning_config(
                 name=loop_name,
                 display_name=step.get("name", "Story Generation"),
                 description=step_config.get("description", ""),
+                max_iterations=max_iterations,
+                cooldown_between_iterations=cooldown,
+                max_consecutive_errors=max_errors,
             )
         else:
             config_yaml = generate_simple_implementation_config(
                 name=loop_name,
                 display_name=step.get("name", "Implementation"),
                 description=step_config.get("description", ""),
+                max_iterations=max_iterations,
+                cooldown_between_iterations=cooldown,
+                max_consecutive_errors=max_errors,
             )
 
         # Save to database

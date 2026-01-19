@@ -2,9 +2,10 @@
 
 import asyncio
 import re
+from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
 from ralphx.core.executor import ExecutorEvent, ExecutorEventData, LoopExecutor
@@ -440,7 +441,7 @@ async def stop_loop(slug: str, loop_name: str):
             detail=f"Loop {loop_name} is not running",
         )
 
-    executor.stop()
+    await executor.stop()
 
     return {"message": f"Stop signal sent to {loop_name}"}
 
@@ -1275,7 +1276,9 @@ class PhaseInfoResponse(BaseModel):
     """Response with phase and category information for a consumer loop."""
 
     loop_name: str
-    namespace: Optional[str] = None  # Source namespace for items
+    workflow_id: Optional[str] = None  # Workflow context
+    source_step_id: Optional[int] = None  # Step to consume items from
+    namespace: Optional[str] = None  # Deprecated: Source namespace for items
     source_loop: Optional[str] = None  # Backward compatibility
     total_items: int
     phases: list[PhaseInfo]
@@ -1319,16 +1322,18 @@ async def get_loop_phases(slug: str, loop_name: str):
             detail=f"Loop not found: {loop_name}",
         )
 
-    # Check if this is a consumer loop
-    # source_loop in config refers to the loop name, which is used as namespace
-    namespace = None
-    if config.item_types and config.item_types.input:
-        namespace = config.item_types.input.source
+    # Get loop's DB record to find workflow context
+    loop_record = project_db.get_loop(loop_name)
+    workflow_id = loop_record.get("workflow_id") if loop_record else None
+    step_id = loop_record.get("step_id") if loop_record else None
 
-    if not namespace:
-        # Not a consumer loop - return empty phase info
+    # Check if this is a consumer loop with workflow context
+    if not workflow_id or step_id is None or config.type != LoopType.CONSUMER:
+        # Not a consumer loop or missing workflow context - return empty phase info
         return PhaseInfoResponse(
             loop_name=loop_name,
+            workflow_id=workflow_id,
+            source_step_id=None,
             namespace=None,
             source_loop=None,  # Backward compatibility
             total_items=0,
@@ -1339,17 +1344,35 @@ async def get_loop_phases(slug: str, loop_name: str):
             graph_stats={},
         )
 
-    # Get all items from namespace
+    # For consumer loops, determine which step to consume items from
+    # By default, consume from the previous step in the workflow
+    consume_from_step_id = None
+    current_step = project_db.get_workflow_step(step_id)
+    step_number = current_step["step_number"] if current_step else 1
+
+    if step_number > 1:
+        # Get the previous step
+        prev_step = project_db.get_workflow_step_by_number(workflow_id, step_number - 1)
+        if prev_step:
+            consume_from_step_id = prev_step["id"]
+    else:
+        # Single-step consumer: consume from own step ID (for imported items)
+        consume_from_step_id = step_id
+
+    # Get all items from the source step
     items, total = project_db.list_work_items(
-        namespace=namespace,
+        workflow_id=workflow_id,
+        source_step_id=consume_from_step_id,
         limit=10000,
     )
 
     if not items:
         return PhaseInfoResponse(
             loop_name=loop_name,
-            namespace=namespace,
-            source_loop=namespace,  # Backward compatibility
+            workflow_id=workflow_id,
+            source_step_id=consume_from_step_id,
+            namespace=None,
+            source_loop=None,  # Backward compatibility
             total_items=0,
             phases=[],
             categories=[],
@@ -1426,8 +1449,10 @@ async def get_loop_phases(slug: str, loop_name: str):
 
     return PhaseInfoResponse(
         loop_name=loop_name,
-        namespace=namespace,
-        source_loop=namespace,  # Backward compatibility
+        workflow_id=workflow_id,
+        source_step_id=consume_from_step_id,
+        namespace=None,
+        source_loop=None,  # Backward compatibility
         total_items=total,
         phases=phases,
         categories=categories,
@@ -2636,3 +2661,73 @@ async def get_permission_template(template_id: str):
         description=template["description"],
         settings=template["settings"],
     )
+
+
+@router.post("/{slug}/cleanup-stale-runs")
+async def cleanup_stale_runs_endpoint(
+    slug: str,
+    max_inactivity_minutes: int = Query(15, ge=1, le=120),
+    dry_run: bool = Query(False),
+):
+    """Clean up stale runs for a project.
+
+    A run is considered stale if:
+    - Status is RUNNING or PAUSED
+    - AND one of:
+      - executor_pid is set and process is not running (definitive stale)
+      - last_activity_at is older than max_inactivity_minutes and PID not running
+      - last_activity_at is older than 2x max_inactivity_minutes even if PID appears
+        running (handles PID reuse by OS)
+      - No executor_pid/activity tracking and started > 1 hour ago (legacy runs)
+
+    Args:
+        slug: Project slug.
+        max_inactivity_minutes: Max minutes without activity before considering stale.
+            Default is 15. The 2x threshold for PID reuse detection means runs
+            with an apparently-running PID won't be marked stale until activity
+            is 2x this value old.
+        dry_run: If True, don't actually update, just report what would be cleaned.
+
+    Returns:
+        Dictionary with:
+        - cleaned: Number of runs cleaned (or would be cleaned if dry_run)
+        - dry_run: Whether this was a dry run
+        - runs: List of stale run details
+        - errors: List of any errors during cleanup (if not dry_run)
+    """
+    manager = ProjectManager()
+    project = manager.get_project(slug)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {slug}",
+        )
+
+    project_db = ProjectDatabase(project.path)
+
+    from ralphx.core.doctor import detect_stale_runs
+
+    stale = detect_stale_runs(project_db, max_inactivity_minutes)
+    errors = []
+
+    if not dry_run:
+        for run in stale:
+            try:
+                project_db.update_run(
+                    run["run_id"],
+                    status="aborted",
+                    completed_at=datetime.utcnow().isoformat(),
+                    error_message=f"Marked stale: {run['reason']}",
+                )
+            except Exception as e:
+                errors.append({
+                    "run_id": run["run_id"],
+                    "error": str(e),
+                })
+
+    return {
+        "cleaned": len(stale) - len(errors),
+        "dry_run": dry_run,
+        "runs": stale,
+        "errors": errors if errors else None,
+    }

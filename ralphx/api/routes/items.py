@@ -17,10 +17,12 @@ class ItemCreate(BaseModel):
     """Request model for creating a work item."""
 
     content: str = Field(..., min_length=1, description="Item content/description")
+    title: Optional[str] = Field(None, description="Item title")
     workflow_id: str = Field(..., min_length=1, description="Parent workflow ID")
     source_step_id: int = Field(..., description="Workflow step that created this item")
     category: Optional[str] = Field(None, description="Category name")
     priority: int = Field(0, ge=0, le=10, description="Priority (0-10)")
+    dependencies: Optional[list[str]] = Field(None, description="List of item IDs this depends on")
     metadata: Optional[dict] = Field(None, description="Additional metadata")
 
 
@@ -28,9 +30,11 @@ class ItemUpdate(BaseModel):
     """Request model for updating a work item."""
 
     content: Optional[str] = Field(None, description="Item content/description")
+    title: Optional[str] = Field(None, description="Item title")
     status: Optional[str] = Field(None, description="Status (pending, in_progress, completed, rejected)")
     category: Optional[str] = Field(None, description="Category name")
     priority: Optional[int] = Field(None, ge=0, le=10, description="Priority (0-10)")
+    dependencies: Optional[list[str]] = Field(None, description="List of item IDs this depends on")
     metadata: Optional[dict] = Field(None, description="Additional metadata")
 
 
@@ -224,8 +228,10 @@ async def create_item(slug: str, data: ItemCreate):
         workflow_id=data.workflow_id,
         source_step_id=data.source_step_id,
         content=data.content,
+        title=data.title,
         category=data.category,
         priority=data.priority,
+        dependencies=data.dependencies,
         metadata=data.metadata,
     )
 
@@ -251,6 +257,8 @@ async def update_item(slug: str, item_id: str, data: ItemUpdate):
     updates = {}
     if data.content is not None:
         updates["content"] = data.content
+    if data.title is not None:
+        updates["title"] = data.title
     if data.status is not None:
         # Validate status
         try:
@@ -265,6 +273,8 @@ async def update_item(slug: str, item_id: str, data: ItemUpdate):
         updates["category"] = data.category
     if data.priority is not None:
         updates["priority"] = data.priority
+    if data.dependencies is not None:
+        updates["dependencies"] = data.dependencies
     if data.metadata is not None:
         updates["metadata"] = data.metadata
 

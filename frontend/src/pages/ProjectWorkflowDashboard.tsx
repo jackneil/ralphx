@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { getProject, listWorkflows, listLoops, getLoopStatus } from '../api'
+import Swal from 'sweetalert2'
+import { getProject, listWorkflows, listLoops, getLoopStatus, restoreWorkflow, deleteWorkflow } from '../api'
 import type { Workflow } from '../api'
 import { useDashboardStore, type Loop } from '../stores/dashboard'
 import WorkflowQuickStart from '../components/workflow/WorkflowQuickStart'
@@ -17,6 +18,7 @@ export default function ProjectWorkflowDashboard() {
 
   const [error, setError] = useState<string | null>(null)
   const [workflows, setWorkflows] = useState<Workflow[]>([])
+  const [archivedWorkflows, setArchivedWorkflows] = useState<Workflow[]>([])
   const [workflowsLoading, setWorkflowsLoading] = useState(true)
   const [hasLegacyLoops, setHasLegacyLoops] = useState(false)
   const [showCreateModal, setShowCreateModal] = useState(false)
@@ -25,10 +27,15 @@ export default function ProjectWorkflowDashboard() {
     if (!slug) return
     setWorkflowsLoading(true)
     try {
+      // Load active workflows (non-archived)
       const data = await listWorkflows(slug)
       setWorkflows(data)
+      // Load archived workflows separately
+      const archived = await listWorkflows(slug, { archived_only: true })
+      setArchivedWorkflows(archived)
     } catch {
       setWorkflows([])
+      setArchivedWorkflows([])
     } finally {
       setWorkflowsLoading(false)
     }
@@ -86,6 +93,70 @@ export default function ProjectWorkflowDashboard() {
     loadWorkflows()
     loadLoops()
   }, [slug, setSelectedProject, loadWorkflows, loadLoops])
+
+  const handleRestoreWorkflow = async (workflowId: string, workflowName: string) => {
+    if (!slug) return
+
+    const result = await Swal.fire({
+      title: 'Restore Workflow?',
+      text: `Restore "${workflowName}" from the archive?`,
+      icon: 'question',
+      showCancelButton: true,
+      confirmButtonColor: 'var(--color-primary)',
+      cancelButtonColor: 'var(--color-slate)',
+      confirmButtonText: 'Restore',
+      cancelButtonText: 'Cancel',
+      background: 'var(--color-surface)',
+      color: 'var(--color-text-primary)',
+    })
+
+    if (!result.isConfirmed) return
+
+    try {
+      await restoreWorkflow(slug, workflowId)
+      loadWorkflows()
+    } catch (err) {
+      Swal.fire({
+        title: 'Error',
+        text: err instanceof Error ? err.message : 'Failed to restore workflow',
+        icon: 'error',
+        background: 'var(--color-surface)',
+        color: 'var(--color-text-primary)',
+      })
+    }
+  }
+
+  const handlePermanentDelete = async (workflowId: string, workflowName: string) => {
+    if (!slug) return
+
+    const result = await Swal.fire({
+      title: 'Permanently Delete?',
+      html: `<p>This will permanently delete "<strong>${workflowName}</strong>" and all its data.</p><p class="mt-2 text-red-400">This action cannot be undone.</p>`,
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonColor: 'var(--color-rose)',
+      cancelButtonColor: 'var(--color-slate)',
+      confirmButtonText: 'Delete Forever',
+      cancelButtonText: 'Cancel',
+      background: 'var(--color-surface)',
+      color: 'var(--color-text-primary)',
+    })
+
+    if (!result.isConfirmed) return
+
+    try {
+      await deleteWorkflow(slug, workflowId)
+      loadWorkflows()
+    } catch (err) {
+      Swal.fire({
+        title: 'Error',
+        text: err instanceof Error ? err.message : 'Failed to delete workflow',
+        icon: 'error',
+        background: 'var(--color-surface)',
+        color: 'var(--color-text-primary)',
+      })
+    }
+  }
 
   if (error) {
     return (
@@ -230,6 +301,57 @@ export default function ProjectWorkflowDashboard() {
                   workflow={workflow}
                   projectSlug={slug!}
                 />
+              ))}
+            </div>
+          </details>
+        </div>
+      )}
+
+      {/* Archived Workflows */}
+      {archivedWorkflows.length > 0 && (
+        <div className="mb-8">
+          <details className="group">
+            <summary className="flex items-center justify-between cursor-pointer mb-4">
+              <h2 className="text-xl font-semibold text-gray-400">
+                <svg className="w-5 h-5 inline-block mr-2 -mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
+                </svg>
+                Archived
+                <span className="ml-2 text-sm font-normal">
+                  ({archivedWorkflows.length})
+                </span>
+              </h2>
+              <svg className="w-5 h-5 text-gray-400 group-open:rotate-180 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </summary>
+            <div className="space-y-2">
+              {archivedWorkflows.map((workflow) => (
+                <div
+                  key={workflow.id}
+                  className="flex items-center justify-between p-4 rounded-lg bg-gray-800/50 border border-gray-700/50"
+                >
+                  <div className="flex-1 min-w-0">
+                    <h3 className="text-sm font-medium text-gray-400 truncate">{workflow.name}</h3>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Archived {workflow.archived_at ? new Date(workflow.archived_at).toLocaleDateString() : ''}
+                    </p>
+                  </div>
+                  <div className="flex items-center space-x-2 ml-4">
+                    <button
+                      onClick={() => handleRestoreWorkflow(workflow.id, workflow.name)}
+                      className="px-3 py-1.5 text-xs font-medium text-primary-400 bg-primary-900/30 rounded hover:bg-primary-900/50 transition-colors"
+                    >
+                      Restore
+                    </button>
+                    <button
+                      onClick={() => handlePermanentDelete(workflow.id, workflow.name)}
+                      className="px-3 py-1.5 text-xs font-medium text-red-400 bg-red-900/30 rounded hover:bg-red-900/50 transition-colors"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
               ))}
             </div>
           </details>

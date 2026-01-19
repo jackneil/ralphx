@@ -31,6 +31,7 @@ import InputTemplateSelector from '../components/InputTemplateSelector'
 import LoopResourceManager from '../components/LoopResourceManager'
 import ReadyCheckModal from '../components/ReadyCheckModal'
 import { confirm as confirmDialog, toast } from '../lib/alerts'
+import { formatLocalDate } from '../utils/time'
 
 const TAG_LABELS: Record<string, string> = {
   master_design: 'Master Design',
@@ -517,7 +518,7 @@ export default function LoopDetail() {
                 <p className="text-sm text-gray-400 mb-2">
                   {readyCheckStatus.qa_count} clarification{readyCheckStatus.qa_count !== 1 ? 's' : ''} recorded
                   {readyCheckStatus.last_updated && (
-                    <> • Last updated {new Date(readyCheckStatus.last_updated).toLocaleDateString()}</>
+                    <> • Last updated {formatLocalDate(readyCheckStatus.last_updated)}</>
                   )}
                 </p>
                 {readyCheckStatus.qa_summary.length > 0 && (
