@@ -57,11 +57,26 @@ Each workflow step is a **Ralph loop** - the viral Claude Code looping pattern:
 
 ## Quick Start
 
-```bash
-pip install ralphx && claude mcp add ralphx -- ralphx mcp
+**Copy and paste this into Claude Code:**
+
+```
+Install RalphX for me. RalphX is a Ralph wrapper on PyPI that manages Ralph loops
+for product development. I'm not technical so please handle everything:
+
+1. Check if I have conda/miniconda installed. If not, install miniconda for my OS.
+2. Create a Python 3.11 environment called "ralphx" and activate it
+3. Install RalphX from PyPI: pip install ralphx
+4. Add RalphX as an MCP server so you can control it: claude mcp add ralphx -- ralphx mcp
+5. Start the RalphX dashboard: ralphx serve
+6. Ask me if I want a desktop shortcut to launch the dashboard. If yes, create
+   a shortcut for my OS that uses the full path to the Python executable in the
+   ralphx conda env (don't use conda activate - point directly to the python binary)
+
+Use the ask question tool if you need any info from me. Don't assume I know
+how to run commands - just do everything for me and tell me when it's ready.
 ```
 
-Then tell Claude:
+Claude will handle the entire installation. When done, tell Claude:
 
 > "Register this project and help me build a workflow from my idea for [describe your app]"
 
@@ -72,6 +87,14 @@ Or if you have a design doc:
 Open `http://localhost:16768` to monitor progress.
 
 ![Dashboard](docs/images/dashboard-overview.png)
+
+---
+
+**Already technical?** Here's the one-liner:
+
+```bash
+pip install ralphx && claude mcp add ralphx -- ralphx mcp
+```
 
 ---
 
@@ -160,19 +183,23 @@ Ask Claude: *"Set up a new-product workflow starting from my idea for a task man
 
 ## Manual Installation
 
+For those who prefer to do it themselves:
+
 ```bash
-# Create conda environment
+# If you don't have conda, install miniconda first:
+# https://docs.conda.io/en/latest/miniconda.html
+
+# Create environment and install
 conda create -n ralphx python=3.11 -y
 conda activate ralphx
-
-# Install RalphX
 pip install ralphx
 
-# Register your project
-ralphx add /path/to/your/project
+# Set up MCP so Claude can control RalphX
+claude mcp add ralphx -- ralphx mcp
 
 # Start the dashboard
 ralphx serve
+# Open http://localhost:16768
 ```
 
 ---
