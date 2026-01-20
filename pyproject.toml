@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ralphx"
-version = "0.2.1"
+version = "0.2.2"
 description = "Autonomous AI loop orchestration for Claude Code - define workflows in YAML, run autonomously, monitor in real-time"
 readme = "README.md"
 license = "MIT"

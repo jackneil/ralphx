@@ -1,6 +1,6 @@
 # RalphX
 
-![RalphX Demo](docs/images/ralphx-demo.gif)
+![RalphX Demo](https://raw.githubusercontent.com/jackneil/ralphx/main/docs/images/ralphx-demo.gif)
 
 **From idea to working, tested code. Autonomously.**
 
@@ -86,7 +86,7 @@ Or if you have a design doc:
 
 Open `http://localhost:16768` to monitor progress.
 
-![Dashboard](docs/images/dashboard-overview.png)
+![Dashboard](https://raw.githubusercontent.com/jackneil/ralphx/main/docs/images/dashboard-overview.png)
 
 ---
 
@@ -128,7 +128,7 @@ Each iteration of the implementation Ralph loop:
 
 ## The Dashboard
 
-![Workflow Timeline](docs/images/workflow-timeline.png)
+![Workflow Timeline](https://raw.githubusercontent.com/jackneil/ralphx/main/docs/images/workflow-timeline.png)
 
 **Monitor your Ralph loops in real-time:**
 - See which Ralph loop is running and iteration progress
