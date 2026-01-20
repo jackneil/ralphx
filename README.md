@@ -1,345 +1,231 @@
 # RalphX
 
-**Autonomous AI Loop Orchestration for Claude Code**
+![RalphX Demo](docs/images/ralphx-demo.gif)
+
+**From idea to working, tested code. Autonomously.**
+
+RalphX orchestrates Claude Code to run your entire product development lifecycle: research an idea, generate a design doc, write user stories, implement features, and test everything. Each step runs as a configurable loop with fresh context but memory of what's been completed.
 
 [![PyPI version](https://badge.fury.io/py/ralphx.svg)](https://badge.fury.io/py/ralphx)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-RalphX lets you define autonomous AI workflows in YAML and run them with Claude Code. Instead of manually prompting your AI assistant over and over, define a loop once and let it execute autonomously while you monitor progress in a real-time dashboard.
+---
+
+## The Full Lifecycle
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│    Idea      │ ─▶ │ Design Doc   │ ─▶ │ User Stories │ ─▶ │ Implement    │ ─▶ │    Test      │
+│              │    │ (+ research) │    │              │    │              │    │              │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+       │                   │                   │                   │                   │
+  "Build an app      Web search +         50-200 stories      Code for each       CLI, API, UI
+   that does X"      synthesis            with criteria        story               testing
+```
+
+**Start anywhere.** Bring your own design doc, or let RalphX research and create one. Jump straight to implementation if you already have stories.
 
 ---
 
-## Why RalphX?
+## How It Works
 
-**The Problem:** Running Claude Code manually for repetitive tasks is tedious. You find yourself copy-pasting prompts, tracking progress in your head, and losing context between sessions.
+Each workflow step runs as a **configurable loop**:
 
-**The Solution:** RalphX provides:
+1. **Fresh context** - Each iteration starts clean, no token bloat
+2. **Memory of progress** - Knows what's done, what's next
+3. **Recursive iterations** - Run until complete or hit limits
+4. **Real-time monitoring** - Watch progress in the dashboard
 
-- **Declarative Loops** - Define workflows in YAML, not code
-- **Autonomous Execution** - Let loops run while you focus on other work
-- **Real-time Monitoring** - Watch progress in a web dashboard with live logs
-- **Work Item Tracking** - Manage generated/consumed items with categories and phases
-- **Multiple Interfaces** - Web UI for visual users, MCP for Claude Code integration, CLI for automation
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Story Generation Loop (iteration 12 of 50)                     │
+│  ─────────────────────────────────────────────────────────────  │
+│  ✓ 47 stories generated                                         │
+│  ● Currently: Generating API authentication stories...          │
+│  ○ Remaining: Payment processing, notifications                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-### Use Cases
-
-- **Planning Loops** - Generate user stories from design docs
-- **Implementation Loops** - Build features phase by phase
-- **Research Loops** - Gather and synthesize information
-- **Review Loops** - Automated code review and feedback
-- **Content Pipelines** - Generate documentation or content at scale
+**Run your way:**
+- Run the entire workflow end-to-end until completion
+- Run individual steps/loops one at a time
+- Jump back and forth between steps as needed
+- Pause, resume, or restart anytime
 
 ---
 
 ## Quick Start
 
-RalphX is designed to work with Claude Code. Just ask Claude to set it up for you.
+```bash
+pip install ralphx && claude mcp add ralphx -- ralphx mcp
+```
 
-### Ask Claude Code (Recommended)
+Then tell Claude:
 
-Copy this prompt into Claude Code:
+> "Register this project and help me build a workflow from my idea for [describe your app]"
 
-> "Install RalphX using conda and register this project. Then show me how to create my first workflow."
+Or if you have a design doc:
 
-Claude will handle environment setup, installation, and project registration.
+> "Register this project and create a planning workflow from my README"
 
-### Manual Installation
+Open `http://localhost:16768` to monitor progress.
 
-If you prefer to install manually:
+![Dashboard](docs/images/dashboard-overview.png)
+
+---
+
+## What Each Step Does
+
+### Research & Design (optional)
+Start from an idea. Claude searches the web, synthesizes findings, and builds out a comprehensive design document.
+
+### Story Generation
+Feed in a design doc (yours or generated). Claude extracts user stories with:
+- Clear titles and descriptions
+- Acceptance criteria
+- Priority and categorization
+
+### Implementation
+Claude implements each story autonomously:
+- Reads the codebase for context
+- Writes code that fits your patterns
+- Creates tests alongside features
+
+### Testing (coming soon)
+Verify everything works:
+- **CLI testing** - Run commands, verify output
+- **Backend testing** - API endpoints, database operations
+- **UI testing** - Chrome/Playwright automation via Claude
+
+---
+
+## The Dashboard
+
+![Workflow Timeline](docs/images/workflow-timeline.png)
+
+**Monitor everything in real-time:**
+- See which step is running and iteration progress
+- Watch Claude's actual output as it works
+- View generated stories and implementations
+- Start, pause, or stop workflows anytime
+
+---
+
+## Workflow Templates
+
+Pre-built workflows for common patterns:
+
+| Template | Steps |
+|----------|-------|
+| **New Product** | Research → Design Doc → Stories → Implement → Test |
+| **From PRD** | Stories → Implement → Test |
+| **Feature Add** | Impact Analysis → Tasks → Implement → Test |
+| **Bug Fix** | Import Issues → Triage → Root Cause → Fix → Verify |
+| **Security Audit** | Scan → Prioritize → Remediate → Verify |
+
+Ask Claude: *"Set up a new-product workflow starting from my idea for a task management app"*
+
+---
+
+## Coming Soon
+
+**Testing Loops:**
+- CLI/backend testing as workflow steps
+- Chrome/Playwright UI testing via Claude
+- Recursive test-fix cycles until green
+
+**Integrations:**
+- GitHub Issues - Import bugs and features directly
+- Jira - Sync with existing project management
+- Sentry - Turn production errors into bugs
+- Slack - Notifications when workflows complete
+
+**Triggers:**
+- Scheduled workflows (cron-style)
+- Webhook triggers from CI/CD
+- Git push/PR triggers
+
+**Subscription Management:**
+- Auto-switch to backup subscription when usage limits hit
+
+**Mobile Access:**
+- Mobile-friendly dashboard for monitoring on the go
+- Remote access setup instructions in the wiki
+
+---
+
+## Manual Installation
 
 ```bash
-# Create conda environment (we use conda, not venv)
+# Create conda environment
 conda create -n ralphx python=3.11 -y
 conda activate ralphx
 
 # Install RalphX
 pip install ralphx
 
-# Register your project and start the dashboard
+# Register your project
 ralphx add /path/to/your/project
+
+# Start the dashboard
 ralphx serve
-# Open http://localhost:8765
-```
-
-### MCP Integration (Optional)
-
-Let Claude Code manage your loops through natural language:
-
-```bash
-# Add RalphX as an MCP server
-claude mcp add ralphx -- ralphx mcp
-
-# Now ask Claude: "List my RalphX projects" or "Start the planning loop"
 ```
 
 ---
 
-## Core Concepts
+## Per-Project Subscriptions
 
-| Concept | Description |
-|---------|-------------|
-| **Project** | A directory registered with RalphX, containing loops and work items |
-| **Loop** | A YAML config defining an autonomous workflow (prompts, modes, limits) |
-| **Work Item** | Generated/consumed data (stories, tasks, research notes, etc.) |
-| **Mode** | An execution strategy within a loop (e.g., research mode, implementation mode) |
-| **Iteration** | A single execution cycle of a loop |
+Configure different Claude subscriptions per project. Great for:
+- Separating personal vs work usage
+- Managing team billing
+- Tracking costs per project
 
 ---
 
-## Creating Your First Loop
+## Why RalphX?
 
-Create a file called `my_loop.yaml` in your project:
-
-```yaml
-name: research_loop
-display_name: "Research Loop"
-type: generator
-
-modes:
-  default:
-    timeout: 300
-    model: sonnet
-    tools: [WebSearch, Read, Write]
-    prompt_template: prompts/research.md
-
-mode_selection:
-  strategy: fixed
-  fixed_mode: default
-
-output:
-  format: jsonl
-  path: data/research_items.jsonl
-  schema:
-    required: [id, content, status]
-
-limits:
-  max_iterations: 10
-  max_consecutive_errors: 3
-```
-
-### Key Fields
-
-- **name** - Unique identifier for the loop
-- **type** - `generator` (creates items) or `consumer` (processes items)
-- **modes** - Different execution strategies with their own prompts and settings
-- **mode_selection** - How to pick which mode runs (fixed, rotating, or conditional)
-- **output** - Where generated items are stored
-- **limits** - Safety limits to prevent runaway execution
-
-Run it:
-
-```bash
-ralphx run my_loop.yaml --project my-project
-```
-
----
-
-## Web Dashboard
-
-Start the dashboard with `ralphx serve` and open http://localhost:8765.
-
-```
-+----------------------------------------------------------+
-|  RalphX Dashboard                              [Settings] |
-+----------------------------------------------------------+
-|                                                          |
-|  Projects          Loops              Work Items         |
-|  +--------------+  +----------------+ +----------------+ |
-|  | my-project   |  | research_loop  | | 12 items       | |
-|  | another-proj |  | planning_loop  | | Status: active | |
-|  +--------------+  +----------------+ +----------------+ |
-|                                                          |
-|  Live Session Logs                                       |
-|  +-----------------------------------------------------+ |
-|  | [14:23:01] Starting iteration 5...                  | |
-|  | [14:23:15] Generated item: user-story-042           | |
-|  | [14:23:18] Iteration complete. Items: 42            | |
-|  +-----------------------------------------------------+ |
-|                                                          |
-+----------------------------------------------------------+
-```
-
-**Features:**
-- Real-time loop monitoring with SSE streaming
-- Work item management (view, filter, edit)
-- Session logs with timestamps
-- Start/stop/pause loop controls
-- Configuration editing
-
----
-
-## MCP Integration (Claude Code)
-
-[MCP (Model Context Protocol)](https://modelcontextprotocol.io/) lets Claude Code use external tools. RalphX exposes its functionality through MCP, allowing Claude to manage your loops conversationally.
-
-### Setup
-
-```bash
-# Add RalphX as an MCP server
-claude mcp add ralphx -- ralphx mcp
-```
-
-### Available Tools
-
-Once connected, Claude Code has access to:
-
-| Tool | Description |
-|------|-------------|
-| `ralphx_list_projects` | List all registered projects |
-| `ralphx_get_project` | Get details about a specific project |
-| `ralphx_list_loops` | List loops in a project |
-| `ralphx_get_loop_status` | Check if a loop is running |
-| `ralphx_start_loop` | Start a loop execution |
-| `ralphx_stop_loop` | Stop a running loop |
-| `ralphx_list_items` | List work items |
-| `ralphx_add_item` | Add a new work item |
-| `ralphx_update_item` | Update an existing item |
-
-### Example Conversation
-
-```
-You: "What RalphX projects do I have?"
-Claude: "You have 2 projects registered: 'my-app' and 'docs-site'"
-
-You: "Start the planning loop on my-app"
-Claude: "Started the planning loop. It will generate user stories from your
-        design docs. I'll monitor progress - currently on iteration 1."
-
-You: "How many items has it generated?"
-Claude: "The loop has generated 8 user stories so far. Would you like me
-        to show you the latest ones?"
-```
+| Problem | RalphX Solution |
+|---------|-----------------|
+| Claude Code loses context on long tasks | Fresh context per iteration with memory of progress |
+| Manual prompting is tedious | Autonomous loops run while you do other work |
+| Hard to track what's done | Real-time dashboard shows exact progress |
+| Starting from scratch is overwhelming | Research step builds design docs from ideas |
+| No visibility into AI work | Watch Claude's actual output as it works |
+| Mixed billing across projects | Per-project subscription configuration |
 
 ---
 
 ## CLI Reference
 
-| Command | Description |
-|---------|-------------|
-| `ralphx add <path>` | Register a project directory |
-| `ralphx remove <name>` | Unregister a project |
-| `ralphx list` | List all registered projects |
-| `ralphx show <name>` | Show project details |
-| `ralphx sync` | Sync loops from project directories |
-| `ralphx loops` | List all loops across projects |
-| `ralphx validate <loop>` | Validate a loop configuration |
-| `ralphx run <loop>` | Run a loop |
-| `ralphx serve` | Start the web dashboard |
-| `ralphx mcp` | Start the MCP server |
-| `ralphx doctor` | Check system health |
-| `ralphx diagnose <loop>` | Debug a loop configuration |
-| `ralphx why <loop>` | Explain why a loop stopped |
-| `ralphx permissions` | Manage loop permissions |
-
-Use `ralphx <command> --help` for detailed options.
-
----
-
-## Loop Examples
-
-### Planning Loop
-
-Generate user stories from a design document:
-
-```yaml
-name: planning
-display_name: "Story Generator"
-type: generator
-
-modes:
-  generate:
-    timeout: 600
-    model: sonnet
-    prompt_template: prompts/generate_stories.md
-
-mode_selection:
-  strategy: fixed
-  fixed_mode: generate
-
-output:
-  format: jsonl
-  path: data/user_stories.jsonl
-  schema:
-    required: [id, title, description, acceptance_criteria]
-
-limits:
-  max_iterations: 20
-```
-
-### Implementation Loop
-
-Build features with phase awareness:
-
-```yaml
-name: implementation
-display_name: "Feature Builder"
-type: consumer
-
-input:
-  path: data/user_stories.jsonl
-  filter:
-    status: ready
-
-modes:
-  implement:
-    timeout: 900
-    model: sonnet
-    tools: [Read, Write, Bash]
-    prompt_template: prompts/implement.md
-
-mode_selection:
-  strategy: fixed
-  fixed_mode: implement
-
-limits:
-  max_iterations: 50
-  max_consecutive_errors: 5
+```bash
+ralphx add <path>           # Register a project
+ralphx serve                # Start dashboard
+ralphx doctor               # Check prerequisites
+ralphx why <workflow>       # Explain why something stopped
 ```
 
 ---
 
-## Architecture
+## MCP Tools (67 total)
 
-```
-+-----------------------------------------------+
-|         RalphX Dashboard (React)              |
-|  Loop Control | Work Items | Live Logs        |
-+-----------------------------------------------+
-                    | SSE
-                    v
-+-----------------------------------------------+
-|           RalphX API (FastAPI)                |
-|  /loops  |  /items  |  /stream  |  /config    |
-+-----------------------------------------------+
-                    |
-                    v
-+-----------------------------------------------+
-|           RalphX Core (Python)                |
-|  Loop Executor | LLM Adapters | Item Stores   |
-+-----------------------------------------------+
-                    |
-                    v
-+-----------------------------------------------+
-|              Claude Code CLI                  |
-|         (or other LLM backends)               |
-+-----------------------------------------------+
-```
+Claude gets full access to RalphX:
 
-**Components:**
-
-- **Dashboard** - React SPA with real-time updates via SSE
-- **API** - FastAPI server handling REST endpoints and streaming
-- **Core** - Python library with loop execution, adapters, and storage
-- **Adapters** - Pluggable LLM backends (Claude CLI, Anthropic API, etc.)
+| Category | What Claude Can Do |
+|----------|-------------------|
+| **Projects** | Register, list, configure projects |
+| **Workflows** | Create, start, stop, advance steps |
+| **Items** | Manage stories, tasks, bugs |
+| **Monitoring** | Check progress, view logs |
+| **Diagnostics** | Health checks, troubleshooting |
 
 ---
 
 ## Documentation
 
-- [Design Overview](design/DESIGN.md) - Full system design and architecture
-- [Loop Schema](design/LOOP_SCHEMA.md) - Complete YAML configuration reference
-- [API Specification](design/API_SPEC.md) - REST API documentation
+- [SDLC Workflows](design/SDLC_WORKFLOWS.md) - All workflow templates explained
+- [Design Overview](design/DESIGN.md) - Architecture deep dive
+- [Loop Schema](design/LOOP_SCHEMA.md) - Configuration reference
 
 ---
 
