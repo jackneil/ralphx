@@ -4,7 +4,7 @@
 
 **From idea to working, tested code. Autonomously.**
 
-RalphX orchestrates Claude Code to run your entire product development lifecycle: research an idea, generate a design doc, write user stories, implement features, and test everything. Each step runs as a configurable loop with fresh context but memory of what's been completed.
+RalphX is a **Ralph wrapper** for managing Ralph loops across your entire product development lifecycle. [Ralph](https://github.com/anthropics/claude-code) is the viral Claude Code looping pattern - RalphX orchestrates multiple Ralph loops together: research an idea, generate a design doc, write user stories, implement features, and test everything. Each Ralph loop runs with fresh context but memory of what's been completed.
 
 [![PyPI version](https://badge.fury.io/py/ralphx.svg)](https://badge.fury.io/py/ralphx)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -17,20 +17,20 @@ RalphX orchestrates Claude Code to run your entire product development lifecycle
 ```
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
 │    Idea      │ ─▶ │ Design Doc   │ ─▶ │ User Stories │ ─▶ │ Implement    │ ─▶ │    Test      │
-│              │    │ (+ research) │    │              │    │              │    │              │
+│              │    │ Ralph Loop   │    │ Ralph Loop   │    │ Ralph Loop   │    │ Ralph Loop   │
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
        │                   │                   │                   │                   │
   "Build an app      Web search +         50-200 stories      Code for each       CLI, API, UI
    that does X"      synthesis            with criteria        story               testing
 ```
 
-**Start anywhere.** Bring your own design doc, or let RalphX research and create one. Jump straight to implementation if you already have stories.
+**Start anywhere.** Bring your own design doc, or let a Ralph loop research and create one. Jump straight to implementation if you already have stories.
 
 ---
 
 ## How It Works
 
-Each workflow step runs as a **configurable loop**:
+Each workflow step is a **Ralph loop** - the viral Claude Code looping pattern:
 
 1. **Fresh context** - Each iteration starts clean, no token bloat
 2. **Memory of progress** - Knows what's done, what's next
@@ -39,7 +39,7 @@ Each workflow step runs as a **configurable loop**:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Story Generation Loop (iteration 12 of 50)                     │
+│  Story Generation Ralph Loop (iteration 12 of 50)               │
 │  ─────────────────────────────────────────────────────────────  │
 │  ✓ 47 stories generated                                         │
 │  ● Currently: Generating API authentication stories...          │
@@ -49,8 +49,8 @@ Each workflow step runs as a **configurable loop**:
 
 **Run your way:**
 - Run the entire workflow end-to-end until completion
-- Run individual steps/loops one at a time
-- Jump back and forth between steps as needed
+- Run individual Ralph loops one at a time
+- Jump back and forth between Ralph loops as needed
 - Pause, resume, or restart anytime
 
 ---
@@ -75,28 +75,31 @@ Open `http://localhost:16768` to monitor progress.
 
 ---
 
-## What Each Step Does
+## Supported Ralph Loop Types
 
-### Research & Design (optional)
+### Research & Design Ralph Loop
 Start from an idea. Claude searches the web, synthesizes findings, and builds out a comprehensive design document.
 
-### Story Generation
-Feed in a design doc (yours or generated). Claude extracts user stories with:
+### Story Generation Ralph Loop
+Claude extracts and generates robust user stories from your design document:
 - Clear titles and descriptions
 - Acceptance criteria
 - Priority and categorization
 
-### Implementation
-Claude implements each story autonomously:
-- Reads the codebase for context
-- Writes code that fits your patterns
-- Creates tests alongside features
+Optionally enable **web-enhanced mode**: Claude uses your design doc as inspiration, then searches the web to discover related requirements and user stories you may have missed.
 
-### Testing (coming soon)
-Verify everything works:
-- **CLI testing** - Run commands, verify output
-- **Backend testing** - API endpoints, database operations
-- **UI testing** - Chrome/Playwright automation via Claude
+### Implementation Ralph Loop
+Each iteration of the implementation Ralph loop:
+1. **Fresh context** - Starts clean with your design doc, guardrails, and progress summary
+2. **Knows what's done** - Sees all implemented stories with their git commits (can look back if needed)
+3. **Detects duplicates** - Checks if a story is already implemented, marks it dup, moves on
+4. **Implements ONE story** - Reads codebase, writes code that fits your patterns, adds tests
+5. **Commits** - Creates a git commit after each story, then loops to the next
+
+### Coming Soon: Testing Ralph Loops
+- **CLI Testing Ralph Loop** - Run commands, verify output, loop until tests pass
+- **Backend Testing Ralph Loop** - API endpoints, database operations
+- **UI Testing Ralph Loop** - Chrome/Playwright automation via Claude
 
 ---
 
@@ -104,20 +107,20 @@ Verify everything works:
 
 ![Workflow Timeline](docs/images/workflow-timeline.png)
 
-**Monitor everything in real-time:**
-- See which step is running and iteration progress
+**Monitor your Ralph loops in real-time:**
+- See which Ralph loop is running and iteration progress
 - Watch Claude's actual output as it works
 - View generated stories and implementations
-- Start, pause, or stop workflows anytime
+- Start, pause, or stop Ralph loops anytime
 
 ---
 
 ## Workflow Templates
 
-Pre-built workflows for common patterns:
+Pre-built workflows that chain Ralph loops together:
 
-| Template | Steps |
-|----------|-------|
+| Template | Ralph Loops |
+|----------|-------------|
 | **New Product** | Research → Design Doc → Stories → Implement → Test |
 | **From PRD** | Stories → Implement → Test |
 | **Feature Add** | Impact Analysis → Tasks → Implement → Test |
@@ -130,9 +133,9 @@ Ask Claude: *"Set up a new-product workflow starting from my idea for a task man
 
 ## Coming Soon
 
-**Testing Loops:**
-- CLI/backend testing as workflow steps
-- Chrome/Playwright UI testing via Claude
+**More Ralph Loop Types:**
+- CLI/backend testing Ralph loops
+- Chrome/Playwright UI testing Ralph loops
 - Recursive test-fix cycles until green
 
 **Integrations:**
@@ -187,10 +190,10 @@ Configure different Claude subscriptions per project. Great for:
 
 | Problem | RalphX Solution |
 |---------|-----------------|
+| Ralph loops are powerful but manual | RalphX chains Ralph loops into full workflows |
 | Claude Code loses context on long tasks | Fresh context per iteration with memory of progress |
-| Manual prompting is tedious | Autonomous loops run while you do other work |
 | Hard to track what's done | Real-time dashboard shows exact progress |
-| Starting from scratch is overwhelming | Research step builds design docs from ideas |
+| Starting from scratch is overwhelming | Research Ralph loop builds design docs from ideas |
 | No visibility into AI work | Watch Claude's actual output as it works |
 | Mixed billing across projects | Per-project subscription configuration |
 
