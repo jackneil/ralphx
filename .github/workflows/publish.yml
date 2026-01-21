@@ -42,7 +42,8 @@ jobs:
       - name: Verify package contents
         run: |
           python -m venv /tmp/verify-env
-          /tmp/verify-env/bin/pip install dist/*.whl
+          /tmp/verify-env/bin/pip install ${{ github.workspace }}/dist/*.whl
+          cd /tmp  # Run from /tmp to avoid importing local source
           /tmp/verify-env/bin/python -c "
           from pathlib import Path
           import ralphx
