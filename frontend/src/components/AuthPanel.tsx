@@ -200,11 +200,6 @@ export default function AuthPanel({ projectPath, validationResult, onLoginSucces
     return resetDate.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ` at ${timeStr}`
   }
 
-  const formatResetLabel = (isoString?: string): string => {
-    if (!isoString) return ''
-    return `Resets ${formatResetTime(isoString)}`
-  }
-
   if (loading) {
     return (
       <div className="bg-gray-800 rounded-lg p-6 animate-pulse">
