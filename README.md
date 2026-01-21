@@ -256,6 +256,7 @@ Claude gets full access to RalphX:
 - [SDLC Workflows](design/SDLC_WORKFLOWS.md) - All workflow templates explained
 - [Design Overview](design/DESIGN.md) - Architecture deep dive
 - [Loop Schema](design/LOOP_SCHEMA.md) - Configuration reference
+- [Backup & Import Guide](docs/BACKUP_AND_IMPORT.md) - Export workflows, import items
 
 ---
 

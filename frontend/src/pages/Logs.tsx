@@ -113,13 +113,13 @@ export default function Logs() {
       <div className="flex items-center space-x-2 text-sm text-gray-400 mb-2">
         <Link to="/" className="hover:text-white">Dashboard</Link>
         <span>/</span>
-        <span className="text-white">Activity Log</span>
+        <span className="text-white">Logs</span>
       </div>
 
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-3xl font-bold text-white mb-1">Activity Log</h1>
+          <h1 className="text-3xl font-bold text-white mb-1">Logs</h1>
           <p className="text-gray-400">
             {stats?.total ?? 0} total entries
             {stats?.recent_errors_24h ? (

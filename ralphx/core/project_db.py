@@ -4779,6 +4779,8 @@ class ProjectDatabase:
         workflow_id: str,
         step_id: int,
         messages: Optional[list] = None,
+        artifacts: Optional[dict] = None,
+        status: str = "active",
     ) -> dict:
         """Create a planning session for an interactive step.
 
@@ -4787,6 +4789,8 @@ class ProjectDatabase:
             workflow_id: Parent workflow ID.
             step_id: Parent step ID.
             messages: Initial messages (default: empty list).
+            artifacts: Optional artifacts dict.
+            status: Session status (default: 'active').
 
         Returns:
             The created session dict.
@@ -4794,11 +4798,12 @@ class ProjectDatabase:
         with self._writer() as conn:
             now = datetime.utcnow().isoformat()
             messages_json = json.dumps(messages or [])
+            artifacts_json = json.dumps(artifacts) if artifacts else None
             conn.execute(
                 """INSERT INTO planning_sessions
-                   (id, workflow_id, step_id, messages, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 'active', ?, ?)""",
-                (id, workflow_id, step_id, messages_json, now, now),
+                   (id, workflow_id, step_id, messages, artifacts, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (id, workflow_id, step_id, messages_json, artifacts_json, status, now, now),
             )
         return self.get_planning_session(id)
 
@@ -4852,6 +4857,49 @@ class ProjectDatabase:
                     result["artifacts"] = json.loads(result["artifacts"])
                 return result
             return None
+
+    def list_planning_sessions(
+        self,
+        workflow_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[dict]:
+        """List planning sessions with optional filtering.
+
+        Args:
+            workflow_id: Filter by workflow ID.
+            status: Filter by status ('active', 'completed').
+
+        Returns:
+            List of planning session dicts.
+        """
+        with self._reader() as conn:
+            conditions = []
+            params: list[Any] = []
+
+            if workflow_id:
+                conditions.append("workflow_id = ?")
+                params.append(workflow_id)
+            if status:
+                conditions.append("status = ?")
+                params.append(status)
+
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
+            cursor = conn.execute(
+                f"""SELECT * FROM planning_sessions
+                   WHERE {where_clause}
+                   ORDER BY created_at DESC""",
+                params,
+            )
+
+            results = []
+            for row in cursor.fetchall():
+                result = dict(row)
+                if result.get("messages"):
+                    result["messages"] = json.loads(result["messages"])
+                if result.get("artifacts"):
+                    result["artifacts"] = json.loads(result["artifacts"])
+                results.append(result)
+            return results
 
     def add_planning_message(
         self,

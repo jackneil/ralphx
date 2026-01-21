@@ -181,6 +181,62 @@ async def validate_credentials(
     }
 
 
+@router.get("/usage")
+async def get_usage(
+    project_path: Optional[str] = Query(
+        None, description="Project path for scoped credentials"
+    ),
+):
+    """Get Claude API usage statistics.
+
+    Returns 5-hour and 7-day utilization percentages.
+    """
+    import httpx
+
+    project_id = _get_project_id(project_path)
+    db = Database()
+    creds = db.get_credentials(project_id)
+
+    if not creds or not creds.get("access_token"):
+        return {
+            "success": False,
+            "error": "No credentials found",
+        }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.anthropic.com/api/oauth/usage",
+                headers={
+                    "Authorization": f"Bearer {creds['access_token']}",
+                    "anthropic-beta": "oauth-2025-04-20",
+                },
+                timeout=10.0,
+            )
+
+            if response.status_code != 200:
+                return {
+                    "success": False,
+                    "error": f"API error: {response.status_code}",
+                }
+
+            data = response.json()
+            five_hour = data.get("five_hour", {})
+            seven_day = data.get("seven_day", {})
+            return {
+                "success": True,
+                "five_hour_utilization": five_hour.get("utilization"),
+                "five_hour_resets_at": five_hour.get("resets_at"),
+                "seven_day_utilization": seven_day.get("utilization"),
+                "seven_day_resets_at": seven_day.get("resets_at"),
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
 @router.get("/credentials/export")
 async def export_credentials(
     scope: Literal["project", "global"] = Query("global"),

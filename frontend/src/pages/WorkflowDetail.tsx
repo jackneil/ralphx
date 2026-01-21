@@ -14,7 +14,7 @@ import type { Workflow, ImportJsonlResponse, WorkflowResource } from '../api'
 import WorkflowTimeline from '../components/workflow/WorkflowTimeline'
 import WorkflowStatusBar from '../components/workflow/WorkflowStatusBar'
 import WorkflowItemsTab from '../components/workflow/WorkflowItemsTab'
-import ImportJsonlModal from '../components/workflow/ImportJsonlModal'
+import ExportWorkflowModal from '../components/workflow/ExportWorkflowModal'
 
 export default function WorkflowDetail() {
   const { slug, workflowId } = useParams<{ slug: string; workflowId: string }>()
@@ -25,7 +25,7 @@ export default function WorkflowDetail() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [actionLoading, setActionLoading] = useState(false)
-  const [showImport, setShowImport] = useState(false)
+  const [showExport, setShowExport] = useState(false)
   const [importResult, setImportResult] = useState<ImportJsonlResponse | null>(null)
   const [activeTab, setActiveTab] = useState<'steps' | 'items'>('steps')
   const [itemsSourceStepId, setItemsSourceStepId] = useState<number | undefined>(undefined)
@@ -62,13 +62,13 @@ export default function WorkflowDetail() {
 
   const handleStartClick = async () => {
     const result = await Swal.fire({
-      title: 'Run Entire Workflow?',
-      text: 'This will begin executing the workflow from the current step.',
+      title: 'Run All Ralph Loops?',
+      text: 'This will begin executing all Ralph loops in the workflow from the current step.',
       icon: 'question',
       showCancelButton: true,
       confirmButtonColor: 'var(--color-primary)',
       cancelButtonColor: 'var(--color-slate)',
-      confirmButtonText: 'Run Full Workflow',
+      confirmButtonText: 'Run Full Workflow Ralph Loops',
       cancelButtonText: 'Cancel',
       background: 'var(--color-surface)',
       color: 'var(--color-text-primary)',
@@ -155,13 +155,13 @@ export default function WorkflowDetail() {
     const stepName = (workflow?.steps || []).find(s => s.step_number === stepNumber)?.name || `Step ${stepNumber}`
 
     const result = await Swal.fire({
-      title: 'Run Step?',
+      title: 'Run Ralph Loop?',
       text: `Start executing "${stepName}"?`,
       icon: 'question',
       showCancelButton: true,
       confirmButtonColor: 'var(--color-primary)',
       cancelButtonColor: 'var(--color-slate)',
-      confirmButtonText: 'Run Step',
+      confirmButtonText: 'Run Ralph Loop',
       cancelButtonText: 'Cancel',
       background: 'var(--color-surface)',
       color: 'var(--color-text-primary)',
@@ -302,7 +302,7 @@ export default function WorkflowDetail() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <span>Run Full Workflow</span>
+                <span>Run Full Workflow Ralph Loops</span>
               </button>
             )}
 
@@ -322,19 +322,17 @@ export default function WorkflowDetail() {
               </button>
             )}
 
-            {/* Import Button - only show in draft/paused state */}
-            {(workflow.status === 'draft' || workflow.status === 'paused') && (
-              <button
-                onClick={() => setShowImport(true)}
-                className="flex items-center space-x-2 px-4 py-2 bg-gray-700 text-gray-300 rounded hover:bg-gray-600 transition-colors"
-                title="Import work items from JSONL file"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3-3m0 0l3 3m-3-3v12" />
-                </svg>
-                <span>Import</span>
-              </button>
-            )}
+            {/* Export Workflow Button */}
+            <button
+              onClick={() => setShowExport(true)}
+              className="flex items-center space-x-2 px-4 py-2 bg-gray-700 text-gray-300 rounded hover:bg-gray-600 transition-colors"
+              title="Export workflow to shareable ZIP file"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              <span>Export Workflow</span>
+            </button>
 
             <button
               onClick={() => navigate(`/projects/${slug}/workflows/${workflowId}/edit`)}
@@ -419,6 +417,11 @@ export default function WorkflowDetail() {
             projectSlug={slug!}
             workflowId={workflowId!}
             sourceStepId={itemsSourceStepId}
+            steps={steps}
+            onImported={(result) => {
+              setImportResult(result)
+              loadWorkflow() // Refresh workflow data
+            }}
           />
         </div>
       )}
@@ -467,18 +470,13 @@ export default function WorkflowDetail() {
         </div>
       )}
 
-      {/* Import JSONL Modal */}
-      {showImport && (
-        <ImportJsonlModal
+      {/* Export Workflow Modal */}
+      {showExport && (
+        <ExportWorkflowModal
           projectSlug={slug!}
           workflowId={workflowId!}
-          steps={steps}
-          onClose={() => setShowImport(false)}
-          onImported={(result) => {
-            setImportResult(result)
-            setShowImport(false)
-            loadWorkflow() // Refresh to show new items
-          }}
+          workflowName={workflow.name}
+          onClose={() => setShowExport(false)}
         />
       )}
 

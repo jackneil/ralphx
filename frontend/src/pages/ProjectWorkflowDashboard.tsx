@@ -1,14 +1,16 @@
 import { useEffect, useState, useCallback } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useNavigate } from 'react-router-dom'
 import Swal from 'sweetalert2'
 import { getProject, listWorkflows, listLoops, getLoopStatus, restoreWorkflow, deleteWorkflow } from '../api'
-import type { Workflow } from '../api'
+import type { Workflow, ImportResult } from '../api'
 import { useDashboardStore, type Loop } from '../stores/dashboard'
 import WorkflowQuickStart from '../components/workflow/WorkflowQuickStart'
 import ActiveWorkflowCard from '../components/workflow/ActiveWorkflowCard'
+import ImportWorkflowModal from '../components/workflow/ImportWorkflowModal'
 
 export default function ProjectWorkflowDashboard() {
   const { slug } = useParams<{ slug: string }>()
+  const navigate = useNavigate()
   const {
     selectedProject,
     setSelectedProject,
@@ -22,6 +24,8 @@ export default function ProjectWorkflowDashboard() {
   const [workflowsLoading, setWorkflowsLoading] = useState(true)
   const [hasLegacyLoops, setHasLegacyLoops] = useState(false)
   const [showCreateModal, setShowCreateModal] = useState(false)
+  const [showImportModal, setShowImportModal] = useState(false)
+  const [importResult, setImportResult] = useState<ImportResult | null>(null)
 
   const loadWorkflows = useCallback(async () => {
     if (!slug) return
@@ -257,15 +261,27 @@ export default function ProjectWorkflowDashboard() {
         <div className="mb-8">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-semibold text-white">Active Workflows</h2>
-            <button
-              onClick={() => setShowCreateModal(true)}
-              className="flex items-center space-x-2 px-4 py-2 bg-primary-600 text-white rounded hover:bg-primary-500 text-sm"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-              </svg>
-              <span>New Workflow</span>
-            </button>
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={() => setShowImportModal(true)}
+                className="flex items-center space-x-2 px-4 py-2 bg-gray-700 text-gray-300 rounded hover:bg-gray-600 text-sm"
+                title="Import workflow from .ralphx.zip file"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                </svg>
+                <span>Import Workflow</span>
+              </button>
+              <button
+                onClick={() => setShowCreateModal(true)}
+                className="flex items-center space-x-2 px-4 py-2 bg-primary-600 text-white rounded hover:bg-primary-500 text-sm"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                </svg>
+                <span>New Workflow</span>
+              </button>
+            </div>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {activeWorkflows.map((workflow) => (
@@ -403,7 +419,7 @@ export default function ProjectWorkflowDashboard() {
         </Link>
 
         <Link
-          to={`/projects/${slug}/settings`}
+          to={`/projects/${slug}/settings?tab=resources`}
           className="p-4 rounded-lg bg-gray-800 border border-gray-700 hover:border-gray-600 transition-colors group"
         >
           <div className="flex items-center space-x-3">
@@ -415,7 +431,7 @@ export default function ProjectWorkflowDashboard() {
         </Link>
 
         <Link
-          to={`/projects/${slug}/settings`}
+          to={`/projects/${slug}/settings?tab=auth`}
           className="p-4 rounded-lg bg-gray-800 border border-gray-700 hover:border-gray-600 transition-colors group"
         >
           <div className="flex items-center space-x-3">
@@ -449,6 +465,51 @@ export default function ProjectWorkflowDashboard() {
                 loadWorkflows()
               }}
             />
+          </div>
+        </div>
+      )}
+
+      {/* Import Workflow Modal */}
+      {showImportModal && (
+        <ImportWorkflowModal
+          projectSlug={slug!}
+          onClose={() => setShowImportModal(false)}
+          onImported={(result) => {
+            setImportResult(result)
+            setShowImportModal(false)
+            loadWorkflows()
+            // Navigate to the imported workflow
+            navigate(`/projects/${slug}/workflows/${result.workflow_id}`)
+          }}
+        />
+      )}
+
+      {/* Import Success Banner */}
+      {importResult && (
+        <div className="fixed bottom-6 right-6 p-4 rounded-lg bg-green-900/90 border border-green-700 shadow-lg max-w-sm z-50">
+          <div className="flex items-start justify-between">
+            <div>
+              <h4 className="text-green-400 font-medium">Import Complete</h4>
+              <p className="text-sm text-gray-300 mt-1">
+                "{importResult.workflow_name}" imported successfully
+              </p>
+              <p className="text-xs text-gray-400 mt-1">
+                {importResult.steps_created} steps, {importResult.items_imported} items, {importResult.resources_created} resources
+              </p>
+              {importResult.warnings.length > 0 && (
+                <p className="text-sm text-yellow-400 mt-1">
+                  {importResult.warnings.length} warning(s)
+                </p>
+              )}
+            </div>
+            <button
+              onClick={() => setImportResult(null)}
+              className="text-gray-400 hover:text-white ml-4"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
           </div>
         </div>
       )}

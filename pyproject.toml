@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ralphx"
-version = "0.2.2"
+version = "0.3.0"
 description = "Autonomous AI loop orchestration for Claude Code - define workflows in YAML, run autonomously, monitor in real-time"
 readme = "README.md"
 license = "MIT"
@@ -67,8 +67,10 @@ Documentation = "https://github.com/jackneil/ralphx#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ralphx"]
-# Include static files (frontend build) in the wheel
-artifacts = ["ralphx/static/**"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"ralphx/static" = "ralphx/static"
+"ralphx/examples" = "ralphx/examples"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -76,6 +78,10 @@ include = [
     "/README.md",
     "/LICENSE",
 ]
+
+[tool.hatch.build.targets.sdist.force-include]
+"ralphx/static" = "ralphx/static"
+"ralphx/examples" = "ralphx/examples"
 
 [tool.ruff]
 line-length = 100

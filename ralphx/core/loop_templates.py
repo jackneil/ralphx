@@ -228,6 +228,72 @@ Return your findings as JSON:
 
 
 # ============================================================================
+# Web-Generated Requirements Prompt
+# ============================================================================
+
+WEBGEN_REQUIREMENTS_PROMPT = """# Web-Generated Requirements Discovery
+
+You are researching industry best practices to find requirements MISSING from the design document.
+
+## Design Document Summary
+{{design_doc_summary}}
+
+## Existing Stories (DO NOT DUPLICATE)
+Total: {{total_stories}}
+{{existing_stories}}
+
+## Category Statistics (for ID assignment)
+{{category_stats}}
+
+## Your Task
+
+1. **Identify the domain** from the design document (e.g., "e-commerce", "healthcare", "fintech")
+2. **Research** using WebSearch:
+   - "{domain} application best practices {{current_year}}"
+   - "{domain} security requirements"
+   - "{domain} compliance regulations"
+   - "common {domain} features users expect"
+3. **Find gaps** - requirements NOT in existing stories
+4. **Generate stories** for those gaps
+
+## Output Format
+
+```json
+{
+  "domain_identified": "e-commerce",
+  "searches_performed": ["e-commerce best practices 2026", "..."],
+  "gaps_found": [
+    {"gap": "No rate limiting", "source": "OWASP guidelines"},
+    {"gap": "Missing GDPR compliance", "source": "EU regulations"}
+  ],
+  "stories": [
+    {
+      "id": "SEC-045",
+      "title": "Implement rate limiting",
+      "content": "As a system administrator, I want rate limiting on API endpoints so that the system is protected from abuse.",
+      "acceptance_criteria": ["Rate limit of 100 req/min per user", "429 response when exceeded", "Configurable limits"],
+      "priority": 2,
+      "category": "SEC",
+      "complexity": "medium",
+      "source": "webgen_requirements",
+      "rationale": "OWASP recommends rate limiting for all public APIs"
+    }
+  ]
+}
+```
+
+## Rules
+
+1. Use standard CATEGORY-NNN IDs (check category_stats for next number)
+2. Add `"source": "webgen_requirements"` to each story's metadata
+3. Include `rationale` explaining WHY this requirement matters
+4. If web search returns nothing useful, return empty stories array with explanation
+5. DO NOT duplicate existing stories - check IDs and titles carefully
+6. Focus on GAPS - things genuinely missing, not rephrasing existing stories
+"""
+
+
+# ============================================================================
 # Implementation Loop Template
 # ============================================================================
 

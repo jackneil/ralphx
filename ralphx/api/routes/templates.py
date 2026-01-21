@@ -21,6 +21,8 @@ from ralphx.core.loop_templates import (
     create_loop_from_template,
     get_loop_template,
     list_loop_templates,
+    PLANNING_EXTRACT_PROMPT,
+    IMPLEMENTATION_IMPLEMENT_PROMPT,
 )
 from ralphx.core.permission_templates import (
     apply_template_to_loop,
@@ -407,3 +409,114 @@ async def apply_permission_template_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         )
+
+
+# ============================================================================
+# Step Prompts (System Prompts for Workflow Steps)
+# ============================================================================
+
+# Template variable documentation for each loop type
+TEMPLATE_VARIABLES = {
+    "generator": {
+        "{{input_item.title}}": {
+            "description": "Title of the current item (not commonly used in generator)",
+            "required": False,
+        },
+        "{{existing_stories}}": {
+            "description": "List of already-generated stories to avoid duplicates",
+            "required": True,
+        },
+        "{{total_stories}}": {
+            "description": "Count of stories generated so far",
+            "required": False,
+        },
+        "{{category_stats}}": {
+            "description": "Statistics by category for ID assignment",
+            "required": False,
+        },
+        "{{inputs_list}}": {
+            "description": "List of input documents available",
+            "required": False,
+        },
+    },
+    "consumer": {
+        "{{input_item.title}}": {
+            "description": "Title of the story being implemented",
+            "required": True,
+        },
+        "{{input_item.content}}": {
+            "description": "Full story content",
+            "required": True,
+        },
+        "{{input_item.metadata}}": {
+            "description": "Story metadata (priority, category, etc.)",
+            "required": False,
+        },
+        "{{implemented_summary}}": {
+            "description": "Summary of previously implemented stories",
+            "required": False,
+        },
+    },
+}
+
+
+class TemplateVariableInfo(BaseModel):
+    """Information about a template variable."""
+
+    name: str
+    description: str
+    required: bool
+
+
+class StepPromptResponse(BaseModel):
+    """Response for default step prompt endpoint."""
+
+    prompt: str
+    loop_type: str
+    display_name: str
+    variables: list[TemplateVariableInfo]
+
+
+@router.get("/step-prompts/{loop_type}", response_model=StepPromptResponse)
+async def get_default_step_prompt(loop_type: str):
+    """Get default system prompt for a step type.
+
+    Args:
+        loop_type: Either 'generator' or 'consumer'
+
+    Returns:
+        The default prompt content along with template variable documentation.
+    """
+    prompts = {
+        "generator": {
+            "prompt": PLANNING_EXTRACT_PROMPT,
+            "display_name": "Generator (Story Extraction)",
+        },
+        "consumer": {
+            "prompt": IMPLEMENTATION_IMPLEMENT_PROMPT,
+            "display_name": "Consumer (Implementation)",
+        },
+    }
+
+    if loop_type not in prompts:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown loop type: {loop_type}. Must be 'generator' or 'consumer'.",
+        )
+
+    prompt_info = prompts[loop_type]
+    variables = TEMPLATE_VARIABLES.get(loop_type, {})
+
+    return StepPromptResponse(
+        prompt=prompt_info["prompt"].strip(),
+        loop_type=loop_type,
+        display_name=prompt_info["display_name"],
+        variables=[
+            TemplateVariableInfo(
+                name=name,
+                description=info["description"],
+                required=info["required"],
+            )
+            for name, info in variables.items()
+        ],
+    )

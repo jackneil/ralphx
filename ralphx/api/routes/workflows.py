@@ -126,6 +126,7 @@ class CreateStepRequest(BaseModel):
     step_type: str = Field(..., pattern=r"^(interactive|autonomous)$")
     description: Optional[str] = None
     loop_type: Optional[str] = None
+    template: Optional[str] = Field(None, max_length=100)  # Template name (e.g., 'webgen_requirements')
     skippable: bool = False
     # Autonomous step execution settings (step config overrides template defaults)
     model: Optional[str] = Field(None, pattern=r"^(sonnet|sonnet-1m|opus|haiku)$")
@@ -135,6 +136,8 @@ class CreateStepRequest(BaseModel):
     max_iterations: Optional[int] = Field(None, ge=0, le=10000)  # 0 = unlimited
     cooldown_between_iterations: Optional[int] = Field(None, ge=0, le=300)  # seconds
     max_consecutive_errors: Optional[int] = Field(None, ge=1, le=100)
+    # Custom prompt (autonomous steps only)
+    custom_prompt: Optional[str] = Field(None, max_length=50000)
 
 
 class UpdateStepRequest(BaseModel):
@@ -147,6 +150,7 @@ class UpdateStepRequest(BaseModel):
     step_type: Optional[str] = Field(None, pattern=r"^(interactive|autonomous)$")
     description: Optional[str] = None
     loop_type: Optional[str] = None
+    template: Optional[str] = Field(None, max_length=100)  # Template name (e.g., 'webgen_requirements')
     skippable: Optional[bool] = None
     # Autonomous step execution settings (step config overrides template defaults)
     model: Optional[str] = Field(None, pattern=r"^(sonnet|sonnet-1m|opus|haiku)$")
@@ -156,6 +160,8 @@ class UpdateStepRequest(BaseModel):
     max_iterations: Optional[int] = Field(None, ge=0, le=10000)  # 0 = unlimited
     cooldown_between_iterations: Optional[int] = Field(None, ge=0, le=300)  # seconds
     max_consecutive_errors: Optional[int] = Field(None, ge=1, le=100)
+    # Custom prompt (autonomous steps only)
+    custom_prompt: Optional[str] = Field(None, max_length=50000)
 
 
 # Valid tools for autonomous steps
@@ -1068,9 +1074,12 @@ async def create_step(slug: str, workflow_id: str, request: CreateStepRequest):
             )
 
     # Build config - include autonomous settings only for autonomous steps
+    # Note: Strip template to normalize whitespace; empty/whitespace-only becomes None
+    stripped_template = request.template.strip() if request.template else None
     config: dict[str, Any] = {
         "description": request.description,
         "loopType": request.loop_type,
+        "template": stripped_template if stripped_template else None,
         "skippable": request.skippable,
     }
 
@@ -1172,6 +1181,10 @@ async def update_step(slug: str, workflow_id: str, step_id: int, request: Update
         config_updates["description"] = request.description
     if request.loop_type is not None:
         config_updates["loopType"] = request.loop_type
+    if request.template is not None:
+        # Empty string or whitespace-only means clear template, otherwise store stripped value
+        stripped_template = request.template.strip()
+        config_updates["template"] = stripped_template if stripped_template else None
     if request.skippable is not None:
         config_updates["skippable"] = request.skippable
 
@@ -1190,6 +1203,13 @@ async def update_step(slug: str, workflow_id: str, step_id: int, request: Update
             config_updates["cooldown_between_iterations"] = request.cooldown_between_iterations
         if request.max_consecutive_errors is not None:
             config_updates["max_consecutive_errors"] = request.max_consecutive_errors
+        # Custom prompt
+        if request.custom_prompt is not None:
+            # Empty string means clear custom prompt
+            if request.custom_prompt.strip():
+                config_updates["customPrompt"] = request.custom_prompt
+            else:
+                config_updates["customPrompt"] = None
     elif request.step_type == "interactive":
         # Changing from autonomous to interactive: clear autonomous-only config
         config_updates["model"] = None
@@ -1198,6 +1218,7 @@ async def update_step(slug: str, workflow_id: str, step_id: int, request: Update
         config_updates["max_iterations"] = None
         config_updates["cooldown_between_iterations"] = None
         config_updates["max_consecutive_errors"] = None
+        config_updates["customPrompt"] = None
 
     if config_updates:
         current_config = step.get("config") or {}

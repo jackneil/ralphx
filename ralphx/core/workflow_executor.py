@@ -305,7 +305,7 @@ class WorkflowExecutor:
         config_path.write_text(config_yaml)
 
         # Create prompt files (required by the loop config)
-        self._create_loop_prompt_files(loop_name, loop_type)
+        self._create_loop_prompt_files(loop_name, loop_type, step)
 
         # Load and return config
         loader = LoopLoader(db=self.db)
@@ -323,31 +323,61 @@ class WorkflowExecutor:
         loader = LoopLoader(db=self.db)
         return loader.get_loop(loop_record["name"])
 
-    def _create_loop_prompt_files(self, loop_name: str, loop_type: str) -> None:
+    # Maximum allowed size for custom prompts (50KB)
+    MAX_CUSTOM_PROMPT_LENGTH = 50000
+
+    def _create_loop_prompt_files(
+        self, loop_name: str, loop_type: str, step: dict
+    ) -> None:
         """Create prompt template files for an auto-generated loop.
 
         The simple config generators reference prompt files that don't exist.
-        This method creates those files with default content.
+        This method creates those files with default content, or uses a custom
+        prompt if specified in the step config.
 
         Args:
             loop_name: Name of the loop.
             loop_type: Type of loop (generator, consumer).
+            step: The step dict containing config (may include customPrompt or template).
         """
         from ralphx.core.loop_templates import (
             PLANNING_EXTRACT_PROMPT,
             IMPLEMENTATION_IMPLEMENT_PROMPT,
+            WEBGEN_REQUIREMENTS_PROMPT,
         )
 
         loop_dir = Path(self.project.path) / ".ralphx" / "loops" / loop_name
         prompts_dir = loop_dir / "prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
 
+        # Check for custom prompt in step config
+        step_config = step.get("config", {})
+        custom_prompt = step_config.get("customPrompt")
+
+        # Validate custom prompt size if provided
+        if custom_prompt:
+            if len(custom_prompt) > self.MAX_CUSTOM_PROMPT_LENGTH:
+                raise ValueError(
+                    f"Custom prompt exceeds maximum length of {self.MAX_CUSTOM_PROMPT_LENGTH} characters"
+                )
+            # Treat empty/whitespace-only as no custom prompt
+            if not custom_prompt.strip():
+                custom_prompt = None
+
+        # Determine prompt content and file based on template or loop_type
+        template = step_config.get("template")
+
         if loop_type == "generator":
             prompt_file = prompts_dir / "planning.md"
-            prompt_content = PLANNING_EXTRACT_PROMPT
+            if custom_prompt:
+                prompt_content = custom_prompt
+            elif template == "webgen_requirements":
+                prompt_content = WEBGEN_REQUIREMENTS_PROMPT
+            else:
+                prompt_content = PLANNING_EXTRACT_PROMPT
         else:
             prompt_file = prompts_dir / "implement.md"
-            prompt_content = IMPLEMENTATION_IMPLEMENT_PROMPT
+            prompt_content = custom_prompt or IMPLEMENTATION_IMPLEMENT_PROMPT
 
         prompt_file.write_text(prompt_content.strip())
 

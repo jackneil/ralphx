@@ -1315,16 +1315,28 @@ def list_imports(
 def mcp_server() -> None:
     """Start the MCP server for Claude Code integration.
 
-    This command starts the MCP (Model Context Protocol) server that allows
-    Claude Code to interact with RalphX projects, loops, and work items.
+    This command starts the MCP (Model Context Protocol) server that exposes
+    67 tools for full RalphX management through Claude Code.
 
     To add RalphX to Claude Code, run:
         claude mcp add ralphx -- ralphx mcp
 
     Then in Claude Code, you can ask Claude to:
-        - List your RalphX projects
-        - Start/stop loops
-        - View and manage work items
+        - Manage projects (add, remove, list, diagnose)
+        - Control loops (start, stop, configure, validate)
+        - Create and run workflows (multi-step task pipelines)
+        - Track work items (user stories, tasks, research notes)
+        - Monitor runs and view logs
+        - Set up permissions and guardrails
+        - Import content and manage resources
+        - Run system health checks and diagnostics
+
+    Example prompts:
+        "List my RalphX projects"
+        "Start the planning loop on my-app"
+        "Create a workflow for implementing the auth feature"
+        "Why did the last run fail?"
+        "Check if my system is set up correctly"
     """
     from ralphx.mcp_server import main as mcp_main
 

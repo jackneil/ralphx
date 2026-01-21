@@ -57,6 +57,43 @@ TEMPLATES: dict[str, dict] = {
             },
         },
     },
+    "webgen_requirements": {
+        "name": "webgen_requirements",
+        "display_name": "Web-Generated Requirements",
+        "description": "Discover missing requirements through web research on domain best practices",
+        "type": "generator",
+        "category": "discovery",
+        "config": {
+            "name": "webgen_requirements",
+            "display_name": "Web-Generated Requirements",
+            "type": "generator",
+            "description": "Research industry best practices to find requirements NOT in the design doc",
+            "item_types": {
+                "output": {
+                    "singular": "story",
+                    "plural": "stories",
+                    "description": "User stories discovered through domain research",
+                }
+            },
+            "modes": [
+                {
+                    "name": "research",
+                    "description": "Web research for best practices and gaps",
+                    "model": "claude-sonnet-4-20250514",
+                    "timeout": 900,
+                    "tools": ["web_search"],
+                    "prompt_template": "prompts/webgen_requirements.md",
+                }
+            ],
+            "mode_selection": {"strategy": "fixed", "fixed_mode": "research"},
+            "limits": {
+                "max_iterations": 15,
+                "max_runtime_seconds": 14400,
+                "max_consecutive_errors": 3,
+                "cooldown_between_iterations": 15,
+            },
+        },
+    },
     "implementation": {
         "name": "implementation",
         "display_name": "Implementation Loop",

@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ralphx import __version__
-from ralphx.api.routes import auth, config, files, filesystem, imports, items, logs, loops, planning, projects, resources, runs, stream, templates, workflows
+from ralphx.api.routes import auth, config, export_import, files, filesystem, imports, items, logs, loops, planning, projects, resources, runs, stream, templates, workflows
 from ralphx.core.auth import restore_orphaned_backup
 from ralphx.core.workspace import ensure_workspace
 
@@ -123,9 +123,16 @@ async def _stale_run_cleanup_loop():
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     from ralphx.core.logger import system_log
+    from ralphx.core.sample_project import ensure_sample_project_created
 
     # Startup
     ensure_workspace()
+
+    # Create sample project on first run
+    try:
+        ensure_sample_project_created()
+    except Exception as e:
+        logger.warning(f"Sample project creation failed: {e}")
 
     # Restore any orphaned credential backups from previous crashes
     # This ensures user's main credentials are ALWAYS restored
@@ -278,6 +285,7 @@ app.include_router(logs.router, prefix="/api", tags=["logs"])
 app.include_router(config.router, prefix="/api/projects", tags=["config"])
 app.include_router(workflows.router, prefix="/api/projects/{slug}", tags=["workflows"])
 app.include_router(planning.router, prefix="/api/projects/{slug}", tags=["planning"])
+app.include_router(export_import.router, prefix="/api/projects/{slug}", tags=["export-import"])
 
 
 # Root endpoint

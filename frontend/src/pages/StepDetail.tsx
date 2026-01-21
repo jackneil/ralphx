@@ -83,13 +83,13 @@ export default function StepDetail() {
     const stepName = step?.name || `Step ${stepNum}`
 
     const result = await Swal.fire({
-      title: 'Run Step?',
+      title: 'Run Ralph Loop?',
       text: `Start executing "${stepName}"?`,
       icon: 'question',
       showCancelButton: true,
       confirmButtonColor: 'var(--color-primary)',
       cancelButtonColor: 'var(--color-slate)',
-      confirmButtonText: 'Run',
+      confirmButtonText: 'Run Ralph Loop',
       cancelButtonText: 'Cancel',
       background: 'var(--color-surface)',
       color: 'var(--color-text-primary)',
@@ -509,6 +509,8 @@ export default function StepDetail() {
             projectSlug={slug!}
             workflowId={workflowId!}
             sourceStepId={step.id}
+            steps={workflow?.steps || []}
+            onImported={() => loadWorkflow()}
           />
         </div>
       )}

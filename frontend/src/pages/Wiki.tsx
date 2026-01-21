@@ -4,8 +4,9 @@ import GettingStartedContent from '../components/Wiki/content/GettingStartedCont
 import UseCasesContent from '../components/Wiki/content/UseCasesContent'
 import MonitoringContent from '../components/Wiki/content/MonitoringContent'
 import RemoteAccessContent from '../components/Wiki/content/RemoteAccessContent'
+import BackupImportContent from '../components/Wiki/content/BackupImportContent'
 
-type TabId = 'getting-started' | 'use-cases' | 'monitoring' | 'remote-access'
+type TabId = 'getting-started' | 'use-cases' | 'monitoring' | 'remote-access' | 'backup-import'
 
 interface Tab {
   id: TabId
@@ -50,6 +51,15 @@ const tabs: Tab[] = [
       </svg>
     ),
   },
+  {
+    id: 'backup-import',
+    label: 'Backup & Import',
+    icon: (
+      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+      </svg>
+    ),
+  },
 ]
 
 export default function Wiki() {
@@ -85,6 +95,8 @@ export default function Wiki() {
         return <MonitoringContent />
       case 'remote-access':
         return <RemoteAccessContent />
+      case 'backup-import':
+        return <BackupImportContent />
       default:
         return <GettingStartedContent />
     }

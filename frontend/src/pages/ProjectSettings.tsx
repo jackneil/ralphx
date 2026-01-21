@@ -1,8 +1,9 @@
 import { useEffect, useState, useCallback } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import {
   getProject,
   getAuthStatus,
+  getUsage,
   startLogin,
   logoutAuth,
   listProjectResources,
@@ -14,6 +15,7 @@ import {
   ProjectResource,
   ProjectSettings as ProjectSettingsType,
   AuthStatus,
+  UsageData,
 } from '../api'
 import { useDashboardStore } from '../stores/dashboard'
 
@@ -21,9 +23,11 @@ type SettingsTab = 'auth' | 'resources' | 'defaults'
 
 export default function ProjectSettings() {
   const { slug } = useParams<{ slug: string }>()
+  const [searchParams, setSearchParams] = useSearchParams()
   const { selectedProject, setSelectedProject } = useDashboardStore()
 
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null)
+  const [usage, setUsage] = useState<UsageData | null>(null)
   const [resources, setResources] = useState<ProjectResource[]>([])
   const [settings, setSettings] = useState<ProjectSettingsType | null>(null)
   const [loading, setLoading] = useState(true)
@@ -31,8 +35,17 @@ export default function ProjectSettings() {
   const [loginLoading, setLoginLoading] = useState(false)
   const [savingSettings, setSavingSettings] = useState(false)
 
-  // Active tab
-  const [activeTab, setActiveTab] = useState<SettingsTab>('auth')
+  // Active tab - read from URL parameter or default to 'auth'
+  const tabParam = searchParams.get('tab') as SettingsTab | null
+  const validTabs: SettingsTab[] = ['auth', 'resources', 'defaults']
+  const initialTab = tabParam && validTabs.includes(tabParam) ? tabParam : 'auth'
+  const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab)
+
+  // Update URL when tab changes
+  const handleTabChange = (tab: SettingsTab) => {
+    setActiveTab(tab)
+    setSearchParams({ tab })
+  }
 
   // Add resource modal
   const [showAddModal, setShowAddModal] = useState(false)
@@ -66,6 +79,10 @@ export default function ProjectSettings() {
       setAuthStatus(authData)
       setResources(resourcesData)
       setSettings(settingsData)
+      // Fetch usage if connected
+      if (authData?.connected && !authData?.is_expired) {
+        getUsage().then(setUsage).catch(() => setUsage(null))
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load settings')
     } finally {
@@ -206,6 +223,34 @@ export default function ProjectSettings() {
     }
   }
 
+  const getUsageTextColor = (utilization: number): string => {
+    if (utilization >= 80) return 'text-rose-400'
+    if (utilization >= 50) return 'text-amber-400'
+    return 'text-emerald-400'
+  }
+
+  const getUsageBarColor = (utilization: number): string => {
+    if (utilization >= 80) return 'bg-gradient-to-r from-rose-500 to-rose-400'
+    if (utilization >= 50) return 'bg-gradient-to-r from-amber-500 to-amber-400'
+    return 'bg-gradient-to-r from-emerald-500 to-emerald-400'
+  }
+
+  const formatResetTime = (isoString?: string): string => {
+    if (!isoString) return ''
+    const resetDate = new Date(isoString)
+    const now = new Date()
+    const isToday = resetDate.toDateString() === now.toDateString()
+    const tomorrow = new Date(now)
+    tomorrow.setDate(tomorrow.getDate() + 1)
+    const isTomorrow = resetDate.toDateString() === tomorrow.toDateString()
+
+    const timeStr = resetDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+
+    if (isToday) return `today at ${timeStr}`
+    if (isTomorrow) return `tomorrow at ${timeStr}`
+    return resetDate.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ` at ${timeStr}`
+  }
+
   const tabs: { key: SettingsTab; label: string }[] = [
     { key: 'auth', label: 'Authentication' },
     { key: 'resources', label: 'Shared Resources' },
@@ -253,7 +298,7 @@ export default function ProjectSettings() {
         {tabs.map(tab => (
           <button
             key={tab.key}
-            onClick={() => setActiveTab(tab.key)}
+            onClick={() => handleTabChange(tab.key)}
             className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
               activeTab === tab.key
                 ? 'border-primary-500 text-white'
@@ -294,6 +339,49 @@ export default function ProjectSettings() {
                     <span className="text-gray-400">Rate Limit:</span>
                     <span className="text-white ml-2">{authStatus.rate_limit_tier || 'N/A'}</span>
                   </div>
+                  {usage?.success && (
+                    <div className="col-span-2 mt-2 pt-3 border-t border-gray-700">
+                      <p className="text-gray-400 text-sm font-medium mb-2">API Usage</p>
+                      <div className="flex gap-6">
+                        {/* 5-hour */}
+                        <div className="flex-1">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-gray-400 text-sm">5-hour</span>
+                            <span className={`text-sm font-semibold ${getUsageTextColor(usage.five_hour_utilization || 0)}`}>
+                              {Math.round(Math.min(100, usage.five_hour_utilization || 0))}%
+                            </span>
+                          </div>
+                          <div className="h-3 bg-gray-700/50 rounded-full overflow-hidden shadow-inner">
+                            <div
+                              className={`h-full rounded-full shadow-sm ${getUsageBarColor(usage.five_hour_utilization || 0)}`}
+                              style={{ width: `${Math.min(100, usage.five_hour_utilization || 0)}%` }}
+                            />
+                          </div>
+                          {usage.five_hour_resets_at && (
+                            <p className="text-gray-500 text-xs mt-1">Resets {formatResetTime(usage.five_hour_resets_at)}</p>
+                          )}
+                        </div>
+                        {/* 7-day */}
+                        <div className="flex-1">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-gray-400 text-sm">7-day</span>
+                            <span className={`text-sm font-semibold ${getUsageTextColor(usage.seven_day_utilization || 0)}`}>
+                              {Math.round(Math.min(100, usage.seven_day_utilization || 0))}%
+                            </span>
+                          </div>
+                          <div className="h-3 bg-gray-700/50 rounded-full overflow-hidden shadow-inner">
+                            <div
+                              className={`h-full rounded-full shadow-sm ${getUsageBarColor(usage.seven_day_utilization || 0)}`}
+                              style={{ width: `${Math.min(100, usage.seven_day_utilization || 0)}%` }}
+                            />
+                          </div>
+                          {usage.seven_day_resets_at && (
+                            <p className="text-gray-500 text-xs mt-1">Resets {formatResetTime(usage.seven_day_resets_at)}</p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
                 <button
                   onClick={handleLogout}

@@ -96,6 +96,9 @@ class TestMCPServer:
 
     def test_handle_tools_list(self, server):
         """Test tools/list method handling."""
+        # Must initialize first per MCP protocol
+        server._handle_message({"jsonrpc": "2.0", "id": 0, "method": "initialize"})
+
         message = {
             "jsonrpc": "2.0",
             "id": 2,
@@ -342,6 +345,9 @@ class TestMCPServer:
 
     def test_handle_tools_call(self, server, workspace_dir):
         """Test handling a tools/call request."""
+        # Must initialize first per MCP protocol
+        server._handle_message({"jsonrpc": "2.0", "id": 0, "method": "initialize"})
+
         message = {
             "jsonrpc": "2.0",
             "id": 3,
@@ -359,6 +365,9 @@ class TestMCPServer:
 
     def test_handle_unknown_tool(self, server):
         """Test handling an unknown tool call."""
+        # Must initialize first per MCP protocol
+        server._handle_message({"jsonrpc": "2.0", "id": 0, "method": "initialize"})
+
         message = {
             "jsonrpc": "2.0",
             "id": 4,
@@ -371,7 +380,9 @@ class TestMCPServer:
 
         response = server._handle_message(message)
         assert "error" in response
-        assert response["error"]["code"] == -32601
+        # Per MCP spec: unknown tool is -32602 (Invalid params), not -32601 (Method not found)
+        # because tools/call method exists, the tool name is a parameter
+        assert response["error"]["code"] == -32602
 
 
 class TestMCPBasePatterns:

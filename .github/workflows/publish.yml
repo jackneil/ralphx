@@ -41,11 +41,14 @@ jobs:
 
       - name: Verify package contents
         run: |
-          pip install dist/*.whl
-          python -c "
+          python -m venv /tmp/verify-env
+          /tmp/verify-env/bin/pip install dist/*.whl
+          /tmp/verify-env/bin/python -c "
           from pathlib import Path
           import ralphx
           static = Path(ralphx.__file__).parent / 'static'
+          print(f'Package location: {ralphx.__file__}')
+          assert 'site-packages' in str(static), f'Checking wrong location: {static}'
           index = static / 'index.html'
           assets = static / 'assets'
           assert index.exists(), f'Missing {index}'

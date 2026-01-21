@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { getAuthStatus, startLogin, logoutAuth, refreshAuthToken, exportCredentials, AuthStatus, CredentialsExport, AuthValidationResult } from '../api'
+import { getAuthStatus, startLogin, logoutAuth, refreshAuthToken, exportCredentials, getUsage, AuthStatus, CredentialsExport, AuthValidationResult, UsageData } from '../api'
 
 interface AuthPanelProps {
   projectPath?: string  // If provided, shows project-scoped auth
@@ -19,6 +19,8 @@ export default function AuthPanel({ projectPath, validationResult, onLoginSucces
   const [credentialsData, setCredentialsData] = useState<CredentialsExport | null>(null)
   const [loadingCredentials, setLoadingCredentials] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [usage, setUsage] = useState<UsageData | null>(null)
+  const [loadingUsage, setLoadingUsage] = useState(false)
   const pollRef = useRef<number | null>(null)
   const timeoutRef = useRef<number | null>(null)
 
@@ -43,6 +45,17 @@ export default function AuthPanel({ projectPath, validationResult, onLoginSucces
       if (timeoutRef.current) clearTimeout(timeoutRef.current)
     }
   }, [projectPath])
+
+  // Fetch usage when connected
+  useEffect(() => {
+    if (status?.connected && !status?.is_expired) {
+      setLoadingUsage(true)
+      getUsage(projectPath)
+        .then(setUsage)
+        .catch(() => setUsage(null))
+        .finally(() => setLoadingUsage(false))
+    }
+  }, [status?.connected, status?.is_expired, projectPath])
 
   const handleLogin = async () => {
     setLoginPending(true)
@@ -159,6 +172,39 @@ export default function AuthPanel({ projectPath, validationResult, onLoginSucces
     return `${mins}m`
   }
 
+  const getUsageTextColor = (utilization: number): string => {
+    if (utilization >= 80) return 'text-rose-400'
+    if (utilization >= 50) return 'text-amber-400'
+    return 'text-emerald-400'
+  }
+
+  const getUsageBarColor = (utilization: number): string => {
+    if (utilization >= 80) return 'bg-gradient-to-r from-rose-500 to-rose-400'
+    if (utilization >= 50) return 'bg-gradient-to-r from-amber-500 to-amber-400'
+    return 'bg-gradient-to-r from-emerald-500 to-emerald-400'
+  }
+
+  const formatResetTime = (isoString?: string): string => {
+    if (!isoString) return ''
+    const resetDate = new Date(isoString)
+    const now = new Date()
+    const isToday = resetDate.toDateString() === now.toDateString()
+    const tomorrow = new Date(now)
+    tomorrow.setDate(tomorrow.getDate() + 1)
+    const isTomorrow = resetDate.toDateString() === tomorrow.toDateString()
+
+    const timeStr = resetDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+
+    if (isToday) return `today at ${timeStr}`
+    if (isTomorrow) return `tomorrow at ${timeStr}`
+    return resetDate.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ` at ${timeStr}`
+  }
+
+  const formatResetLabel = (isoString?: string): string => {
+    if (!isoString) return ''
+    return `Resets ${formatResetTime(isoString)}`
+  }
+
   if (loading) {
     return (
       <div className="bg-gray-800 rounded-lg p-6 animate-pulse">
@@ -254,6 +300,55 @@ export default function AuthPanel({ projectPath, validationResult, onLoginSucces
                 <p className="text-gray-400 text-sm">
                   Tier: <span className="text-white">{status.rate_limit_tier}</span>
                 </p>
+              )}
+
+              {/* API Usage */}
+              {(loadingUsage || usage?.success) && (
+                <div className="space-y-2">
+                  <p className="text-gray-400 text-sm font-medium">API Usage</p>
+                  {loadingUsage ? (
+                    <div className="text-gray-500">loading...</div>
+                  ) : (
+                    <div className="flex gap-6">
+                      {/* 5-hour */}
+                      <div className="flex-1">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-gray-400 text-sm">5-hour window</span>
+                          <span className={`text-sm font-semibold ${getUsageTextColor(usage?.five_hour_utilization || 0)}`}>
+                            {Math.round(Math.min(100, usage?.five_hour_utilization || 0))}%
+                          </span>
+                        </div>
+                        <div className="h-3 bg-gray-700/50 rounded-full overflow-hidden shadow-inner">
+                          <div
+                            className={`h-full rounded-full shadow-sm ${getUsageBarColor(usage?.five_hour_utilization || 0)}`}
+                            style={{ width: `${Math.min(100, usage?.five_hour_utilization || 0)}%` }}
+                          />
+                        </div>
+                        {usage?.five_hour_resets_at && (
+                          <p className="text-gray-500 text-xs mt-1">Resets {formatResetTime(usage.five_hour_resets_at)}</p>
+                        )}
+                      </div>
+                      {/* 7-day */}
+                      <div className="flex-1">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-gray-400 text-sm">7-day window</span>
+                          <span className={`text-sm font-semibold ${getUsageTextColor(usage?.seven_day_utilization || 0)}`}>
+                            {Math.round(Math.min(100, usage?.seven_day_utilization || 0))}%
+                          </span>
+                        </div>
+                        <div className="h-3 bg-gray-700/50 rounded-full overflow-hidden shadow-inner">
+                          <div
+                            className={`h-full rounded-full shadow-sm ${getUsageBarColor(usage?.seven_day_utilization || 0)}`}
+                            style={{ width: `${Math.min(100, usage?.seven_day_utilization || 0)}%` }}
+                          />
+                        </div>
+                        {usage?.seven_day_resets_at && (
+                          <p className="text-gray-500 text-xs mt-1">Resets {formatResetTime(usage.seven_day_resets_at)}</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
 
               {/* Token expiry and auto-refresh info */}

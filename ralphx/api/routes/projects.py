@@ -33,12 +33,22 @@ class ProjectResponse(BaseModel):
     path: str
     design_doc: Optional[str] = None
     created_at: str
+    path_valid: bool = True  # Whether the project directory exists
 
     model_config = {"from_attributes": True}
 
     @classmethod
-    def from_project(cls, project: Project) -> "ProjectResponse":
-        """Create from Project model."""
+    def from_project(cls, project: Project, check_path: bool = True) -> "ProjectResponse":
+        """Create from Project model.
+
+        Args:
+            project: Project model instance.
+            check_path: If True, check if project path exists.
+        """
+        path_valid = True
+        if check_path:
+            path_valid = Path(project.path).exists()
+
         return cls(
             id=project.id,
             slug=project.slug,
@@ -46,6 +56,7 @@ class ProjectResponse(BaseModel):
             path=str(project.path),
             design_doc=project.design_doc,
             created_at=project.created_at.isoformat() if project.created_at else "",
+            path_valid=path_valid,
         )
 
 
@@ -66,6 +77,13 @@ class ProjectWithStats(ProjectResponse):
     """Project response with statistics."""
 
     stats: ProjectStats = Field(default_factory=ProjectStats)
+
+
+class ProjectUpdate(BaseModel):
+    """Request model for updating a project."""
+
+    name: Optional[str] = Field(None, description="Human-readable name")
+    path: Optional[str] = Field(None, description="New path to project directory (for relinking)")
 
 
 def get_manager() -> ProjectManager:
@@ -165,9 +183,73 @@ async def get_project(slug: str):
         path=base.path,
         design_doc=base.design_doc,
         created_at=base.created_at,
+        path_valid=base.path_valid,
         stats=stats,
     )
     return response
+
+
+@router.patch("/{slug}", response_model=ProjectResponse)
+async def update_project(slug: str, data: ProjectUpdate):
+    """Update a project's metadata or relink its path.
+
+    Use this to:
+    - Rename a project
+    - Relink a project to a new directory (when original path moved/missing)
+    """
+    manager = get_manager()
+    project = manager.get_project(slug)
+
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {slug}",
+        )
+
+    # Handle path update (relink)
+    if data.path is not None:
+        new_path = Path(data.path)
+
+        # Validate new path exists
+        if not new_path.exists():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"New path does not exist: {data.path}",
+            )
+
+        if not new_path.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"New path is not a directory: {data.path}",
+            )
+
+        # Check if new path already has .ralphx directory
+        ralphx_dir = new_path / ".ralphx"
+        if ralphx_dir.exists():
+            # Warn if it has a different project (check project.db)
+            # For now, allow it - user is responsible for ensuring correct path
+            pass
+        else:
+            # Create .ralphx directory at new location
+            from ralphx.core.workspace import ensure_project_ralphx
+            try:
+                ensure_project_ralphx(new_path)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to initialize project at new path: {e}",
+                )
+
+        # Update path in global database
+        manager.global_db.update_project(slug, path=str(new_path.resolve()))
+
+    # Handle name update
+    if data.name is not None:
+        manager.global_db.update_project(slug, name=data.name)
+
+    # Return updated project
+    project = manager.get_project(slug)
+    return ProjectResponse.from_project(project)
 
 
 @router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)

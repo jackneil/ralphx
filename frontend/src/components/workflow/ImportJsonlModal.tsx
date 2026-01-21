@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { listImportFormats, importJsonlToWorkflow } from '../../api'
+import { listImportFormats, importJsonlToWorkflow, listItems } from '../../api'
 import type { ImportFormat, ImportJsonlResponse, WorkflowStep } from '../../api'
 
 interface ImportJsonlModalProps {
@@ -25,7 +25,10 @@ export default function ImportJsonlModal({
   const [error, setError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Load import formats
+  // Existing items count for informational purposes
+  const [existingItemsCount, setExistingItemsCount] = useState<number>(0)
+
+  // Load import formats and existing items count
   useEffect(() => {
     async function loadFormats() {
       try {
@@ -42,8 +45,24 @@ export default function ImportJsonlModal({
         setError('Failed to load import formats')
       }
     }
+
+    async function loadExistingItems() {
+      try {
+        // Get total items in the workflow for informational display
+        const result = await listItems(projectSlug, {
+          workflow_id: workflowId,
+          limit: 1, // Just need the total count
+        })
+        setExistingItemsCount(result.total)
+      } catch (err) {
+        // Non-critical, continue without count display
+        console.warn('Could not load existing items count:', err)
+      }
+    }
+
     loadFormats()
-  }, [projectSlug])
+    loadExistingItems()
+  }, [projectSlug, workflowId])
 
   // Default to first consumer step
   useEffect(() => {
@@ -161,6 +180,25 @@ export default function ImportJsonlModal({
           </p>
         </div>
 
+        {/* Existing Items Info - Show when there are existing items */}
+        {existingItemsCount > 0 && (
+          <div className="mb-4 p-4 rounded-lg border bg-gray-800/50 border-gray-700">
+            <div className="flex items-start gap-2">
+              <svg className="w-5 h-5 text-cyan-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <div>
+                <p className="text-gray-300">
+                  This workflow already has {existingItemsCount} item{existingItemsCount !== 1 ? 's' : ''}.
+                </p>
+                <p className="text-sm text-gray-500 mt-1">
+                  New items will be added alongside existing ones. Items with duplicate IDs will be skipped.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* File Selection */}
         <div className="mb-6">
           <label className="block text-sm font-medium text-gray-300 mb-2">
@@ -210,9 +248,9 @@ export default function ImportJsonlModal({
           <button
             onClick={handleImport}
             disabled={loading || !file || !selectedFormat || selectedStep === null}
-            className="px-4 py-2 bg-primary-600 text-white rounded hover:bg-primary-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="px-4 py-2 text-white rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed bg-primary-600 hover:bg-primary-500"
           >
-            {loading ? 'Importing...' : 'Import'}
+            {loading ? 'Importing...' : 'Import Items'}
           </button>
         </div>
       </div>

@@ -278,6 +278,23 @@ class Database:
             self._local.connection.close()
             self._local.connection = None
 
+    def _parse_metadata(self, value: Any) -> Optional[dict]:
+        """Safely parse metadata that may be JSON or plain text.
+
+        Args:
+            value: Raw metadata value from database (may be JSON string, plain text, or None)
+
+        Returns:
+            Parsed dict if valid JSON, None otherwise
+        """
+        if not value or not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            # Not valid JSON - return None (legacy data may have plain strings)
+            return None
+
     # =========================================================================
     # Project Operations
     # =========================================================================
@@ -1636,7 +1653,7 @@ class Database:
                     "message": row[4],
                     "project_id": row[5],
                     "run_id": row[6],
-                    "metadata": json.loads(row[7]) if row[7] else None,
+                    "metadata": self._parse_metadata(row[7]),
                     "timestamp": row[8],
                 }
                 for row in rows
@@ -1840,6 +1857,7 @@ class Database:
                 -- Add category and event columns for structured logging
                 ALTER TABLE logs ADD COLUMN category TEXT DEFAULT 'system';
                 ALTER TABLE logs ADD COLUMN event TEXT DEFAULT 'log';
+                ALTER TABLE logs ADD COLUMN project_id TEXT;
 
                 -- Indexes for common query patterns
                 CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp DESC);
@@ -1892,13 +1910,19 @@ class Database:
                     metadata TEXT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
-                INSERT INTO logs_new SELECT * FROM logs;
+                -- Explicitly map columns (old schema may not have all columns)
+                INSERT INTO logs_new (id, project_id, run_id, level, category, event, message, metadata, timestamp)
+                    SELECT id, project_id, run_id, level, category, event, message, metadata, timestamp FROM logs;
                 DROP TABLE logs;
                 ALTER TABLE logs_new RENAME TO logs;
 
-                -- Recreate index on logs
+                -- Recreate indexes on logs
                 CREATE INDEX IF NOT EXISTS idx_logs_project ON logs(project_id);
                 CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
+                CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_logs_category ON logs(category);
+                CREATE INDEX IF NOT EXISTS idx_logs_cat_event ON logs(category, event, timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_logs_run_time ON logs(run_id, timestamp);
             """),
         ]
 

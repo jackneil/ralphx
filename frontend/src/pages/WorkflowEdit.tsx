@@ -134,6 +134,7 @@ export default function WorkflowEdit() {
             description: step.config?.description,
             skippable: step.config?.skippable,
             loop_type: step.config?.loopType,
+            template: step.config?.template,  // Template name (e.g., 'webgen_requirements')
           }
           if (step.step_type === 'autonomous') {
             stepData.model = step.config?.model
@@ -154,12 +155,14 @@ export default function WorkflowEdit() {
             originalStep.config?.description !== step.config?.description ||
             originalStep.config?.skippable !== step.config?.skippable ||
             originalStep.config?.loopType !== step.config?.loopType ||
+            originalStep.config?.template !== step.config?.template ||
             originalStep.config?.model !== step.config?.model ||
             originalStep.config?.timeout !== step.config?.timeout ||
             JSON.stringify(originalStep.config?.allowedTools) !== JSON.stringify(step.config?.allowedTools) ||
             originalStep.config?.max_iterations !== step.config?.max_iterations ||
             originalStep.config?.cooldown_between_iterations !== step.config?.cooldown_between_iterations ||
-            originalStep.config?.max_consecutive_errors !== step.config?.max_consecutive_errors
+            originalStep.config?.max_consecutive_errors !== step.config?.max_consecutive_errors ||
+            originalStep.config?.customPrompt !== step.config?.customPrompt
           )
           if (configChanged) {
             const updateData: Parameters<typeof updateWorkflowStep>[3] = {
@@ -168,6 +171,7 @@ export default function WorkflowEdit() {
               description: step.config?.description,
               skippable: step.config?.skippable,
               loop_type: step.config?.loopType,
+              template: step.config?.template || '',  // Send empty string to clear
             }
             if (step.step_type === 'autonomous') {
               updateData.model = step.config?.model
@@ -176,6 +180,10 @@ export default function WorkflowEdit() {
               updateData.max_iterations = step.config?.max_iterations
               updateData.cooldown_between_iterations = step.config?.cooldown_between_iterations
               updateData.max_consecutive_errors = step.config?.max_consecutive_errors
+              // Send custom_prompt (empty string to clear, undefined to skip)
+              if (step.config?.customPrompt !== undefined) {
+                updateData.custom_prompt = step.config.customPrompt || ''
+              }
             }
             await updateWorkflowStep(slug, workflow.id, step.id, updateData)
           }

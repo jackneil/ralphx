@@ -299,6 +299,7 @@ export default function WorkflowEditor({
             description: step.config?.description,
             skippable: step.config?.skippable,
             loop_type: step.config?.loopType,
+            template: step.config?.template,  // Template name (e.g., 'webgen_requirements')
           }
           // Include autonomous config fields only for autonomous steps
           if (step.step_type === 'autonomous') {
@@ -321,6 +322,7 @@ export default function WorkflowEditor({
             originalStep.config?.description !== step.config?.description ||
             originalStep.config?.skippable !== step.config?.skippable ||
             originalStep.config?.loopType !== step.config?.loopType ||
+            originalStep.config?.template !== step.config?.template ||
             originalStep.config?.model !== step.config?.model ||
             originalStep.config?.timeout !== step.config?.timeout ||
             JSON.stringify(originalStep.config?.allowedTools) !== JSON.stringify(step.config?.allowedTools) ||
@@ -335,6 +337,7 @@ export default function WorkflowEditor({
               description: step.config?.description,
               skippable: step.config?.skippable,
               loop_type: step.config?.loopType,
+              template: step.config?.template || '',  // Send empty string to clear
             }
             // Include autonomous config fields only for autonomous steps
             if (step.step_type === 'autonomous') {

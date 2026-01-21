@@ -584,6 +584,24 @@ export async function createLoopFromTemplate(
   })
 }
 
+// Step Prompts (System Prompts for Workflow Steps)
+export interface TemplateVariableInfo {
+  name: string
+  description: string
+  required: boolean
+}
+
+export interface StepPromptResponse {
+  prompt: string
+  loop_type: string
+  display_name: string
+  variables: TemplateVariableInfo[]
+}
+
+export async function getDefaultStepPrompt(loopType: string): Promise<StepPromptResponse> {
+  return request<StepPromptResponse>(`/step-prompts/${loopType}`)
+}
+
 // Permission Templates
 export interface PermissionTemplateInfo {
   id: string
@@ -1123,6 +1141,22 @@ export async function validateAuth(projectPath?: string): Promise<AuthValidation
   return request<AuthValidationResult>(`/auth/validate${params}`)
 }
 
+export interface UsageData {
+  success: boolean
+  error?: string
+  five_hour_utilization?: number
+  five_hour_resets_at?: string
+  seven_day_utilization?: number
+  seven_day_resets_at?: string
+}
+
+export async function getUsage(projectPath?: string): Promise<UsageData> {
+  const params = new URLSearchParams()
+  if (projectPath) params.set('project_path', projectPath)
+  const url = `/auth/usage${params.toString() ? '?' + params : ''}`
+  return request<UsageData>(url)
+}
+
 // ============================================================================
 // Logs API
 // ============================================================================
@@ -1312,6 +1346,7 @@ export interface WorkflowStep {
   config?: {
     description?: string
     loopType?: string
+    template?: string  // Template name (e.g., 'webgen_requirements')
     model?: 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m'
     timeout?: number
     allowedTools?: string[]
@@ -1324,6 +1359,8 @@ export interface WorkflowStep {
     max_iterations?: number
     cooldown_between_iterations?: number
     max_consecutive_errors?: number
+    // Custom AI instructions (overrides default prompt)
+    customPrompt?: string
   }
   loop_name?: string
   artifacts?: Record<string, unknown>
@@ -1495,6 +1532,7 @@ export async function createWorkflowStep(
     step_type: 'interactive' | 'autonomous'
     description?: string
     loop_type?: string
+    template?: string  // Template name (e.g., 'webgen_requirements')
     skippable?: boolean
     model?: 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m'
     timeout?: number
@@ -1503,6 +1541,8 @@ export async function createWorkflowStep(
     max_iterations?: number
     cooldown_between_iterations?: number
     max_consecutive_errors?: number
+    // Custom prompt (autonomous steps only)
+    custom_prompt?: string
   }
 ): Promise<WorkflowStep> {
   return request<WorkflowStep>(`/projects/${slug}/workflows/${workflowId}/steps`, {
@@ -1520,6 +1560,7 @@ export async function updateWorkflowStep(
     step_type?: 'interactive' | 'autonomous'
     description?: string
     loop_type?: string
+    template?: string  // Template name (e.g., 'webgen_requirements')
     skippable?: boolean
     model?: 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m'
     timeout?: number
@@ -1528,6 +1569,8 @@ export async function updateWorkflowStep(
     max_iterations?: number
     cooldown_between_iterations?: number
     max_consecutive_errors?: number
+    // Custom prompt (autonomous steps only)
+    custom_prompt?: string
   }
 ): Promise<WorkflowStep> {
   return request<WorkflowStep>(`/projects/${slug}/workflows/${workflowId}/steps/${stepId}`, {
@@ -2179,6 +2222,179 @@ export function getStatusColor(status: string): string {
     rejected: 'bg-red-500/20 text-red-400',
   }
   return colors[status] || 'bg-gray-500/20 text-gray-400'
+}
+
+// ============================================================================
+// Workflow Export/Import API
+// ============================================================================
+
+export interface ExportPreview {
+  workflow_name: string
+  workflow_namespace: string
+  steps_count: number
+  items_total: number
+  resources_count: number
+  has_planning_session: boolean
+  runs_count: number
+  estimated_size_bytes: number
+  potential_secrets_detected: boolean
+  warnings: string[]
+}
+
+export interface ExportOptions {
+  include_runs?: boolean
+  include_planning?: boolean
+  include_planning_messages?: boolean
+  strip_secrets?: boolean
+  as_template?: boolean
+}
+
+export async function getWorkflowExportPreview(
+  slug: string,
+  workflowId: string
+): Promise<ExportPreview> {
+  return request<ExportPreview>(
+    `/projects/${slug}/workflows/${workflowId}/export/preview`
+  )
+}
+
+export async function exportWorkflow(
+  slug: string,
+  workflowId: string,
+  options: ExportOptions = {}
+): Promise<Blob> {
+  const response = await fetch(
+    `${API_BASE}/projects/${slug}/workflows/${workflowId}/export`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(options),
+    }
+  )
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}))
+    const message = errorData.error?.message || errorData.detail || response.statusText
+    throw new APIError(message, response.status, errorData.error?.code)
+  }
+
+  return response.blob()
+}
+
+export interface StepPreviewInfo {
+  step_number: number
+  name: string
+  step_type: string
+  items_count: number
+}
+
+export interface ResourcePreviewInfo {
+  id: number
+  name: string
+  resource_type: string
+}
+
+export interface ImportPreview {
+  workflow_name: string
+  workflow_namespace: string
+  exported_at: string
+  ralphx_version: string
+  schema_version: number
+  steps_count: number
+  items_count: number
+  resources_count: number
+  has_planning_session: boolean
+  has_runs: boolean
+  is_compatible: boolean
+  compatibility_notes: string[]
+  potential_secrets_detected: boolean
+  // Detailed breakdown for selective import
+  steps: StepPreviewInfo[]
+  resources: ResourcePreviewInfo[]
+}
+
+export interface ImportResult {
+  success: boolean
+  workflow_id: string
+  workflow_name: string
+  steps_created: number
+  items_imported: number
+  items_renamed: number
+  items_skipped: number
+  resources_created: number
+  resources_renamed: number
+  planning_sessions_imported: number
+  runs_imported: number
+  warnings: string[]
+}
+
+export async function getWorkflowImportPreview(
+  slug: string,
+  file: File
+): Promise<ImportPreview> {
+  const formData = new FormData()
+  formData.append('file', file)
+
+  const response = await fetch(
+    `${API_BASE}/projects/${slug}/workflows/import/preview`,
+    {
+      method: 'POST',
+      body: formData,
+    }
+  )
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}))
+    const message = errorData.error?.message || errorData.detail || response.statusText
+    throw new APIError(message, response.status, errorData.error?.code)
+  }
+
+  return response.json()
+}
+
+export interface ImportOptions {
+  conflict_resolution?: 'skip' | 'rename' | 'overwrite'
+  import_items?: boolean
+  import_resources?: boolean
+  import_planning?: boolean
+  import_runs?: boolean
+  // Selective import: if specified, only import these steps/resources
+  selected_steps?: number[]  // step numbers to import
+  selected_resource_ids?: number[]  // resource IDs to import
+}
+
+export async function importWorkflow(
+  slug: string,
+  file: File,
+  options: ImportOptions = {}
+): Promise<ImportResult> {
+  const formData = new FormData()
+  formData.append('file', file)
+
+  const params = new URLSearchParams()
+  if (options.conflict_resolution) params.set('conflict_resolution', options.conflict_resolution)
+  if (options.import_items !== undefined) params.set('import_items', options.import_items.toString())
+  if (options.import_resources !== undefined) params.set('import_resources', options.import_resources.toString())
+  if (options.import_planning !== undefined) params.set('import_planning', options.import_planning.toString())
+  if (options.import_runs !== undefined) params.set('import_runs', options.import_runs.toString())
+  if (options.selected_steps?.length) params.set('selected_steps', options.selected_steps.join(','))
+  if (options.selected_resource_ids?.length) params.set('selected_resource_ids', options.selected_resource_ids.join(','))
+
+  const response = await fetch(
+    `${API_BASE}/projects/${slug}/workflows/import?${params}`,
+    {
+      method: 'POST',
+      body: formData,
+    }
+  )
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}))
+    const message = errorData.error?.message || errorData.detail || response.statusText
+    throw new APIError(message, response.status, errorData.error?.code)
+  }
+
+  return response.json()
 }
 
 export { APIError }

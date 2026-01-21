@@ -1,12 +1,15 @@
 import { useState, useEffect, useCallback } from 'react'
-import { listItems, createItem, updateItem, duplicateItem, Item, getStatusDisplayName, getStatusColor } from '../../api'
+import { listItems, createItem, updateItem, duplicateItem, Item, getStatusDisplayName, getStatusColor, ImportJsonlResponse, WorkflowStep } from '../../api'
 import WorkItemRow from './WorkItemRow'
 import ItemEditModal, { ItemFormData } from './ItemEditModal'
+import ImportJsonlModal from './ImportJsonlModal'
 
 interface WorkflowItemsTabProps {
   projectSlug: string
   workflowId: string
   sourceStepId?: number  // Optional: pre-filter to a specific step
+  steps: WorkflowStep[]  // Required for Import Items modal
+  onImported?: (result: ImportJsonlResponse) => void  // Callback when import completes
 }
 
 const ITEMS_PER_PAGE = 50
@@ -22,7 +25,7 @@ const STATUS_OPTIONS = [
   { value: 'duplicate', label: 'Duplicate' },
 ]
 
-export default function WorkflowItemsTab({ projectSlug, workflowId, sourceStepId }: WorkflowItemsTabProps) {
+export default function WorkflowItemsTab({ projectSlug, workflowId, sourceStepId, steps, onImported }: WorkflowItemsTabProps) {
   const [items, setItems] = useState<Item[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -43,6 +46,9 @@ export default function WorkflowItemsTab({ projectSlug, workflowId, sourceStepId
   const [modalOpen, setModalOpen] = useState(false)
   const [modalMode, setModalMode] = useState<'create' | 'edit' | 'duplicate'>('create')
   const [editingItem, setEditingItem] = useState<Item | null>(null)
+
+  // Import modal state
+  const [showImportModal, setShowImportModal] = useState(false)
 
   const loadItems = useCallback(async () => {
     setLoading(true)
@@ -169,6 +175,17 @@ export default function WorkflowItemsTab({ projectSlug, workflowId, sourceStepId
             className="px-3 py-1.5 text-sm font-medium bg-cyan-600 hover:bg-cyan-500 text-white rounded transition-colors"
           >
             + Add Item
+          </button>
+          {/* Import Items button */}
+          <button
+            onClick={() => setShowImportModal(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition-colors"
+            title="Import work items from JSONL file"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+            </svg>
+            Import Items
           </button>
         </div>
 
@@ -348,6 +365,21 @@ export default function WorkflowItemsTab({ projectSlug, workflowId, sourceStepId
         sourceStepId={sourceStepId || 0}
         existingCategories={categories}
       />
+
+      {/* Import Items Modal */}
+      {showImportModal && (
+        <ImportJsonlModal
+          projectSlug={projectSlug}
+          workflowId={workflowId}
+          steps={steps}
+          onClose={() => setShowImportModal(false)}
+          onImported={(result) => {
+            setShowImportModal(false)
+            loadItems() // Refresh items list
+            onImported?.(result) // Notify parent
+          }}
+        />
+      )}
     </div>
   )
 }

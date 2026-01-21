@@ -1,6 +1,7 @@
 """MCP tool implementations organized by category.
 
 Tool modules:
+- help: Product overview and guidance (call first!)
 - projects: Project management (list, get, add, remove, update)
 - loops: Loop/run management
 - monitoring: Logs, sessions, diagnostics, stale runs
@@ -10,6 +11,7 @@ Tool modules:
 - imports: Import operations
 """
 
+from ralphx.mcp.tools.help import get_help_tools
 from ralphx.mcp.tools.projects import get_project_tools
 from ralphx.mcp.tools.loops import get_loop_tools
 from ralphx.mcp.tools.items import get_item_tools
@@ -25,6 +27,8 @@ from ralphx.mcp.tools.resources import get_resource_tools
 def get_all_tools():
     """Get all tool definitions."""
     tools = []
+    # Help tool first - provides product context
+    tools.extend(get_help_tools())
     tools.extend(get_project_tools())
     tools.extend(get_loop_tools())
     tools.extend(get_item_tools())

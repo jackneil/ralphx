@@ -295,13 +295,13 @@ export default function StepCard({ step, isCurrent: _isCurrent, isSelected, onSe
 
       {/* Action Buttons */}
       <div className="flex items-center gap-2 pt-3 border-t border-[var(--color-border)]">
-        {/* Run Button - show when not running and step not completed */}
+        {/* Run Ralph Loop Button - show when not running and step not completed */}
         {onRun && step.status !== 'completed' && !isActuallyRunning && (
           <button
             onClick={() => onRun(step.step_number)}
             disabled={isRunning}
             className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed bg-[var(--color-cyan)]/10 text-[var(--color-cyan)] border border-[var(--color-cyan)]/30 hover:bg-[var(--color-cyan)]/20 hover:border-[var(--color-cyan)]/50"
-            title="Run this step"
+            title="Run Ralph Loop for this step"
           >
             {isRunning ? (
               <>
@@ -316,7 +316,7 @@ export default function StepCard({ step, isCurrent: _isCurrent, isSelected, onSe
                 <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
                   <path d="M8 5v14l11-7z" />
                 </svg>
-                <span>Run</span>
+                <span>Run Ralph Loop</span>
               </>
             )}
           </button>
