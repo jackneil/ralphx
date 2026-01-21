@@ -50,14 +50,12 @@ conda create -n ralphx python=3.11 && conda activate ralphx && pip install ralph
 
 Publishing is automated via GitHub Actions. To release a new version:
 
-1. **Bump version** in `pyproject.toml`
+1. **Bump version** in both `pyproject.toml` and `ralphx/__init__.py`
 2. **Commit and push** to main
-3. **Create a GitHub Release**:
-   - Go to https://github.com/jackneil/ralphx/releases/new
-   - Tag: `v0.1.3` (match pyproject.toml version)
-   - Title: `v0.1.3`
-   - Auto-generate release notes or write summary
-   - Click "Publish release"
+3. **Create a GitHub Release** using gh CLI:
+   ```bash
+   gh release create v0.3.0 --title "v0.3.0" --generate-notes
+   ```
 4. **GitHub Actions auto-publishes** to PyPI via trusted publishing (OIDC)
 
 The workflow is defined in `.github/workflows/publish.yml` and triggers on `release: types: [published]`.
