@@ -20,8 +20,27 @@ from ralphx.models.session import Session
 
 @pytest.fixture
 def db():
-    """Create in-memory project database."""
+    """Create in-memory project database with workflow context."""
     database = ProjectDatabase(":memory:")
+
+    # Create workflow context for tests that need it
+    workflow_id = "wf-session-test"
+    database.create_workflow(
+        id=workflow_id,
+        name="Session Test Workflow",
+        status="active"
+    )
+    step = database.create_workflow_step(
+        workflow_id=workflow_id,
+        step_number=1,
+        name="Test Step",
+        step_type="autonomous",
+        status="pending"
+    )
+    # Store workflow context for tests
+    database._test_workflow_id = workflow_id
+    database._test_step_id = step["id"]
+
     yield database
     database.close()
 
@@ -50,6 +69,8 @@ class TestSessionManager:
         db.create_run(
             id="run-789",
             loop_name="research",
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
         )
 
         session = session_manager.register_session(
@@ -123,6 +144,8 @@ class TestSessionManager:
         db.create_run(
             id="run-123",
             loop_name="research",
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
         )
 
         # Create sessions for this run

@@ -46,7 +46,6 @@ class TestWorkflowResourcesCRUD:
         workflow = project_db.create_workflow(
             id="test-workflow-1",
             name="Test Workflow",
-            namespace="test",
         )
 
         # Create a resource
@@ -70,7 +69,6 @@ class TestWorkflowResourcesCRUD:
         workflow = project_db.create_workflow(
             id="test-workflow-2",
             name="Test Workflow 2",
-            namespace="test2",
         )
 
         # Create resources of different types
@@ -100,10 +98,10 @@ class TestWorkflowResourcesCRUD:
         """Test that workflows cannot access each other's resources."""
         # TODO: Verify expected behavior with user
         workflow1 = project_db.create_workflow(
-            id="workflow-1", name="Workflow 1", namespace="ns1"
+            id="workflow-1", name="Workflow 1"
         )
         workflow2 = project_db.create_workflow(
-            id="workflow-2", name="Workflow 2", namespace="ns2"
+            id="workflow-2", name="Workflow 2"
         )
 
         # Create resource on workflow 1
@@ -130,7 +128,6 @@ class TestWorkflowResourcesCRUD:
         workflow = project_db.create_workflow(
             id="delete-test-workflow",
             name="To Be Deleted",
-            namespace="delete_test",
         )
 
         resource = project_db.create_workflow_resource(
@@ -200,7 +197,6 @@ class TestWorkItemCreationRequiresWorkflow:
         workflow = project_db.create_workflow(
             id="item-test-workflow",
             name="Item Test",
-            namespace="item_test",
         )
 
         # Create a step for the workflow
@@ -245,7 +241,6 @@ class TestImportWorkflowResource:
         workflow = project_db.create_workflow(
             id="import-test-workflow",
             name="Import Test",
-            namespace="import_test",
         )
 
         # Import it into the workflow (creates a copy)
@@ -305,7 +300,7 @@ class TestWorkflowResourceVersioning:
         """Test that updating a resource creates a version snapshot of the old state."""
         # Create workflow and resource
         workflow = project_db.create_workflow(
-            id="version-test-1", name="Version Test", namespace="vtest"
+            id="version-test-1", name="Version Test"
         )
         resource = project_db.create_workflow_resource(
             workflow_id=workflow["id"],
@@ -332,7 +327,7 @@ class TestWorkflowResourceVersioning:
     def test_update_only_creates_version_when_content_changes(self, project_db):
         """Test that updating only enabled/file_path does NOT create a version."""
         workflow = project_db.create_workflow(
-            id="version-test-2", name="Version Test 2", namespace="vtest2"
+            id="version-test-2", name="Version Test 2"
         )
         resource = project_db.create_workflow_resource(
             workflow_id=workflow["id"],
@@ -352,7 +347,7 @@ class TestWorkflowResourceVersioning:
     def test_optimistic_locking_detects_conflict(self, project_db):
         """Test that optimistic locking returns conflict when timestamps mismatch."""
         workflow = project_db.create_workflow(
-            id="lock-test-1", name="Lock Test", namespace="locktest"
+            id="lock-test-1", name="Lock Test"
         )
         resource = project_db.create_workflow_resource(
             workflow_id=workflow["id"],
@@ -380,7 +375,7 @@ class TestWorkflowResourceVersioning:
     def test_optimistic_locking_allows_when_timestamps_match(self, project_db):
         """Test that optimistic locking allows update when timestamps match."""
         workflow = project_db.create_workflow(
-            id="lock-test-2", name="Lock Test 2", namespace="locktest2"
+            id="lock-test-2", name="Lock Test 2"
         )
         resource = project_db.create_workflow_resource(
             workflow_id=workflow["id"],
@@ -403,7 +398,7 @@ class TestWorkflowResourceVersioning:
     def test_restore_version_creates_snapshot_first(self, project_db):
         """Test that restore creates a version snapshot before overwriting."""
         workflow = project_db.create_workflow(
-            id="restore-test-1", name="Restore Test", namespace="rtest"
+            id="restore-test-1", name="Restore Test"
         )
         resource = project_db.create_workflow_resource(
             workflow_id=workflow["id"],
@@ -437,7 +432,7 @@ class TestWorkflowResourceVersioning:
     def test_restore_validates_version_belongs_to_resource(self, project_db):
         """Test that restore rejects versions from other resources."""
         workflow = project_db.create_workflow(
-            id="restore-test-2", name="Restore Test 2", namespace="rtest2"
+            id="restore-test-2", name="Restore Test 2"
         )
         resource1 = project_db.create_workflow_resource(
             workflow_id=workflow["id"],
@@ -468,7 +463,7 @@ class TestWorkflowResourceVersioning:
     def test_version_cascade_delete(self, project_db):
         """Test that deleting a resource cascades to its versions."""
         workflow = project_db.create_workflow(
-            id="cascade-test-1", name="Cascade Test", namespace="cascade"
+            id="cascade-test-1", name="Cascade Test"
         )
         resource = project_db.create_workflow_resource(
             workflow_id=workflow["id"],
@@ -497,7 +492,7 @@ class TestWorkflowResourceVersioning:
     def test_version_cleanup_keeps_recent(self, project_db):
         """Test that version cleanup keeps the N most recent versions."""
         workflow = project_db.create_workflow(
-            id="cleanup-test", name="Cleanup Test", namespace="cleanup"
+            id="cleanup-test", name="Cleanup Test"
         )
         resource = project_db.create_workflow_resource(
             workflow_id=workflow["id"],

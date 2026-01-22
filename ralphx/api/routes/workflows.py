@@ -62,7 +62,6 @@ class WorkflowResponse(BaseModel):
     id: str
     template_id: Optional[str] = None
     name: str
-    namespace: str
     status: str
     current_step: int
     created_at: str
@@ -222,23 +221,6 @@ def _get_project_db(slug: str) -> ProjectDatabase:
     return ProjectDatabase(project["path"])
 
 
-def _generate_namespace(name: str) -> str:
-    """Generate a valid namespace from a workflow name."""
-    import re
-
-    # Convert to lowercase, replace spaces with dashes
-    ns = name.lower().replace(" ", "-")
-    # Remove invalid characters
-    ns = re.sub(r"[^a-z0-9_-]", "", ns)
-    # Ensure it starts with a letter
-    if not ns or not ns[0].isalpha():
-        ns = "w" + ns
-    # Truncate to 64 chars and add unique suffix
-    ns = ns[:56]
-    suffix = uuid.uuid4().hex[:7]
-    return f"{ns}-{suffix}"
-
-
 def _workflow_to_response(
     workflow: dict, steps: list[dict], pdb: Optional[ProjectDatabase] = None
 ) -> WorkflowResponse:
@@ -366,7 +348,6 @@ def _workflow_to_response(
         id=workflow["id"],
         template_id=workflow.get("template_id"),
         name=workflow["name"],
-        namespace=workflow["namespace"],
         status=workflow["status"],
         current_step=workflow["current_step"],
         created_at=workflow["created_at"],
@@ -511,9 +492,8 @@ async def create_workflow(slug: str, request: CreateWorkflowRequest):
     """
     pdb = _get_project_db(slug)
 
-    # Generate unique ID and namespace
+    # Generate unique ID
     workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
-    namespace = _generate_namespace(request.name)
 
     # Get template steps if template specified (templates still use "phases" internally)
     template_steps = []
@@ -531,7 +511,6 @@ async def create_workflow(slug: str, request: CreateWorkflowRequest):
     workflow = pdb.create_workflow(
         id=workflow_id,
         name=request.name,
-        namespace=namespace,
         template_id=request.template_id,
         status="draft",
     )

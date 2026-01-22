@@ -269,8 +269,17 @@ async def stream_planning_response(slug: str, workflow_id: str):
             detail="Planning session is not active",
         )
 
-    # Get workflow for context
+    # Get workflow and current step for context
     workflow = pdb.get_workflow(workflow_id)
+
+    # Get the step to access its config (tools, model, timeout)
+    step = pdb.get_workflow_step(session["step_id"])
+    step_config = step.get("config", {}) if step else {}
+
+    # Extract configuration from step
+    allowed_tools = step_config.get("allowedTools", [])
+    model = step_config.get("model", "opus")  # Default to opus for design docs
+    timeout = step_config.get("timeout", 180)
 
     async def generate_response():
         """Generate streaming response from Claude."""
@@ -290,7 +299,12 @@ async def stream_planning_response(slug: str, workflow_id: str):
         accumulated = ""
 
         try:
-            async for event in service.stream_response(messages):
+            async for event in service.stream_response(
+                messages,
+                model=model,
+                tools=allowed_tools if allowed_tools else None,
+                timeout=timeout,
+            ):
                 if event.type == AdapterEvent.TEXT:
                     text = event.text or ""
                     accumulated += text
@@ -405,9 +419,9 @@ async def complete_planning_session(
 
     # Get workflow info
     workflow = pdb.get_workflow(workflow_id)
-    namespace = workflow["namespace"]
 
     # Save artifacts as project resources
+    # Use workflow_id for unique filenames (namespace was removed in schema v16)
     from pathlib import Path
     from datetime import datetime
 
@@ -416,7 +430,7 @@ async def complete_planning_session(
         resource_path = Path(project["path"]) / ".ralphx" / "resources"
         resource_path.mkdir(parents=True, exist_ok=True)
 
-        doc_filename = f"design-doc-{namespace}.md"
+        doc_filename = f"design-doc-{workflow_id}.md"
         doc_path = resource_path / doc_filename
         doc_path.write_text(artifacts["design_doc"])
 
@@ -442,7 +456,7 @@ async def complete_planning_session(
         resource_path = Path(project["path"]) / ".ralphx" / "resources"
         resource_path.mkdir(parents=True, exist_ok=True)
 
-        guardrails_filename = f"guardrails-{namespace}.md"
+        guardrails_filename = f"guardrails-{workflow_id}.md"
         guardrails_path = resource_path / guardrails_filename
         guardrails_path.write_text(artifacts["guardrails"])
 

@@ -763,9 +763,6 @@ class LoopExecutor:
             template = template.replace("{{input_item.title}}", title)
             template = template.replace("{{input_item}}", content)  # Alias
             template = template.replace("{{workflow_id}}", workflow_id_val)
-            # Backward compatibility for old templates using namespace/source_loop
-            template = template.replace("{{namespace}}", workflow_id_val)
-            template = template.replace("{{source_loop}}", workflow_id_val)
 
             # hank-rcm style variables (for PROMPT_IMPL.md compatibility)
             # Using {VAR} format to match ralph_impl.sh templates exactly

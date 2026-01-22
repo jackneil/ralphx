@@ -50,8 +50,27 @@ def project_dir():
 
 @pytest.fixture
 def db(project_dir):
-    """Create a project database."""
+    """Create a project database with workflow context."""
     db = ProjectDatabase(project_dir)
+
+    # Create workflow context for tests
+    workflow_id = "wf-preview-test"
+    db.create_workflow(
+        id=workflow_id,
+        name="Preview Test Workflow",
+        status="active"
+    )
+    step = db.create_workflow_step(
+        workflow_id=workflow_id,
+        step_number=1,
+        name="Test Step",
+        step_type="autonomous",
+        status="pending"
+    )
+    # Store workflow context for tests
+    db._test_workflow_id = workflow_id
+    db._test_step_id = step["id"]
+
     yield db
     db.close()
 
@@ -186,11 +205,12 @@ class TestPromptPreviewEngine:
 
     def test_generate_preview_consumer_loop(self, project_dir, db, consumer_loop_config):
         """Test preview for a consumer loop with sample item."""
-        # Create a sample item in the source loop
+        # Create a sample item in the source step
         db.create_work_item(
             id="item-001",
+            workflow_id=db._test_workflow_id,
+            source_step_id=db._test_step_id,
             content="As a user, I want to login",
-            source_loop="research",
         )
         # Mark as completed so it's available for consumption
         db.complete_work_item("item-001")
@@ -206,7 +226,7 @@ class TestPromptPreviewEngine:
 
         # Template variables should include consumer variables
         assert "{{input_item}}" in preview.template_variables
-        assert "{{source_loop}}" in preview.template_variables
+        assert "{{workflow_id}}" in preview.template_variables
 
         # Rendered prompt should have substituted values
         impl = preview.modes[0]

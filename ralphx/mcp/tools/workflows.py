@@ -89,7 +89,6 @@ def list_workflows(
             {
                 "id": w["id"],
                 "name": w["name"],
-                "namespace": w["namespace"],
                 "status": w["status"],
                 "current_step": w["current_step"],
                 "template_id": w.get("template_id"),
@@ -130,7 +129,6 @@ def get_workflow(slug: str, workflow_id: str) -> dict:
     return {
         "id": workflow["id"],
         "name": workflow["name"],
-        "namespace": workflow["namespace"],
         "status": workflow["status"],
         "current_step": workflow["current_step"],
         "template_id": workflow.get("template_id"),
@@ -157,7 +155,6 @@ def create_workflow(
     slug: str,
     name: str,
     template_id: Optional[str] = None,
-    namespace: Optional[str] = None,
 ) -> dict:
     """Create a new workflow, optionally from a template."""
     manager = get_manager()
@@ -168,11 +165,8 @@ def create_workflow(
 
     project_db = manager.get_project_db(project.path)
 
-    # Generate unique ID and namespace
+    # Generate unique ID
     workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
-    if not namespace:
-        namespace = name.lower().replace(" ", "-")[:56]
-        namespace = f"{namespace}-{uuid.uuid4().hex[:7]}"
 
     # Get template steps if specified
     template_steps = []
@@ -194,7 +188,6 @@ def create_workflow(
         project_db.create_workflow(
             id=workflow_id,
             name=name,
-            namespace=namespace,
             template_id=template_id,
             status="draft",
         )
@@ -223,7 +216,6 @@ def create_workflow(
     return {
         "id": workflow_id,
         "name": name,
-        "namespace": namespace,
         "template_id": template_id,
         "step_count": len(template_steps),
         "message": "Workflow created",
@@ -563,17 +555,82 @@ def list_workflow_templates(slug: str) -> dict:
 
 # Workflow Step tools
 
+# Processing type configurations - matches frontend StepSettings.tsx
+PROCESSING_TYPES = {
+    "design_doc": {
+        "label": "Build Design Doc",
+        "description": "Interactive chat with web research to create a design document",
+        "step_type": "interactive",
+        "config": {
+            "loopType": "design_doc",
+            "allowedTools": ["WebSearch", "WebFetch", "Bash", "Read", "Glob", "Grep"],
+            "model": "opus",
+            "timeout": 300,
+        },
+    },
+    "extractgen_requirements": {
+        "label": "Generate Stories (Extract)",
+        "description": "Extract user stories from design documents",
+        "step_type": "autonomous",
+        "config": {
+            "loopType": "generator",
+            "template": "extractgen_requirements",
+            "allowedTools": ["WebSearch", "WebFetch"],
+            "model": "opus",
+            "timeout": 600,
+            "max_iterations": 100,
+            "cooldown_between_iterations": 5,
+            "max_consecutive_errors": 5,
+        },
+    },
+    "webgen_requirements": {
+        "label": "Generate Stories (WebSearch)",
+        "description": "Discover missing requirements via web research",
+        "step_type": "autonomous",
+        "config": {
+            "loopType": "generator",
+            "template": "webgen_requirements",
+            "allowedTools": ["WebSearch", "WebFetch"],
+            "model": "opus",
+            "timeout": 900,
+            "max_iterations": 15,
+            "cooldown_between_iterations": 15,
+            "max_consecutive_errors": 3,
+        },
+    },
+    "implementation": {
+        "label": "Implementation",
+        "description": "Consumes stories and commits code to git",
+        "step_type": "autonomous",
+        "config": {
+            "loopType": "consumer",
+            "template": "implementation",
+            "allowedTools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+            "model": "opus",
+            "timeout": 1800,
+            "max_iterations": 50,
+            "cooldown_between_iterations": 5,
+            "max_consecutive_errors": 3,
+        },
+    },
+}
+
 
 def create_workflow_step(
     slug: str,
     workflow_id: str,
-    name: str,
-    step_type: str,
+    step_name: str,
+    processing_type: str,
     step_number: Optional[int] = None,
-    config: Optional[dict] = None,
     loop_name: Optional[str] = None,
 ) -> dict:
-    """Create a new step in a workflow.
+    """Create a new step in a workflow from a processing type.
+
+    Processing types:
+    - design_doc: Interactive chat to build a design document (with web search)
+    - extractgen_requirements: Extract user stories from design documents
+    - webgen_requirements: Discover requirements via web research
+    - implementation: Implement stories and commit code
 
     If step_number is not provided, appends to end.
     """
@@ -589,29 +646,34 @@ def create_workflow_step(
     if not workflow:
         raise ToolError.workflow_not_found(workflow_id)
 
-    valid_types = ["planning", "autonomous", "manual", "review"]
-    if step_type not in valid_types:
+    if processing_type not in PROCESSING_TYPES:
         raise ToolError.validation_error(
-            f"Invalid step_type: {step_type}. Must be one of: {valid_types}",
+            f"Invalid processing_type: {processing_type}. "
+            f"Must be one of: {list(PROCESSING_TYPES.keys())}",
         )
+
+    # Get the processing type configuration
+    type_config = PROCESSING_TYPES[processing_type]
+    step_type = type_config["step_type"]
+    config = {**type_config["config"]}  # Copy to avoid mutation
 
     try:
         if step_number is None:
             # Use atomic creation that auto-calculates step number
             step = project_db.create_workflow_step_atomic(
                 workflow_id=workflow_id,
-                name=name,
+                name=step_name,
                 step_type=step_type,
-                config=config or {},
+                config=config,
                 loop_name=loop_name,
             )
         else:
             step = project_db.create_workflow_step(
                 workflow_id=workflow_id,
                 step_number=step_number,
-                name=name,
+                name=step_name,
                 step_type=step_type,
-                config=config or {},
+                config=config,
                 loop_name=loop_name,
                 status="pending",
             )
@@ -627,7 +689,9 @@ def create_workflow_step(
         "step_number": step["step_number"],
         "name": step["name"],
         "step_type": step["step_type"],
-        "message": "Step created",
+        "processing_type": processing_type,
+        "config": config,
+        "message": f"Step created with {type_config['label']} configuration",
     }
 
 
@@ -877,7 +941,6 @@ def get_workflow_tools() -> list[ToolDefinition]:
                     "slug": prop_string("Project slug"),
                     "name": prop_string("Workflow name"),
                     "template_id": prop_string("Template ID (optional)"),
-                    "namespace": prop_string("Custom namespace (optional)"),
                 },
                 required=["slug", "name"],
             ),
@@ -984,18 +1047,18 @@ def get_workflow_tools() -> list[ToolDefinition]:
         # Step management
         ToolDefinition(
             name="ralphx_create_workflow_step",
-            description="Create a new step in a workflow",
+            description="Create a new step in a workflow. Processing types: design_doc (interactive chat with web research), extractgen_requirements (extract stories from docs), webgen_requirements (web research for requirements), implementation (implement stories)",
             handler=create_workflow_step,
             input_schema=make_schema(
                 properties={
                     "slug": prop_string("Project slug"),
                     "workflow_id": prop_string("Workflow ID"),
-                    "name": prop_string("Step name"),
-                    "step_type": prop_enum("Step type", ["planning", "autonomous", "manual", "review"]),
+                    "step_name": prop_string("Step name (e.g., 'Design Document', 'Story Generation')"),
+                    "processing_type": prop_enum("Processing type", ["design_doc", "extractgen_requirements", "webgen_requirements", "implementation"]),
                     "step_number": prop_int("Step number (optional, defaults to append)"),
                     "loop_name": prop_string("Loop name for autonomous steps"),
                 },
-                required=["slug", "workflow_id", "name", "step_type"],
+                required=["slug", "workflow_id", "step_name", "processing_type"],
             ),
         ),
         ToolDefinition(

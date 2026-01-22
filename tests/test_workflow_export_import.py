@@ -38,7 +38,6 @@ def workflow_with_data(project_db: ProjectDatabase) -> dict:
     workflow = project_db.create_workflow(
         id="wf-test-123",
         name="Test Workflow",
-        namespace="test-export",
         template_id="build-product",
         status="active",
     )
@@ -105,7 +104,7 @@ class TestWorkflowExporter:
         preview = exporter.get_preview(workflow["id"])
 
         assert preview.workflow_name == "Test Workflow"
-        assert preview.workflow_namespace == "test-export"
+        assert preview.workflow_id == "wf-test-123"
         assert preview.steps_count == 2
         assert preview.items_total == 5
         assert preview.resources_count == 2
@@ -126,7 +125,7 @@ class TestWorkflowExporter:
         zip_bytes, filename = exporter.export_workflow(workflow["id"])
 
         # Check filename format
-        assert filename.startswith("workflow-test-export-")
+        assert filename.startswith("workflow-wf-test-123-")
         assert filename.endswith(".ralphx.zip")
 
         # Verify ZIP contents
@@ -254,11 +253,6 @@ class TestWorkflowImporter:
 
         # Should have different workflow IDs
         assert result1.workflow_id != result2.workflow_id
-
-        # Should have different namespaces (auto-suffixed)
-        wf1 = project_db.get_workflow(result1.workflow_id)
-        wf2 = project_db.get_workflow(result2.workflow_id)
-        assert wf1["namespace"] != wf2["namespace"]
 
     def test_import_with_selective_options(self, project_db: ProjectDatabase, workflow_with_data: dict):
         """Test selective import."""
@@ -422,7 +416,6 @@ class TestEdgeCases:
         workflow = project_db.create_workflow(
             id="wf-no-steps",
             name="Empty Workflow",
-            namespace="empty-workflow",
             template_id="build-product",
             status="draft",
         )
@@ -444,7 +437,6 @@ class TestEdgeCases:
         workflow = project_db.create_workflow(
             id="wf-no-steps",
             name="Empty Workflow",
-            namespace="empty-workflow",
             template_id="build-product",
             status="draft",
         )

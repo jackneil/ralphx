@@ -23,7 +23,7 @@ class TestJsonlImport:
         db.seed_defaults_if_empty()
 
         # Create a workflow for the items
-        db.create_workflow("test-workflow", "Test Workflow", namespace="test")
+        db.create_workflow("test-workflow", "Test Workflow")
         db.create_workflow_step(
             workflow_id="test-workflow",
             step_number=1,

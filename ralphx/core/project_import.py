@@ -30,7 +30,6 @@ class WorkflowPreviewInfo:
     """Preview info for a workflow in the project export."""
     id: str
     name: str
-    namespace: str
     steps_count: int
     items_count: int
     resources_count: int
@@ -263,8 +262,13 @@ class ProjectImporter:
 
         # Get workflow info from manifest
         for wf_info in manifest.get('contents', {}).get('workflows', []):
-            wf_namespace = wf_info['namespace']
-            wf_prefix = f"workflows/{wf_namespace}/"
+            wf_id = wf_info['id']
+            # Support both new (workflow_id) and old (namespace) path formats
+            wf_prefix = f"workflows/{wf_id}/"
+            # Check for old namespace-based paths for backward compatibility
+            old_namespace = wf_info.get('namespace')
+            if old_namespace and f"workflows/{old_namespace}/workflow.json" in zf.namelist():
+                wf_prefix = f"workflows/{old_namespace}/"
 
             # Count items
             items_count = 0
@@ -304,7 +308,6 @@ class ProjectImporter:
             workflows_info.append(WorkflowPreviewInfo(
                 id=wf_info['id'],
                 name=wf_info['name'],
-                namespace=wf_namespace,
                 steps_count=steps_count,
                 items_count=items_count,
                 resources_count=resources_count,
@@ -354,7 +357,6 @@ class ProjectImporter:
             workflows=[WorkflowPreviewInfo(
                 id=wf_info.get('id', ''),
                 name=wf_info.get('name', ''),
-                namespace=wf_info.get('namespace', ''),
                 steps_count=contents.get('steps', 0),
                 items_count=contents.get('items_total', 0),
                 resources_count=contents.get('resources', 0),
@@ -484,8 +486,13 @@ class ProjectImporter:
         import hashlib
         import uuid
 
-        wf_namespace = wf_info['namespace']
-        wf_prefix = f"workflows/{wf_namespace}/"
+        wf_id = wf_info['id']
+        # Support both new (workflow_id) and old (namespace) path formats
+        wf_prefix = f"workflows/{wf_id}/"
+        # Check for old namespace-based paths for backward compatibility
+        old_namespace = wf_info.get('namespace')
+        if old_namespace and f"workflows/{old_namespace}/workflow.json" in zf.namelist():
+            wf_prefix = f"workflows/{old_namespace}/"
 
         # Read workflow data
         workflow_data = json.loads(zf.read(f"{wf_prefix}workflow.json").decode('utf-8'))
@@ -522,15 +529,10 @@ class ProjectImporter:
             hash_suffix = hashlib.md5(f"{old_id}-{uuid.uuid4().hex}".encode()).hexdigest()[:8]
             id_mapping[old_id] = f"{old_id}-{hash_suffix}"
 
-        # Generate unique namespace
-        base_namespace = workflow_data['workflow']['namespace']
-        namespace = self._generate_unique_namespace(base_namespace)
-
         # Create workflow
         workflow = self.db.create_workflow(
             id=new_wf_id,
             name=workflow_data['workflow']['name'],
-            namespace=namespace,
             template_id=workflow_data['workflow'].get('template_id'),
             status='draft',
         )
@@ -666,20 +668,3 @@ class ProjectImporter:
             id_mapping=id_mapping,
             warnings=warnings,
         )
-
-    def _generate_unique_namespace(self, base_namespace: str) -> str:
-        """Generate a unique namespace."""
-        import uuid
-
-        existing_workflows = self.db.list_workflows()
-        existing_namespaces = {w['namespace'] for w in existing_workflows}
-
-        if base_namespace not in existing_namespaces:
-            return base_namespace
-
-        for i in range(1, 1000):
-            candidate = f"{base_namespace[:56]}-{i}"
-            if candidate not in existing_namespaces:
-                return candidate
-
-        return f"{base_namespace[:50]}-{uuid.uuid4().hex[:8]}"

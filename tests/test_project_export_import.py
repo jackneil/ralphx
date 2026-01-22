@@ -52,7 +52,6 @@ def project_with_workflows(project_db: ProjectDatabase) -> list[dict]:
         workflow = project_db.create_workflow(
             id=f"wf-test-{i}",
             name=f"Workflow {i}",
-            namespace=f"workflow-{i}",
             template_id="build-product",
             status="active",
         )
@@ -156,10 +155,10 @@ class TestProjectExporter:
 
             # Check each workflow directory exists
             for wf in project_with_workflows:
-                namespace = wf["namespace"]
-                assert f"workflows/{namespace}/workflow.json" in names
-                assert f"workflows/{namespace}/items.jsonl" in names
-                assert f"workflows/{namespace}/resources/resources.json" in names
+                wf_id = wf["id"]
+                assert f"workflows/{wf_id}/workflow.json" in names
+                assert f"workflows/{wf_id}/items.jsonl" in names
+                assert f"workflows/{wf_id}/resources/resources.json" in names
 
     def test_export_selected_workflows(
         self,
@@ -287,13 +286,13 @@ class TestProjectImporter:
         assert result.success
         assert result.workflows_imported == 1
 
-    def test_import_generates_unique_namespaces(
+    def test_import_generates_unique_ids(
         self,
         project_db: ProjectDatabase,
         project_info: dict,
         project_with_workflows: list[dict],
     ):
-        """Test that importing creates unique namespaces."""
+        """Test that importing creates unique workflow IDs."""
         exporter = ProjectExporter(project_db, project_info)
         zip_bytes, _ = exporter.export_project()
 

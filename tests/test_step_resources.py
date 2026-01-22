@@ -25,7 +25,6 @@ def workflow_with_step(project_db):
     workflow = project_db.create_workflow(
         id=workflow_id,
         name="Test Workflow",
-        namespace=f"test-{workflow_id}",
     )
 
     # Create a step

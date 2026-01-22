@@ -1158,6 +1158,132 @@ export async function getUsage(projectPath?: string): Promise<UsageData> {
 }
 
 // ============================================================================
+// Multi-Account Management API
+// ============================================================================
+
+export interface AccountUsage {
+  five_hour: number              // percentage 0-100
+  seven_day: number              // percentage 0-100
+  five_hour_resets_at?: string   // ISO timestamp
+  seven_day_resets_at?: string   // ISO timestamp
+}
+
+export interface Account {
+  id: number
+  email: string
+  display_name?: string
+  subscription_type?: string
+  rate_limit_tier?: string
+  is_default: boolean
+  is_active: boolean
+  expires_at?: number
+  expires_in_seconds?: number
+  is_expired: boolean
+  usage?: AccountUsage
+  usage_cached_at?: number
+  projects_using: number
+  last_error?: string
+  last_error_at?: string
+  consecutive_failures: number
+  created_at?: string
+}
+
+export interface ProjectAccountAssignment {
+  project_id: string
+  account_id: number
+  account_email: string
+  account_display_name?: string
+  subscription_type?: string
+  is_active: boolean
+  is_default: boolean
+  allow_fallback: boolean
+  usage?: AccountUsage
+}
+
+export interface AssignAccountRequest {
+  account_id: number
+  allow_fallback: boolean
+}
+
+// List all connected Claude accounts
+export async function listAccounts(includeInactive: boolean = false): Promise<Account[]> {
+  const params = includeInactive ? '?include_inactive=true' : ''
+  return request<Account[]>(`/auth/accounts${params}`)
+}
+
+// Start OAuth flow to add a new account
+export async function addAccount(): Promise<{ success: boolean; flow_id: string; message: string }> {
+  return request('/auth/accounts/add', { method: 'POST' })
+}
+
+// Get a specific account
+export async function getAccount(accountId: number): Promise<Account> {
+  return request<Account>(`/auth/accounts/${accountId}`)
+}
+
+// Update account display name or active status
+export async function updateAccount(
+  accountId: number,
+  data: { display_name?: string; is_active?: boolean }
+): Promise<Account> {
+  return request<Account>(`/auth/accounts/${accountId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  })
+}
+
+// Remove an account
+export async function removeAccount(accountId: number): Promise<{ success: boolean }> {
+  return request(`/auth/accounts/${accountId}`, { method: 'DELETE' })
+}
+
+// Set an account as default
+export async function setDefaultAccount(accountId: number): Promise<Account> {
+  return request<Account>(`/auth/accounts/${accountId}/set-default`, { method: 'POST' })
+}
+
+// Force refresh account token
+export async function refreshAccountToken(accountId: number): Promise<{ success: boolean; message?: string }> {
+  return request(`/auth/accounts/${accountId}/refresh`, { method: 'POST' })
+}
+
+// Refresh usage cache for a single account
+export async function refreshAccountUsage(accountId: number): Promise<{ success: boolean; usage?: AccountUsage; error?: string }> {
+  return request(`/auth/accounts/${accountId}/refresh-usage`, { method: 'POST' })
+}
+
+// Refresh usage cache for all accounts
+export async function refreshAllAccountsUsage(): Promise<{ updated: number; failed: number }> {
+  return request('/auth/accounts/refresh-all-usage', { method: 'POST' })
+}
+
+// Get account assigned to a project
+export async function getProjectAccount(projectId: string): Promise<ProjectAccountAssignment | null> {
+  return request<ProjectAccountAssignment | null>(`/auth/projects/${projectId}/account`)
+}
+
+// Assign an account to a project
+export async function assignProjectAccount(
+  projectId: string,
+  req: AssignAccountRequest
+): Promise<ProjectAccountAssignment> {
+  return request<ProjectAccountAssignment>(`/auth/projects/${projectId}/account`, {
+    method: 'POST',
+    body: JSON.stringify(req),
+  })
+}
+
+// Remove account assignment from a project (will use default)
+export async function unassignProjectAccount(projectId: string): Promise<{ success: boolean; message: string }> {
+  return request(`/auth/projects/${projectId}/account`, { method: 'DELETE' })
+}
+
+// Get the effective account for a project (resolves assignment or default)
+export async function getEffectiveProjectAccount(projectId: string): Promise<Account | null> {
+  return request<Account | null>(`/auth/projects/${projectId}/effective-account`)
+}
+
+// ============================================================================
 // Logs API
 // ============================================================================
 
@@ -1382,7 +1508,6 @@ export interface Workflow {
   id: string
   template_id?: string
   name: string
-  namespace: string
   status: 'draft' | 'active' | 'paused' | 'completed'
   current_step: number
   created_at: string
@@ -2230,7 +2355,7 @@ export function getStatusColor(status: string): string {
 
 export interface ExportPreview {
   workflow_name: string
-  workflow_namespace: string
+  workflow_id: string
   steps_count: number
   items_total: number
   resources_count: number
@@ -2296,7 +2421,7 @@ export interface ResourcePreviewInfo {
 
 export interface ImportPreview {
   workflow_name: string
-  workflow_namespace: string
+  workflow_id: string
   exported_at: string
   ralphx_version: string
   schema_version: number

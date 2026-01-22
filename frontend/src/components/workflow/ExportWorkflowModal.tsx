@@ -57,7 +57,7 @@ export default function ExportWorkflowModal({
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `workflow-${preview?.workflow_namespace || workflowId}-${new Date().toISOString().slice(0,10)}.ralphx.zip`
+      a.download = `workflow-${preview?.workflow_id || workflowId}-${new Date().toISOString().slice(0,10)}.ralphx.zip`
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)

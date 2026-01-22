@@ -124,14 +124,10 @@ def _create_workflow_with_stories(
             logger.warning(f"Template '{template_id}' not found")
             return None
 
-        # Generate namespace
-        namespace = f"excuse-gen-{uuid.uuid4().hex[:7]}"
-
-        # Create workflow
+        # Create workflow (namespace parameter removed in schema v16)
         workflow = project_db.create_workflow(
             id=workflow_id,
             name="Build Excuse Generator",
-            namespace=namespace,
             template_id=template_id,
             status="draft",
         )

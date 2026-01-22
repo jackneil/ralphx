@@ -750,7 +750,7 @@ limits:
 
 def generate_simple_implementation_config(
     name: str,
-    namespace: Optional[str] = None,
+    source_loop: Optional[str] = None,
     display_name: str = "Implementation",
     description: str = "",
     max_iterations: Optional[int] = None,
@@ -761,7 +761,7 @@ def generate_simple_implementation_config(
 
     Args:
         name: Unique loop ID (auto-generated, e.g., implementation-20260115_1).
-        namespace: Namespace to consume stories from.
+        source_loop: Source loop name to consume items from.
         display_name: User-facing name (can be duplicated across loops).
         description: Optional user-provided description.
         max_iterations: Override for max iterations (default: 50).
@@ -771,7 +771,7 @@ def generate_simple_implementation_config(
     Returns:
         YAML configuration string.
     """
-    source_section = f"    source: {namespace}" if namespace else ""
+    source_section = f"    source: {source_loop}" if source_loop else ""
     desc_line = description if description else "Implement user stories as working code"
 
     # Apply defaults if not specified

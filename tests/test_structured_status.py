@@ -120,7 +120,6 @@ class TestDatabaseStatusUpdate:
         db.create_workflow(
             id=workflow_id,
             name="Test Workflow",
-            namespace="test-ns",
         )
 
         # Create work item
@@ -337,7 +336,6 @@ class TestExecutorStructuredStatus:
         db.create_workflow(
             id=wf_id,
             name="Executor Test Workflow",
-            namespace="test_ns",
         )
         return wf_id
 
@@ -361,7 +359,6 @@ class TestExecutorStructuredStatus:
         db.create_workflow(
             id=workflow_id,
             name="Test Workflow",
-            namespace="test-ns",
         )
 
         # Create and claim item
@@ -661,7 +658,6 @@ class TestStructuredOutputInIteration:
         db.create_workflow(
             id=workflow_id,
             name="Batch Test Workflow",
-            namespace="batch-ns",
         )
 
         # Create executor in batch mode

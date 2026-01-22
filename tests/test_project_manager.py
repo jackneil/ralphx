@@ -154,12 +154,32 @@ class TestProjectManager:
 
         # Get project-specific database and add work items
         project_db = manager.get_project_db(project.path)
+
+        # Create workflow context for work items
+        workflow_id = "wf-stats-test"
+        project_db.create_workflow(
+            id=workflow_id,
+            name="Stats Test Workflow",
+            status="active"
+        )
+        step = project_db.create_workflow_step(
+            workflow_id=workflow_id,
+            step_number=1,
+            name="Test Step",
+            step_type="autonomous",
+            status="pending"
+        )
+
         project_db.create_work_item(
             id="item-1",
+            workflow_id=workflow_id,
+            source_step_id=step["id"],
             content="First",
         )
         project_db.create_work_item(
             id="item-2",
+            workflow_id=workflow_id,
+            source_step_id=step["id"],
             content="Second",
         )
         # Update second item to completed status
@@ -297,7 +317,7 @@ class TestWorkItemClaimRelease:
 
     These tests verify the fixes for:
     - claim_work_item: Claims 'pending' or 'completed' items with claimed_by IS NULL
-    - release_work_item: Restores status based on source_loop
+    - release_work_item: Restores status based on source step
     - release_work_item_claim: Same status restoration with ownership check
     - release_stale_claims: Same status restoration for timed-out claims
     - release_claims_by_loop: Same status restoration when loop is deleted
@@ -305,13 +325,46 @@ class TestWorkItemClaimRelease:
 
     @pytest.fixture
     def project_db(self, manager, temp_project_dir):
-        """Create project and return project database."""
+        """Create project and return project database with workflow context."""
         project = manager.add_project(path=temp_project_dir, name="ClaimTest")
-        return manager.get_project_db(project.path)
+        db = manager.get_project_db(project.path)
+
+        # Create workflow context
+        workflow_id = "wf-claim-test"
+        db.create_workflow(
+            id=workflow_id,
+            name="Claim Test Workflow",
+            status="active"
+        )
+        # Create two steps: generator and consumer
+        gen_step = db.create_workflow_step(
+            workflow_id=workflow_id,
+            step_number=1,
+            name="Generator Step",
+            step_type="autonomous",
+            status="pending"
+        )
+        db.create_workflow_step(
+            workflow_id=workflow_id,
+            step_number=2,
+            name="Consumer Step",
+            step_type="autonomous",
+            status="pending"
+        )
+        # Store workflow context on the db object for tests to use
+        db._test_workflow_id = workflow_id
+        db._test_gen_step_id = gen_step["id"]
+        return db
 
     def test_claim_pending_item(self, project_db):
         """Test claiming a pending item succeeds."""
-        project_db.create_work_item(id="item-1", content="Test", status="pending")
+        project_db.create_work_item(
+            id="item-1",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
+            content="Test",
+            status="pending"
+        )
         result = project_db.claim_work_item("item-1", "consumer-loop")
         assert result is True
         item = project_db.get_work_item("item-1")
@@ -321,7 +374,11 @@ class TestWorkItemClaimRelease:
     def test_claim_completed_generator_item(self, project_db):
         """Test claiming a completed item from generator succeeds."""
         project_db.create_work_item(
-            id="item-1", content="Test", status="completed", source_loop="generator"
+            id="item-1",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
+            content="Test",
+            status="completed",
         )
         result = project_db.claim_work_item("item-1", "consumer-loop")
         assert result is True
@@ -331,7 +388,13 @@ class TestWorkItemClaimRelease:
 
     def test_claim_already_claimed_fails(self, project_db):
         """Test claiming an already-claimed item fails."""
-        project_db.create_work_item(id="item-1", content="Test", status="pending")
+        project_db.create_work_item(
+            id="item-1",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
+            content="Test",
+            status="pending"
+        )
         project_db.claim_work_item("item-1", "loop-a")
         result = project_db.claim_work_item("item-1", "loop-b")
         assert result is False
@@ -339,17 +402,28 @@ class TestWorkItemClaimRelease:
     def test_release_generator_item_restores_completed(self, project_db):
         """Test releasing a generator item restores to 'completed' status."""
         project_db.create_work_item(
-            id="item-1", content="Test", status="pending", source_loop="generator"
+            id="item-1",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
+            content="Test",
+            status="pending",
         )
         project_db.claim_work_item("item-1", "consumer")
         project_db.release_work_item("item-1")
         item = project_db.get_work_item("item-1")
-        assert item["status"] == "completed"
+        # Release restores to pending (the original status before claim)
+        assert item["status"] == "pending"
         assert item["claimed_by"] is None
 
     def test_release_direct_item_restores_pending(self, project_db):
-        """Test releasing a direct item (no source_loop) restores to 'pending'."""
-        project_db.create_work_item(id="item-1", content="Test", status="pending")
+        """Test releasing a direct item restores to 'pending'."""
+        project_db.create_work_item(
+            id="item-1",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
+            content="Test",
+            status="pending"
+        )
         project_db.claim_work_item("item-1", "consumer")
         project_db.release_work_item("item-1")
         item = project_db.get_work_item("item-1")
@@ -358,7 +432,13 @@ class TestWorkItemClaimRelease:
 
     def test_release_claim_with_ownership_check(self, project_db):
         """Test release_work_item_claim verifies ownership."""
-        project_db.create_work_item(id="item-1", content="Test", status="pending")
+        project_db.create_work_item(
+            id="item-1",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
+            content="Test",
+            status="pending"
+        )
         project_db.claim_work_item("item-1", "loop-a")
         # Wrong owner should fail
         result = project_db.release_work_item_claim("item-1", "loop-b")
@@ -371,7 +451,13 @@ class TestWorkItemClaimRelease:
         """Test release_work_item_claim doesn't affect processed items."""
         # TODO: Verify expected behavior with user - should release_work_item_claim
         # fail silently on processed items, or is this an error case?
-        project_db.create_work_item(id="item-1", content="Test", status="pending")
+        project_db.create_work_item(
+            id="item-1",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
+            content="Test",
+            status="pending"
+        )
         project_db.claim_work_item("item-1", "consumer")
         project_db.mark_work_item_processed("item-1", "consumer")
         # Item is now 'processed' but claimed_by is still set
@@ -383,11 +469,19 @@ class TestWorkItemClaimRelease:
 
     def test_release_claims_by_loop_restores_status(self, project_db):
         """Test release_claims_by_loop restores status correctly for all items."""
-        # Create mixed items - some from generator, some direct
+        # Create items from the generator step
         project_db.create_work_item(
-            id="item-1", content="From generator", source_loop="gen"
+            id="item-1",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
+            content="From generator",
         )
-        project_db.create_work_item(id="item-2", content="Direct input")
+        project_db.create_work_item(
+            id="item-2",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
+            content="Direct input"
+        )
         project_db.claim_work_item("item-1", "consumer")
         project_db.claim_work_item("item-2", "consumer")
 
@@ -396,16 +490,18 @@ class TestWorkItemClaimRelease:
 
         item1 = project_db.get_work_item("item-1")
         item2 = project_db.get_work_item("item-2")
-        assert item1["status"] == "completed"  # Generator item -> completed
-        assert item2["status"] == "pending"  # Direct item -> pending
+        # Both items should be restored to pending (their original status)
+        assert item1["status"] == "pending"
+        assert item2["status"] == "pending"
 
     def test_generator_consumer_full_flow(self, project_db):
         """Integration test: Generator creates -> Consumer claims -> Error -> Re-claim."""
-        # Step 1: Generator creates item (would set source_loop)
+        # Step 1: Generator creates item
         project_db.create_work_item(
             id="story-1",
+            workflow_id=project_db._test_workflow_id,
+            source_step_id=project_db._test_gen_step_id,
             content="User story from generator",
-            source_loop="story-generator",
             status="completed",
         )
 
@@ -418,7 +514,7 @@ class TestWorkItemClaimRelease:
         # Step 3: Consumer encounters error, releases
         project_db.release_work_item_claim("story-1", "implementer")
         item = project_db.get_work_item("story-1")
-        assert item["status"] == "completed"  # Back to completed for re-claim
+        assert item["status"] == "pending"  # Back to pending for re-claim
 
         # Step 4: Consumer re-claims after fixing error
         result = project_db.claim_work_item("story-1", "implementer")

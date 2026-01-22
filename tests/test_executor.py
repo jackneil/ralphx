@@ -30,8 +30,27 @@ from ralphx.models.run import RunStatus
 
 @pytest.fixture
 def db():
-    """Create in-memory project database."""
+    """Create in-memory project database with workflow context."""
     database = ProjectDatabase(":memory:")
+
+    # Create workflow context for executor tests
+    workflow_id = "wf-executor-test"
+    database.create_workflow(
+        id=workflow_id,
+        name="Executor Test Workflow",
+        status="active"
+    )
+    step = database.create_workflow_step(
+        workflow_id=workflow_id,
+        step_number=1,
+        name="Test Step",
+        step_type="autonomous",
+        status="pending"
+    )
+    # Store workflow context for tests
+    database._test_workflow_id = workflow_id
+    database._test_step_id = step["id"]
+
     yield database
     database.close()
 
@@ -125,7 +144,8 @@ def mock_adapter():
     adapter = MagicMock()
     adapter.is_running = False
 
-    async def mock_execute(prompt, model, tools, timeout):
+    async def mock_execute(prompt, model, tools, timeout, **kwargs):
+        """Mock execute that accepts any extra kwargs like json_schema."""
         return ExecutionResult(
             session_id="session-123",
             success=True,
@@ -149,6 +169,8 @@ class TestModeSelection:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -168,6 +190,8 @@ class TestModeSelection:
             project=project,
             loop_config=weighted_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -185,6 +209,8 @@ class TestModeSelection:
             project=project,
             loop_config=weighted_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -212,6 +238,8 @@ class TestWorkItemExtraction:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -237,6 +265,8 @@ class TestWorkItemExtraction:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -258,6 +288,8 @@ class TestWorkItemExtraction:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -279,6 +311,8 @@ class TestWorkItemExtraction:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -297,6 +331,8 @@ class TestExecutorRun:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
             dry_run=True,
         )
@@ -314,6 +350,8 @@ class TestExecutorRun:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -330,6 +368,8 @@ class TestExecutorRun:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -344,6 +384,8 @@ class TestExecutorRun:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -376,6 +418,8 @@ class TestExecutorRun:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=adapter,
         )
 
@@ -396,6 +440,8 @@ class TestExecutorEvents:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
             dry_run=True,
         )
@@ -415,6 +461,8 @@ class TestExecutorEvents:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
             dry_run=True,
         )
@@ -435,6 +483,8 @@ class TestExecutorEvents:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
             dry_run=True,
         )
@@ -454,6 +504,8 @@ class TestExecutorEvents:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
 
@@ -476,6 +528,8 @@ class TestExecutorPauseResume:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
             dry_run=True,
         )
@@ -508,6 +562,8 @@ class TestExecutorProperties:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
         assert not executor.is_running
@@ -518,6 +574,8 @@ class TestExecutorProperties:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
         assert executor.run_id is None
@@ -528,6 +586,8 @@ class TestExecutorProperties:
             project=project,
             loop_config=simple_loop_config,
             db=db,
+            workflow_id=db._test_workflow_id,
+            step_id=db._test_step_id,
             adapter=mock_adapter,
         )
         assert executor.current_iteration == 0

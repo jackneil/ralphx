@@ -849,14 +849,14 @@ async def create_simple_loop(slug: str, request: CreateSimpleLoopRequest):
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Source loop '{source_loop}' not found in this project.",
                 )
-            namespace = source_loop  # Use source loop name as namespace
+            source_loop_name = source_loop  # Use source loop name
         elif request.stories_source and request.stories_source.type == "content":
-            # For JSONL uploads, derive namespace from request or loop_id
-            namespace = request.stories_source.namespace or loop_id.replace("-", "_")
+            # For JSONL uploads, derive source from request or loop_id
+            source_loop_name = request.stories_source.namespace or loop_id.replace("-", "_")
 
         config_yaml = generate_simple_implementation_config(
             name=loop_id,
-            namespace=namespace,
+            source_loop=source_loop_name,
             display_name=display_name,
             description=description,
         )

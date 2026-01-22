@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from ralphx.core.project_db import PROJECT_SCHEMA_VERSION, ProjectDatabase, validate_namespace
+from ralphx.core.project_db import PROJECT_SCHEMA_VERSION, ProjectDatabase
 from ralphx.core.workflow_export import EXPORT_FORMAT_NAME, EXPORT_FORMAT_VERSION
 
 
@@ -106,7 +106,7 @@ class ImportPreview:
     """Preview of what will be imported."""
     # Basic info
     workflow_name: str
-    workflow_namespace: str
+    workflow_id: str
     exported_at: str
     ralphx_version: str
     schema_version: int
@@ -254,7 +254,7 @@ class WorkflowImporter:
 
             return ImportPreview(
                 workflow_name=manifest['workflow']['name'],
-                workflow_namespace=manifest['workflow']['namespace'],
+                workflow_id=manifest['workflow']['id'],
                 exported_at=manifest['exported_at'],
                 ralphx_version=manifest.get('ralphx_version', 'unknown'),
                 schema_version=manifest.get('schema_version', 0),
@@ -736,10 +736,6 @@ class WorkflowImporter:
         old_wf_id = workflow_data['workflow']['id']
         new_wf_id = id_mapping[old_wf_id]
 
-        # Generate new namespace (ensure unique)
-        base_namespace = workflow_data['workflow']['namespace']
-        namespace = self._generate_unique_namespace(base_namespace)
-
         # Update items with new IDs
         updated_items = self._update_references(items_data, id_mapping)
 
@@ -747,7 +743,6 @@ class WorkflowImporter:
         workflow = self.db.create_workflow(
             id=new_wf_id,
             name=workflow_data['workflow']['name'],
-            namespace=namespace,
             template_id=workflow_data['workflow'].get('template_id'),
             status='draft',
         )
@@ -905,7 +900,6 @@ class WorkflowImporter:
         original_metadata = {
             'imported_from': {
                 'original_workflow_id': old_wf_id,
-                'original_namespace': workflow_data['workflow']['namespace'],
                 'export_timestamp': manifest.get('exported_at'),
                 'export_version': manifest.get('ralphx_version'),
             },
@@ -1153,21 +1147,3 @@ class WorkflowImporter:
             id_mapping=step_id_mapping,
             warnings=warnings,
         )
-
-    def _generate_unique_namespace(self, base_namespace: str) -> str:
-        """Generate a unique namespace based on the base."""
-        # Check if base namespace exists
-        existing_workflows = self.db.list_workflows()
-        existing_namespaces = {w['namespace'] for w in existing_workflows}
-
-        if base_namespace not in existing_namespaces:
-            return base_namespace
-
-        # Add suffix until unique
-        for i in range(1, 1000):
-            candidate = f"{base_namespace[:56]}-{i}"
-            if candidate not in existing_namespaces:
-                return candidate
-
-        # Fallback with uuid
-        return f"{base_namespace[:50]}-{uuid.uuid4().hex[:8]}"

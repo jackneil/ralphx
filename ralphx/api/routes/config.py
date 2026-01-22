@@ -426,59 +426,6 @@ async def import_jsonl_with_format(
 
 
 # ============================================================================
-# Namespace Endpoints
-# ============================================================================
-
-
-class NamespaceInfo(BaseModel):
-    """Information about a namespace."""
-
-    namespace: str
-    item_count: int
-    pending_count: int
-    completed_count: int
-    processed_count: int
-
-
-@router.get("/{slug}/namespaces", response_model=list[NamespaceInfo])
-async def list_namespaces(slug: str):
-    """List all namespaces with item counts.
-
-    Returns namespaces that have work items, along with counts by status.
-    """
-    manager, project, project_db = get_project(slug)
-
-    # Get all items grouped by namespace
-    items, _ = project_db.list_work_items(limit=10000)
-
-    namespace_stats = {}
-    for item in items:
-        ns = item.get("namespace")
-        if not ns:
-            continue
-
-        if ns not in namespace_stats:
-            namespace_stats[ns] = {
-                "namespace": ns,
-                "item_count": 0,
-                "pending_count": 0,
-                "completed_count": 0,
-                "processed_count": 0,
-            }
-
-        namespace_stats[ns]["item_count"] += 1
-        status = item.get("status", "pending")
-        if status == "pending":
-            namespace_stats[ns]["pending_count"] += 1
-        elif status == "completed":
-            namespace_stats[ns]["completed_count"] += 1
-        elif status == "processed":
-            namespace_stats[ns]["processed_count"] += 1
-
-    return [NamespaceInfo(**ns) for ns in namespace_stats.values()]
-
-
-# ============================================================================
 # Project Resources (Shared Library) Endpoints
 # ============================================================================
 

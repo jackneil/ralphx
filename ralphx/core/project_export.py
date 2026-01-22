@@ -34,7 +34,6 @@ class WorkflowSummary:
     """Summary of a workflow in the project."""
     id: str
     name: str
-    namespace: str
     steps_count: int
     items_count: int
     resources_count: int
@@ -137,7 +136,6 @@ class ProjectExporter:
             summaries.append(WorkflowSummary(
                 id=wf['id'],
                 name=wf['name'],
-                namespace=wf['namespace'],
                 steps_count=wf_preview.steps_count,
                 items_count=wf_preview.items_total,
                 resources_count=wf_preview.resources_count,
@@ -231,7 +229,7 @@ class ProjectExporter:
             )
 
             for wf in workflows:
-                wf_prefix = f"workflows/{wf['namespace']}/"
+                wf_prefix = f"workflows/{wf['id']}/"
 
                 # Get workflow data
                 steps = self.db.list_workflow_steps(wf['id'])
@@ -261,7 +259,6 @@ class ProjectExporter:
                         'id': wf['id'],
                         'template_id': wf.get('template_id'),
                         'name': wf['name'],
-                        'namespace': wf['namespace'],
                         'status': 'draft',
                         'current_step': 1,
                         'created_at': wf.get('created_at'),
@@ -432,7 +429,6 @@ class ProjectExporter:
                     {
                         'id': w['id'],
                         'name': w['name'],
-                        'namespace': w['namespace'],
                     }
                     for w in workflows
                 ],

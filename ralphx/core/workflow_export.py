@@ -63,7 +63,7 @@ class SecretMatch:
 class ExportPreview:
     """Preview of what will be exported."""
     workflow_name: str
-    workflow_namespace: str
+    workflow_id: str
     steps_count: int
     items_total: int
     items_by_step: dict[int, int]  # step_id -> count
@@ -155,7 +155,7 @@ class WorkflowExporter:
 
         return ExportPreview(
             workflow_name=workflow['name'],
-            workflow_namespace=workflow['namespace'],
+            workflow_id=workflow['id'],
             steps_count=len(steps),
             items_total=total_items,  # Show real count, not truncated count
             items_by_step=items_by_step,
@@ -247,8 +247,7 @@ class WorkflowExporter:
 
         # Generate filename
         timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
-        namespace = workflow['namespace']
-        filename = f"workflow-{namespace}-{timestamp}.ralphx.zip"
+        filename = f"workflow-{workflow['id']}-{timestamp}.ralphx.zip"
 
         zip_bytes = zip_buffer.getvalue()
 
@@ -342,7 +341,7 @@ class WorkflowExporter:
                         snippet=redacted[:50] + '...' if len(redacted) > 50 else redacted,
                     ))
 
-        # Scan workflow name and namespace (unlikely but check)
+        # Scan workflow name (unlikely but check)
         scan_text(workflow.get('name', ''), 'workflow.name')
 
         # Scan resources
@@ -383,7 +382,6 @@ class WorkflowExporter:
             'workflow': {
                 'id': workflow['id'],
                 'name': workflow['name'],
-                'namespace': workflow['namespace'],
                 'template_id': workflow.get('template_id'),
             },
             'contents': {
@@ -447,7 +445,6 @@ class WorkflowExporter:
                 'id': workflow['id'],
                 'template_id': workflow.get('template_id'),
                 'name': workflow['name'],
-                'namespace': workflow['namespace'],
                 'status': 'draft',  # Reset status on export
                 'current_step': 1,  # Reset to beginning
                 'created_at': workflow.get('created_at'),

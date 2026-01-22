@@ -14,7 +14,6 @@ This makes projects portable - clone a repo with .ralphx/ and all data comes wit
 """
 
 import json
-import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -24,28 +23,7 @@ from typing import Any, Iterator, Optional
 
 
 # Schema version for project DB
-PROJECT_SCHEMA_VERSION = 15
-
-# Namespace validation pattern: lowercase, alphanumeric, underscores, dashes, max 64 chars
-# Must start with a letter
-NAMESPACE_PATTERN = re.compile(r'^[a-z][a-z0-9_-]{0,63}$')
-
-
-def validate_namespace(namespace: str) -> bool:
-    """Validate namespace format.
-
-    Namespaces must:
-    - Start with a lowercase letter
-    - Contain only lowercase letters, digits, underscores, and dashes
-    - Be 1-64 characters long
-
-    Args:
-        namespace: The namespace string to validate.
-
-    Returns:
-        True if valid, False otherwise.
-    """
-    return bool(NAMESPACE_PATTERN.match(namespace))
+PROJECT_SCHEMA_VERSION = 16
 
 # Project database schema - all project-specific data
 PROJECT_SCHEMA_SQL = """
@@ -297,7 +275,6 @@ CREATE TABLE IF NOT EXISTS workflows (
     id TEXT PRIMARY KEY,
     template_id TEXT,                       -- Optional reference to template
     name TEXT NOT NULL,
-    namespace TEXT NOT NULL,                -- Workflow identifier
     status TEXT DEFAULT 'draft',            -- draft, active, paused, completed
     current_step INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -467,7 +444,6 @@ CREATE INDEX IF NOT EXISTS idx_loop_resources_type ON loop_resources(resource_ty
 
 -- Workflow indexes
 CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status);
-CREATE INDEX IF NOT EXISTS idx_workflows_namespace ON workflows(namespace);
 CREATE INDEX IF NOT EXISTS idx_workflow_steps_workflow ON workflow_steps(workflow_id, step_number);
 CREATE INDEX IF NOT EXISTS idx_workflow_steps_status ON workflow_steps(status);
 CREATE INDEX IF NOT EXISTS idx_planning_sessions_workflow ON planning_sessions(workflow_id);
@@ -658,6 +634,11 @@ class ProjectDatabase:
         # Migration from v14 to v15: Add workflow_resource_versions table
         if from_version == 14:
             self._migrate_v14_to_v15(conn)
+            from_version = 15  # Continue to next migration
+
+        # Migration from v15 to v16: Remove namespace from workflows table
+        if from_version == 15:
+            self._migrate_v15_to_v16(conn)
 
         # Seed workflow templates for fresh databases
         self._seed_workflow_templates(conn)
@@ -959,6 +940,46 @@ class ProjectDatabase:
             CREATE INDEX IF NOT EXISTS idx_resource_versions
             ON workflow_resource_versions(workflow_resource_id, version_number DESC)
         """)
+
+    def _migrate_v15_to_v16(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v15 to v16.
+
+        Removes:
+        - namespace column from workflows table (deprecated, replaced by workflow_id)
+        - idx_workflows_namespace index
+
+        SQLite doesn't support DROP COLUMN directly, so we recreate the table.
+        """
+        # 1. Create new table without namespace
+        conn.execute("""
+            CREATE TABLE workflows_new (
+                id TEXT PRIMARY KEY,
+                template_id TEXT,
+                name TEXT NOT NULL,
+                status TEXT DEFAULT 'draft',
+                current_step INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                archived_at TIMESTAMP
+            )
+        """)
+
+        # 2. Copy data (excluding namespace)
+        conn.execute("""
+            INSERT INTO workflows_new (id, template_id, name, status, current_step, created_at, updated_at, archived_at)
+            SELECT id, template_id, name, status, current_step, created_at, updated_at, archived_at
+            FROM workflows
+        """)
+
+        # 3. Drop old table and index
+        conn.execute("DROP INDEX IF EXISTS idx_workflows_namespace")
+        conn.execute("DROP TABLE workflows")
+
+        # 4. Rename new table
+        conn.execute("ALTER TABLE workflows_new RENAME TO workflows")
+
+        # 5. Recreate the status index on the new table
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status)")
 
     # ========== Loops ==========
 
@@ -1808,9 +1829,8 @@ class ProjectDatabase:
         """Release all claims held by a specific loop.
 
         Used when deleting a loop to prevent orphaned claims.
-        Items with a namespace set are restored to 'completed' status so they
-        can be picked up by consumer loops again.
-        Items without a namespace are restored to 'pending'.
+        Released items are restored to 'pending' status so they can be
+        picked up by other loops.
 
         Args:
             loop_name: Name of the loop whose claims should be released.
@@ -1826,7 +1846,7 @@ class ProjectDatabase:
                 UPDATE work_items
                 SET claimed_by = NULL,
                     claimed_at = NULL,
-                    status = CASE WHEN namespace IS NOT NULL THEN 'completed' ELSE 'pending' END,
+                    status = 'pending',
                     updated_at = ?
                 WHERE claimed_by = ? AND status = 'claimed'
                 """,
@@ -1840,9 +1860,8 @@ class ProjectDatabase:
         This is an atomic operation that checks ownership and releases in one step
         to prevent TOCTOU race conditions.
 
-        Items with a namespace set are restored to 'completed' status so they
-        can be picked up by consumer loops again.
-        Items without a namespace are restored to 'pending'.
+        Released items are restored to 'pending' status so they can be
+        picked up by other loops.
 
         Args:
             id: Work item ID.
@@ -1858,7 +1877,7 @@ class ProjectDatabase:
                 UPDATE work_items
                 SET claimed_by = NULL,
                     claimed_at = NULL,
-                    status = CASE WHEN namespace IS NOT NULL THEN 'completed' ELSE 'pending' END,
+                    status = 'pending',
                     updated_at = ?
                 WHERE id = ? AND claimed_by = ? AND status = 'claimed'
                 """,
@@ -3273,7 +3292,6 @@ class ProjectDatabase:
         self,
         id: str,
         name: str,
-        namespace: str,
         template_id: Optional[str] = None,
         status: str = "draft",
     ) -> dict:
@@ -3282,29 +3300,19 @@ class ProjectDatabase:
         Args:
             id: Unique workflow identifier.
             name: User-facing workflow name.
-            namespace: Namespace to link all phases.
             template_id: Optional template ID this workflow is based on.
             status: Initial status (default: draft).
 
         Returns:
             The created workflow dict.
-
-        Raises:
-            ValueError: If namespace is invalid.
         """
-        if not validate_namespace(namespace):
-            raise ValueError(
-                f"Invalid namespace '{namespace}'. Must match pattern: "
-                "lowercase letter followed by up to 63 lowercase letters, digits, underscores, or dashes."
-            )
-
         with self._writer() as conn:
             now = datetime.utcnow().isoformat()
             conn.execute(
                 """INSERT INTO workflows
-                   (id, template_id, name, namespace, status, current_step, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 1, ?, ?)""",
-                (id, template_id, name, namespace, status, now, now),
+                   (id, template_id, name, status, current_step, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 1, ?, ?)""",
+                (id, template_id, name, status, now, now),
             )
         return self.get_workflow(id)
 
@@ -3318,7 +3326,6 @@ class ProjectDatabase:
     def list_workflows(
         self,
         status: Optional[str] = None,
-        namespace: Optional[str] = None,
         include_archived: bool = False,
         archived_only: bool = False,
     ) -> list[dict]:
@@ -3326,7 +3333,6 @@ class ProjectDatabase:
 
         Args:
             status: Filter by workflow status.
-            namespace: Filter by namespace.
             include_archived: If True, include archived workflows.
             archived_only: If True, only return archived workflows.
         """
@@ -3337,9 +3343,6 @@ class ProjectDatabase:
             if status:
                 conditions.append("status = ?")
                 params.append(status)
-            if namespace:
-                conditions.append("namespace = ?")
-                params.append(namespace)
 
             # Handle archived filtering
             if archived_only:

@@ -70,7 +70,7 @@ async def _read_upload_with_limit(file: UploadFile, max_size: int = MAX_UPLOAD_S
 class ExportPreviewResponse(BaseModel):
     """Response for export preview."""
     workflow_name: str
-    workflow_namespace: str
+    workflow_id: str
     steps_count: int
     items_total: int
     resources_count: int
@@ -108,7 +108,7 @@ class ResourcePreviewResponse(BaseModel):
 class ImportPreviewResponse(BaseModel):
     """Response for import preview."""
     workflow_name: str
-    workflow_namespace: str
+    workflow_id: str
     exported_at: str
     ralphx_version: str
     schema_version: int
@@ -138,7 +138,7 @@ class ConflictInfo(BaseModel):
 class MergePreviewResponse(BaseModel):
     """Response for merge preview."""
     workflow_name: str
-    workflow_namespace: str
+    workflow_id: str
     items_count: int
     resources_count: int
     conflicts: list[ConflictInfo]
@@ -194,7 +194,6 @@ class WorkflowSummaryResponse(BaseModel):
     """Summary of a workflow in project export."""
     id: str
     name: str
-    namespace: str
     steps_count: int
     items_count: int
     resources_count: int
@@ -323,7 +322,7 @@ async def preview_workflow_export(slug: str, workflow_id: str):
 
     return ExportPreviewResponse(
         workflow_name=preview.workflow_name,
-        workflow_namespace=preview.workflow_namespace,
+        workflow_id=preview.workflow_id,
         steps_count=preview.steps_count,
         items_total=preview.items_total,
         resources_count=preview.resources_count,
@@ -404,7 +403,7 @@ async def preview_workflow_import(
 
     return ImportPreviewResponse(
         workflow_name=preview.workflow_name,
-        workflow_namespace=preview.workflow_namespace,
+        workflow_id=preview.workflow_id,
         exported_at=preview.exported_at,
         ralphx_version=preview.ralphx_version,
         schema_version=preview.schema_version,
@@ -551,7 +550,7 @@ async def preview_workflow_merge(
 
     return MergePreviewResponse(
         workflow_name=preview.workflow_name,
-        workflow_namespace=preview.workflow_namespace,
+        workflow_id=preview.workflow_id,
         items_count=preview.items_count,
         resources_count=preview.resources_count,
         conflicts=conflicts,
@@ -639,7 +638,6 @@ async def preview_project_export(
             WorkflowSummaryResponse(
                 id=w.id,
                 name=w.name,
-                namespace=w.namespace,
                 steps_count=w.steps_count,
                 items_count=w.items_count,
                 resources_count=w.resources_count,
@@ -727,7 +725,6 @@ async def preview_project_import(
             WorkflowSummaryResponse(
                 id=w.id,
                 name=w.name,
-                namespace=w.namespace,
                 steps_count=w.steps_count,
                 items_count=w.items_count,
                 resources_count=w.resources_count,

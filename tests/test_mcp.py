@@ -160,7 +160,6 @@ class TestMCPServer:
         project_db.create_workflow(
             id=workflow_id,
             name="Test Workflow",
-            namespace="test",
             status="draft",
         )
 
@@ -212,7 +211,6 @@ class TestMCPServer:
         project_db.create_workflow(
             id=workflow_id,
             name="Test Workflow",
-            namespace="test",
             status="draft",
         )
         step = project_db.create_workflow_step(
@@ -260,7 +258,6 @@ class TestMCPServer:
         project_db.create_workflow(
             id=workflow_id,
             name="Test Workflow",
-            namespace="test",
             status="draft",
         )
         step = project_db.create_workflow_step(
@@ -307,7 +304,6 @@ class TestMCPServer:
         project_db.create_workflow(
             id=workflow_id,
             name="Test Workflow",
-            namespace="test",
             status="draft",
         )
         step = project_db.create_workflow_step(
@@ -537,7 +533,6 @@ class TestMCPEdgeCases:
         project_db.create_workflow(
             id=workflow_id,
             name="Empty Workflow",
-            namespace="empty-test",
             status="draft",
         )
 
@@ -596,7 +591,6 @@ class TestMCPEdgeCases:
         project_db.create_workflow(
             id=workflow_id,
             name="Test Workflow",
-            namespace="test",
             status="draft",
         )
         step = project_db.create_workflow_step(
