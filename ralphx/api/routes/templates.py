@@ -4,7 +4,7 @@ Templates are global, read-only, and shipped with RalphX.
 No authentication required - templates are public.
 
 Includes:
-- Loop templates (research, implementation, etc.)
+- Loop templates (extractgen_requirements, implementation, etc.)
 - Loop builder templates (planning, implementation with Phase 1)
 - Permission templates (planning, implementation, read_only, etc.)
 """
@@ -87,7 +87,7 @@ async def get_template_by_name(name: str) -> TemplateDetail:
     No authentication required - templates are public.
 
     Args:
-        name: Template name (e.g., 'research', 'implementation')
+        name: Template name (e.g., 'extractgen_requirements', 'implementation')
 
     Returns:
         Full template with config and YAML representation

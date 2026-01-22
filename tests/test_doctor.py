@@ -452,7 +452,7 @@ class TestStaleRunDetection:
         assert "No activity since" in stale[0]["reason"]
 
     def test_detect_stale_run_legacy_no_tracking(self, project_db):
-        """Test detection of legacy runs without PID or activity tracking."""
+        """Test detection of legacy/orphan runs without PID or activity tracking."""
         from ralphx.core.doctor import detect_stale_runs
         from datetime import datetime, timedelta
 
@@ -470,7 +470,8 @@ class TestStaleRunDetection:
 
         assert len(stale) == 1
         assert stale[0]["run_id"] == "run-legacy"
-        assert "Legacy run" in stale[0]["reason"]
+        # Runs with no PID and no activity are detected as "Orphan run"
+        assert "Orphan run" in stale[0]["reason"]
 
     def test_detect_stale_run_pid_reuse_scenario(self, project_db):
         """Test detection when PID appears running but activity is very stale.

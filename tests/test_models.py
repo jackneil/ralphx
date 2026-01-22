@@ -287,9 +287,10 @@ class TestWorkItem:
             category="ANS",
             tags=["billing", "core"],
         )
-        item = create.to_work_item("project-123")
+        item = create.to_work_item(workflow_id="workflow-123", source_step_id=1)
         assert item.id == "ANS-001"
-        assert item.project_id == "project-123"
+        assert item.workflow_id == "workflow-123"
+        assert item.source_step_id == 1
         assert item.status == WorkItemStatus.PENDING
 
     def test_status_enum_values(self):
@@ -303,7 +304,13 @@ class TestWorkItem:
 
     def test_is_actionable(self):
         """Test is_actionable method."""
-        item = WorkItem(id="1", project_id="p", content="test", status=WorkItemStatus.PENDING)
+        item = WorkItem(
+            id="1",
+            workflow_id="wf-1",
+            source_step_id=1,
+            content="test",
+            status=WorkItemStatus.PENDING
+        )
         assert item.is_actionable() is True
 
         item.status = WorkItemStatus.COMPLETED
@@ -311,7 +318,13 @@ class TestWorkItem:
 
     def test_is_terminal(self):
         """Test is_terminal method."""
-        item = WorkItem(id="1", project_id="p", content="test", status=WorkItemStatus.PENDING)
+        item = WorkItem(
+            id="1",
+            workflow_id="wf-1",
+            source_step_id=1,
+            content="test",
+            status=WorkItemStatus.PENDING
+        )
         assert item.is_terminal() is False
 
         item.status = WorkItemStatus.COMPLETED
@@ -328,7 +341,7 @@ class TestRun:
             project_id="project-456",
             loop_name="research",
         )
-        assert run.status == RunStatus.ACTIVE
+        assert run.status == RunStatus.RUNNING
         assert run.is_active is True
         assert run.is_terminal is False
 

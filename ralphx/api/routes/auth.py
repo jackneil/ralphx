@@ -1,21 +1,14 @@
-"""Authentication routes for Claude Code credentials."""
+"""Authentication routes for Claude accounts."""
 
 import asyncio
 import secrets
-from typing import Literal, Optional
+import time
+from typing import Optional
 
-from fastapi import APIRouter, Query
-from pydantic import BaseModel
+import httpx
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
-from ralphx.core.auth import (
-    AuthStatus,
-    clear_credentials,
-    force_refresh_token,
-    get_auth_status,
-    refresh_token_if_needed,
-    store_oauth_tokens,
-    validate_token_health,
-)
 from ralphx.core.database import Database
 from ralphx.core.oauth import OAuthFlow
 
@@ -23,6 +16,170 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 # Track active OAuth flows
 _active_flows: dict[str, asyncio.Task] = {}
+
+
+# ============================================================================
+# Pydantic Models
+# ============================================================================
+
+
+class AccountUsage(BaseModel):
+    """Usage statistics for an account."""
+
+    five_hour: float = Field(description="5-hour utilization percentage (0-100)")
+    seven_day: float = Field(description="7-day utilization percentage (0-100)")
+    five_hour_resets_at: Optional[str] = Field(None, description="ISO timestamp when 5h limit resets")
+    seven_day_resets_at: Optional[str] = Field(None, description="ISO timestamp when 7d limit resets")
+
+
+class AccountResponse(BaseModel):
+    """Response model for a single account."""
+
+    id: int
+    email: str
+    display_name: Optional[str] = None
+    subscription_type: Optional[str] = None
+    rate_limit_tier: Optional[str] = None
+    is_default: bool
+    is_active: bool
+    expires_at: Optional[int] = None
+    expires_in_seconds: Optional[int] = None
+    is_expired: bool
+    usage: Optional[AccountUsage] = None
+    usage_cached_at: Optional[int] = None
+    projects_using: int = 0
+    last_error: Optional[str] = None
+    last_error_at: Optional[str] = None
+    consecutive_failures: int = 0
+    created_at: Optional[str] = None
+
+
+class AccountUpdateRequest(BaseModel):
+    """Request model for updating an account."""
+
+    display_name: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class ProjectAccountAssignment(BaseModel):
+    """Response model for project account assignment."""
+
+    project_id: str
+    account_id: int
+    account_email: str
+    account_display_name: Optional[str] = None
+    subscription_type: Optional[str] = None
+    is_active: bool
+    is_default: bool
+    allow_fallback: bool
+    usage: Optional[AccountUsage] = None
+
+
+class AssignAccountRequest(BaseModel):
+    """Request model for assigning account to project."""
+
+    account_id: int = Field(description="Account ID to assign")
+    allow_fallback: bool = Field(default=True, description="Allow fallback to other accounts on rate limit")
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+
+async def _fetch_account_usage(access_token: str) -> Optional[dict]:
+    """Fetch usage data from Anthropic API."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.anthropic.com/api/oauth/usage",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "anthropic-beta": "oauth-2025-04-20",
+                },
+                timeout=10.0,
+            )
+
+            if response.status_code != 200:
+                return None
+
+            data = response.json()
+            five_hour = data.get("five_hour", {})
+            seven_day = data.get("seven_day", {})
+            return {
+                "five_hour": five_hour.get("utilization", 0),
+                "seven_day": seven_day.get("utilization", 0),
+                "five_hour_resets_at": five_hour.get("resets_at"),
+                "seven_day_resets_at": seven_day.get("resets_at"),
+            }
+    except Exception:
+        return None
+
+
+def _build_account_response(account: dict, db: Database) -> AccountResponse:
+    """Build AccountResponse from database account dict."""
+    now = int(time.time())
+    expires_at = account.get("expires_at", 0)
+    is_expired = now >= expires_at if expires_at else True
+
+    usage = None
+    if account.get("cached_usage_5h") is not None or account.get("cached_usage_7d") is not None:
+        usage = AccountUsage(
+            five_hour=account.get("cached_usage_5h", 0) or 0,
+            seven_day=account.get("cached_usage_7d", 0) or 0,
+            five_hour_resets_at=account.get("cached_5h_resets_at"),
+            seven_day_resets_at=account.get("cached_7d_resets_at"),
+        )
+
+    return AccountResponse(
+        id=account["id"],
+        email=account["email"],
+        display_name=account.get("display_name"),
+        subscription_type=account.get("subscription_type"),
+        rate_limit_tier=account.get("rate_limit_tier"),
+        is_default=bool(account.get("is_default")),
+        is_active=bool(account.get("is_active")),
+        expires_at=expires_at,
+        expires_in_seconds=max(0, expires_at - now) if expires_at else None,
+        is_expired=is_expired,
+        usage=usage,
+        usage_cached_at=account.get("usage_cached_at"),
+        projects_using=db.count_projects_using_account(account["id"]),
+        last_error=account.get("last_error"),
+        last_error_at=account.get("last_error_at"),
+        consecutive_failures=account.get("consecutive_failures", 0),
+        created_at=account.get("created_at"),
+    )
+
+
+def _build_usage_from_account(account: dict) -> Optional[AccountUsage]:
+    """Build AccountUsage from account dict if usage data exists."""
+    if account.get("cached_usage_5h") is None and account.get("cached_usage_7d") is None:
+        return None
+    return AccountUsage(
+        five_hour=account.get("cached_usage_5h", 0) or 0,
+        seven_day=account.get("cached_usage_7d", 0) or 0,
+        five_hour_resets_at=account.get("cached_5h_resets_at"),
+        seven_day_resets_at=account.get("cached_7d_resets_at"),
+    )
+
+
+# ============================================================================
+# Legacy Frontend Endpoints (backwards compatibility with AuthPanel.tsx)
+# These endpoints adapt the new accounts system to the frontend's expectations
+# ============================================================================
+
+
+from typing import Literal
+
+from ralphx.core.auth import (
+    AuthStatus,
+    get_auth_status,
+    refresh_token_if_needed,
+    force_refresh_token,
+    store_oauth_tokens,
+    validate_account_token,
+)
 
 
 class LoginRequest(BaseModel):
@@ -55,7 +212,6 @@ async def get_status(
 
     Proactively refreshes tokens when within 5 minutes of expiry,
     keeping tokens fresh when dashboard is being monitored.
-    Note: Background task also refreshes tokens within 2 hours of expiry.
     """
     project_id = _get_project_id(project_path)
 
@@ -69,12 +225,8 @@ async def get_status(
 async def start_login(request: LoginRequest):
     """Start OAuth flow - opens browser for authentication.
 
-    Flow:
-    1. Starts localhost callback server
-    2. Opens browser to Anthropic OAuth
-    3. User authorizes
-    4. Callback receives code, exchanges for tokens
-    5. Tokens stored in database
+    Stores tokens in accounts table. For project scope, assigns the
+    new/existing account to the project.
     """
     project_id = _get_project_id(request.project_path)
 
@@ -83,7 +235,7 @@ async def start_login(request: LoginRequest):
         result = await flow.start()
         if result.get("success"):
             tokens = result["tokens"]
-            store_oauth_tokens(tokens, request.scope, project_id)
+            store_oauth_tokens(tokens, project_id)
         return result
 
     flow_id = secrets.token_urlsafe(8)
@@ -124,9 +276,20 @@ async def get_flow_status(flow_id: str):
 
 @router.post("/logout")
 async def logout(request: LoginRequest):
-    """Clear credentials for the specified scope from database."""
+    """Logout: soft-delete the effective account for the scope.
+
+    Note: In the accounts system, we don't actually delete the account,
+    we just mark it as inactive. The frontend will show "not connected".
+    """
     project_id = _get_project_id(request.project_path)
-    clear_credentials(request.scope, project_id)
+    db = Database()
+
+    # Get effective account
+    account = db.get_effective_account(project_id)
+    if account:
+        # Mark as inactive (soft logout)
+        db.update_account(account["id"], is_active=False)
+
     return {"success": True}
 
 
@@ -135,7 +298,6 @@ async def refresh_token(request: LoginRequest):
     """Manually refresh the OAuth token.
 
     Forces a token refresh regardless of expiry time.
-    Useful when users want to ensure they have a fresh token.
     """
     project_id = _get_project_id(request.project_path)
     result = await force_refresh_token(project_id)
@@ -150,33 +312,26 @@ async def validate_credentials(
 ):
     """Validate that stored credentials are actually working.
 
-    This actually attempts to refresh the OAuth token to verify
-    the refresh_token is still valid. Unlike /status which just
-    checks the stored expiry timestamp, this makes a real API call.
-
-    Use this when:
-    - Troubleshooting authentication issues
-    - Verifying credentials after they might have been revoked
-    - Before starting a long-running loop
+    Makes a real API call to verify the refresh_token is still valid.
     """
     project_id = _get_project_id(project_path)
     db = Database()
-    creds = db.get_credentials(project_id)
+    account = db.get_effective_account(project_id)
 
-    if not creds:
+    if not account:
         return {
             "valid": False,
-            "error": "No credentials found",
+            "error": "No account found",
             "scope": None,
         }
 
-    is_valid, error = await validate_token_health(creds)
+    is_valid, error = await validate_account_token(account)
 
     return {
         "valid": is_valid,
         "error": error if not is_valid else None,
-        "scope": creds.get("scope"),
-        "email": creds.get("email"),
+        "scope": "account",
+        "email": account.get("email"),
         "refreshed": is_valid,  # If valid, we also refreshed the token
     }
 
@@ -191,92 +346,464 @@ async def get_usage(
 
     Returns 5-hour and 7-day utilization percentages.
     """
-    import httpx
-
     project_id = _get_project_id(project_path)
     db = Database()
-    creds = db.get_credentials(project_id)
+    account = db.get_effective_account(project_id)
 
-    if not creds or not creds.get("access_token"):
+    if not account or not account.get("access_token"):
         return {
             "success": False,
-            "error": "No credentials found",
+            "error": "No account found",
         }
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                "https://api.anthropic.com/api/oauth/usage",
-                headers={
-                    "Authorization": f"Bearer {creds['access_token']}",
-                    "anthropic-beta": "oauth-2025-04-20",
-                },
-                timeout=10.0,
-            )
+    usage_data = await _fetch_account_usage(account["access_token"])
 
-            if response.status_code != 200:
-                return {
-                    "success": False,
-                    "error": f"API error: {response.status_code}",
-                }
-
-            data = response.json()
-            five_hour = data.get("five_hour", {})
-            seven_day = data.get("seven_day", {})
-            return {
-                "success": True,
-                "five_hour_utilization": five_hour.get("utilization"),
-                "five_hour_resets_at": five_hour.get("resets_at"),
-                "seven_day_utilization": seven_day.get("utilization"),
-                "seven_day_resets_at": seven_day.get("resets_at"),
-            }
-    except Exception as e:
+    if not usage_data:
         return {
             "success": False,
-            "error": str(e),
+            "error": "Failed to fetch usage data",
         }
-
-
-@router.get("/credentials/export")
-async def export_credentials(
-    scope: Literal["project", "global"] = Query("global"),
-    project_path: Optional[str] = Query(None),
-):
-    """Export credentials in Claude Code JSON format.
-
-    Returns credentials in the format used by ~/.claude/.credentials.json
-    so users can copy them for use elsewhere.
-    """
-    project_id = _get_project_id(project_path)
-    db = Database()
-
-    # Get credentials for the specified scope
-    if scope == "project" and project_id:
-        creds = db.get_credentials_by_scope("project", project_id)
-    else:
-        creds = db.get_credentials_by_scope("global", None)
-
-    if not creds:
-        return {
-            "success": False,
-            "error": f"No {scope} credentials found",
-            "credentials": None,
-        }
-
-    # Format as Claude Code expects (matching ~/.claude/.credentials.json)
-    credentials_json = {
-        "claudeAiOauth": {
-            "accessToken": creds["access_token"],
-            "refreshToken": creds["refresh_token"],
-            "expiresAt": creds["expires_at"] * 1000,  # Convert to milliseconds
-            "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"],
-            "email": creds.get("email"),
-        }
-    }
 
     return {
         "success": True,
-        "scope": creds["scope"],
-        "email": creds.get("email"),
-        "credentials": credentials_json,
+        "five_hour_utilization": usage_data["five_hour"],
+        "five_hour_resets_at": usage_data.get("five_hour_resets_at"),
+        "seven_day_utilization": usage_data["seven_day"],
+        "seven_day_resets_at": usage_data.get("seven_day_resets_at"),
     }
+
+
+# ============================================================================
+# Account Management Endpoints
+# ============================================================================
+
+
+@router.get("/accounts", response_model=list[AccountResponse])
+async def list_accounts(
+    include_inactive: bool = Query(False, description="Include disabled accounts"),
+):
+    """List all connected Claude accounts with usage statistics."""
+    db = Database()
+    accounts = db.list_accounts(include_inactive=include_inactive)
+    return [_build_account_response(acc, db) for acc in accounts]
+
+
+@router.post("/accounts/add")
+async def add_account():
+    """Start OAuth flow to add a new account.
+
+    Opens browser for authentication. On success, creates a new account
+    or updates existing if email matches.
+    """
+
+    async def run_flow():
+        flow = OAuthFlow()
+        result = await flow.start()
+        if result.get("success"):
+            tokens = result["tokens"]
+            email = tokens.get("email")
+            if not email:
+                return {"success": False, "error": "No email in OAuth response"}
+
+            db = Database()
+            account = db.create_account(
+                email=email,
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                expires_at=int(time.time()) + tokens.get("expires_in", 28800),
+                scopes=tokens.get("scopes"),
+                subscription_type=tokens.get("subscription_type"),
+                rate_limit_tier=tokens.get("rate_limit_tier"),
+            )
+
+            # Fetch usage data immediately
+            usage_data = await _fetch_account_usage(tokens["access_token"])
+            if usage_data:
+                db.update_account_usage_cache(
+                    account["id"],
+                    five_hour=usage_data["five_hour"],
+                    seven_day=usage_data["seven_day"],
+                    five_hour_resets_at=usage_data.get("five_hour_resets_at"),
+                    seven_day_resets_at=usage_data.get("seven_day_resets_at"),
+                )
+
+            return {"success": True, "account_id": account["id"], "email": email}
+        return result
+
+    flow_id = secrets.token_urlsafe(8)
+    task = asyncio.create_task(run_flow())
+    _active_flows[flow_id] = task
+
+    # Clean up completed flows
+    for fid in list(_active_flows.keys()):
+        if _active_flows[fid].done():
+            del _active_flows[fid]
+
+    return {
+        "success": True,
+        "flow_id": flow_id,
+        "message": "Browser opened for authentication",
+    }
+
+
+@router.get("/accounts/{account_id}", response_model=AccountResponse)
+async def get_account(account_id: int):
+    """Get details for a specific account."""
+    db = Database()
+    account = db.get_account(account_id)
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    return _build_account_response(account, db)
+
+
+@router.patch("/accounts/{account_id}", response_model=AccountResponse)
+async def update_account(account_id: int, request: AccountUpdateRequest):
+    """Update an account's display name or active status."""
+    db = Database()
+    account = db.get_account(account_id)
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    updates = {}
+    if request.display_name is not None:
+        updates["display_name"] = request.display_name
+    if request.is_active is not None:
+        updates["is_active"] = request.is_active
+
+    if updates:
+        db.update_account(account_id, **updates)
+        account = db.get_account(account_id)
+
+    return _build_account_response(account, db)
+
+
+@router.delete("/accounts/{account_id}")
+async def delete_account(account_id: int):
+    """Remove an account (soft delete).
+
+    Cannot delete the default account if other accounts exist.
+    Cannot delete an account that is assigned to projects.
+    """
+    db = Database()
+    account = db.get_account(account_id)
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    # Check if account is assigned to any projects
+    projects_using = db.count_projects_using_account(account_id)
+    if projects_using > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete account: assigned to {projects_using} project(s). Unassign first.",
+        )
+
+    # Check if this is the default and there are other accounts
+    if account.get("is_default"):
+        other_accounts = [a for a in db.list_accounts() if a["id"] != account_id]
+        if other_accounts:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete default account. Set another account as default first.",
+            )
+
+    db.delete_account(account_id)
+    return {"success": True}
+
+
+@router.post("/accounts/{account_id}/set-default", response_model=AccountResponse)
+async def set_default_account(account_id: int):
+    """Set an account as the default."""
+    db = Database()
+    account = db.get_account(account_id)
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    if not account.get("is_active"):
+        raise HTTPException(status_code=400, detail="Cannot set inactive account as default")
+
+    db.set_default_account(account_id)
+    account = db.get_account(account_id)
+
+    return _build_account_response(account, db)
+
+
+@router.post("/accounts/{account_id}/refresh")
+async def refresh_account_token(account_id: int):
+    """Refresh an account's OAuth token."""
+    db = Database()
+    account = db.get_account(account_id)
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    if not account.get("refresh_token"):
+        return {"success": False, "message": "No refresh token available"}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.anthropic.com/api/oauth/token",
+                json={
+                    "grant_type": "refresh_token",
+                    "refresh_token": account["refresh_token"],
+                    "client_id": "9d1c250a-e61b-44b9-b2e4-8c4c53cd68d5",
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-beta": "oauth-2025-04-20",
+                },
+            )
+
+            if resp.status_code != 200:
+                return {"success": False, "message": f"Token refresh failed: {resp.status_code}"}
+
+            tokens = resp.json()
+            new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
+
+            db.update_account(
+                account_id,
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token", account["refresh_token"]),
+                expires_at=new_expires_at,
+            )
+
+            return {"success": True, "expires_at": new_expires_at}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@router.post("/accounts/{account_id}/refresh-usage")
+async def refresh_account_usage(account_id: int):
+    """Refresh usage statistics for an account."""
+    db = Database()
+    account = db.get_account(account_id)
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    usage_data = await _fetch_account_usage(account["access_token"])
+
+    if not usage_data:
+        return {"success": False, "error": "Failed to fetch usage data"}
+
+    db.update_account_usage_cache(
+        account_id,
+        five_hour=usage_data["five_hour"],
+        seven_day=usage_data["seven_day"],
+        five_hour_resets_at=usage_data.get("five_hour_resets_at"),
+        seven_day_resets_at=usage_data.get("seven_day_resets_at"),
+    )
+
+    return {"success": True, "usage": usage_data}
+
+
+@router.post("/accounts/refresh-all-usage")
+async def refresh_all_accounts_usage():
+    """Refresh usage statistics for all active accounts."""
+    db = Database()
+    accounts = db.list_accounts(include_inactive=False)
+
+    results = {"refreshed": 0, "failed": 0, "accounts": []}
+
+    for account in accounts:
+        usage_data = await _fetch_account_usage(account["access_token"])
+
+        if usage_data:
+            db.update_account_usage_cache(
+                account["id"],
+                five_hour=usage_data["five_hour"],
+                seven_day=usage_data["seven_day"],
+                five_hour_resets_at=usage_data.get("five_hour_resets_at"),
+                seven_day_resets_at=usage_data.get("seven_day_resets_at"),
+            )
+            results["refreshed"] += 1
+            results["accounts"].append({"id": account["id"], "email": account["email"], "success": True})
+        else:
+            results["failed"] += 1
+            results["accounts"].append({"id": account["id"], "email": account["email"], "success": False})
+
+    return results
+
+
+# ============================================================================
+# Project Account Assignment Endpoints
+# ============================================================================
+
+
+@router.get("/projects/{project_id}/account", response_model=Optional[ProjectAccountAssignment])
+async def get_project_account(project_id: str):
+    """Get the account assigned to a project (if any)."""
+    db = Database()
+
+    # Verify project exists
+    project = db.get_project_by_id(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    assignment = db.get_project_account_assignment(project_id)
+    if not assignment:
+        return None
+
+    account = db.get_account(assignment["account_id"])
+    if not account:
+        return None
+
+    return ProjectAccountAssignment(
+        project_id=project_id,
+        account_id=account["id"],
+        account_email=account["email"],
+        account_display_name=account.get("display_name"),
+        subscription_type=account.get("subscription_type"),
+        is_active=bool(account.get("is_active")),
+        is_default=bool(account.get("is_default")),
+        allow_fallback=bool(assignment.get("allow_fallback", True)),
+        usage=_build_usage_from_account(account),
+    )
+
+
+@router.post("/projects/{project_id}/account", response_model=ProjectAccountAssignment)
+async def assign_project_account(project_id: str, request: AssignAccountRequest):
+    """Assign an account to a project."""
+    db = Database()
+
+    # Verify project exists
+    project = db.get_project_by_id(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Verify account exists and is active
+    account = db.get_account(request.account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    if not account.get("is_active"):
+        raise HTTPException(status_code=400, detail="Cannot assign inactive account")
+
+    # Create or update assignment
+    db.assign_account_to_project(project_id, request.account_id, request.allow_fallback)
+
+    return ProjectAccountAssignment(
+        project_id=project_id,
+        account_id=account["id"],
+        account_email=account["email"],
+        account_display_name=account.get("display_name"),
+        subscription_type=account.get("subscription_type"),
+        is_active=bool(account.get("is_active")),
+        is_default=bool(account.get("is_default")),
+        allow_fallback=request.allow_fallback,
+        usage=_build_usage_from_account(account),
+    )
+
+
+@router.delete("/projects/{project_id}/account")
+async def unassign_project_account(project_id: str):
+    """Remove account assignment from a project (will use default)."""
+    db = Database()
+
+    # Verify project exists
+    project = db.get_project_by_id(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    db.unassign_account_from_project(project_id)
+    return {"success": True}
+
+
+@router.get("/projects/{project_id}/effective-account", response_model=Optional[AccountResponse])
+async def get_effective_project_account(project_id: str):
+    """Get the effective account for a project (assigned or default)."""
+    db = Database()
+
+    # Verify project exists
+    project = db.get_project_by_id(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    account = db.get_effective_account(project_id)
+    if not account:
+        return None
+
+    return _build_account_response(account, db)
+
+
+# ============================================================================
+# Credentials Export Endpoint (for CLI usage)
+# ============================================================================
+
+
+class CredentialsExportResponse(BaseModel):
+    """Response for credentials export."""
+
+    success: bool
+    error: Optional[str] = None
+    scope: Optional[str] = None
+    email: Optional[str] = None
+    credentials: Optional[dict] = None
+
+
+@router.get("/credentials/export", response_model=CredentialsExportResponse)
+async def export_credentials(
+    scope: str = Query("global", description="Scope: 'global' or 'project'"),
+    project_path: Optional[str] = Query(None, description="Project path for project scope"),
+):
+    """Export credentials in Claude CLI format for manual use.
+
+    Returns credentials in the format expected by ~/.claude/.credentials.json
+    """
+    import json
+
+    db = Database()
+
+    # Determine project_id if project scope
+    project_id = None
+    if scope == "project" and project_path:
+        # Find project by path
+        projects = db.list_projects()
+        for p in projects:
+            if p.get("path") == project_path:
+                project_id = p.get("id")
+                break
+
+    # Get effective account
+    account = db.get_effective_account(project_id)
+
+    if not account:
+        return CredentialsExportResponse(
+            success=False,
+            error="No account found. Please login first.",
+            scope=scope,
+        )
+
+    # Build credentials in Claude CLI format
+    default_scopes = ["user:inference", "user:profile", "user:sessions:claude_code"]
+    stored_scopes = account.get("scopes")
+    if stored_scopes:
+        try:
+            scopes = json.loads(stored_scopes) if isinstance(stored_scopes, str) else stored_scopes
+        except (json.JSONDecodeError, TypeError):
+            scopes = default_scopes
+    else:
+        scopes = default_scopes
+
+    credentials = {
+        "claudeAiOauth": {
+            "accessToken": account["access_token"],
+            "refreshToken": account.get("refresh_token"),
+            "expiresAt": account.get("expires_at", 0) * 1000,  # Convert to milliseconds
+            "scopes": scopes,
+            "subscriptionType": account.get("subscription_type") or "max",
+            "rateLimitTier": account.get("rate_limit_tier") or "default_claude_max_20x",
+        }
+    }
+
+    return CredentialsExportResponse(
+        success=True,
+        scope=scope,
+        email=account.get("email"),
+        credentials=credentials,
+    )

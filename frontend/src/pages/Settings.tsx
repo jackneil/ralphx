@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getHealth, listProjects, deleteProject, cleanupProjects, validateAuth, AuthValidationResult } from '../api'
+import { getHealth, listProjects, deleteProject, cleanupProjects } from '../api'
 import { useDashboardStore } from '../stores/dashboard'
-import AuthPanel from '../components/AuthPanel'
+import AccountsPanel from '../components/AccountsPanel'
 
 interface Project {
   id: string
@@ -21,7 +21,6 @@ export default function Settings() {
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [cleanupResult, setCleanupResult] = useState<{ deleted: string[]; failed: string[]; dry_run: boolean } | null>(null)
   const [cleaningUp, setCleaningUp] = useState(false)
-  const [validationResult, setValidationResult] = useState<AuthValidationResult | null>(null)
 
   useEffect(() => {
     async function load() {
@@ -38,21 +37,6 @@ export default function Settings() {
       }
     }
     load()
-  }, [])
-
-  // Validate credentials (called on mount and after login success)
-  const validateCredentials = async () => {
-    try {
-      const result = await validateAuth()
-      setValidationResult(result)
-    } catch {
-      setValidationResult({ valid: false, error: 'Failed to validate credentials' })
-    }
-  }
-
-  // Validate credentials on mount
-  useEffect(() => {
-    validateCredentials()
   }, [])
 
   const handleDeleteProject = async (slug: string) => {
@@ -138,8 +122,8 @@ export default function Settings() {
             </div>
           </div>
 
-          {/* Claude Authentication */}
-          <AuthPanel validationResult={validationResult} onLoginSuccess={validateCredentials} />
+          {/* Claude Accounts */}
+          <AccountsPanel />
 
           {/* Cleanup Test Data */}
           <div className="card">

@@ -90,10 +90,16 @@ Open `http://localhost:16768` to monitor progress.
 
 ---
 
-**Already technical?** Here's the one-liner:
+**Already technical?** Here's the quick setup:
 
 ```bash
-pip install ralphx && claude mcp add ralphx -- ralphx mcp
+# Create a Python 3.11+ environment (pick one):
+conda create -n ralphx python=3.11 -y   # then: conda activate ralphx
+python3 -m venv ~/.venvs/ralphx         # then: source ~/.venvs/ralphx/bin/activate
+
+# Install and configure MCP:
+pip install ralphx
+claude mcp add ralphx -- "$(which ralphx)" mcp
 ```
 
 ---
@@ -186,16 +192,19 @@ Ask Claude: *"Set up a new-product workflow starting from my idea for a task man
 For those who prefer to do it themselves:
 
 ```bash
-# If you don't have conda, install miniconda first:
-# https://docs.conda.io/en/latest/miniconda.html
-
-# Create environment and install
+# Create a virtual environment (use conda, venv, or your preferred tool)
+# Example with conda:
 conda create -n ralphx python=3.11 -y
 conda activate ralphx
+
+# Or with venv:
+# python3 -m venv ~/.venvs/ralphx && source ~/.venvs/ralphx/bin/activate
+
+# Install RalphX
 pip install ralphx
 
-# Set up MCP so Claude can control RalphX
-claude mcp add ralphx -- ralphx mcp
+# Set up MCP so Claude can control RalphX (uses full path so it works outside the venv)
+claude mcp add ralphx -- "$(which ralphx)" mcp
 
 # Start the dashboard
 ralphx serve

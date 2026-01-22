@@ -632,11 +632,11 @@ class TestTemplateEndpoints:
 
     def test_get_template_by_name(self, client):
         """Test getting a specific template."""
-        response = client.get("/api/templates/research")
+        response = client.get("/api/templates/extractgen_requirements")
         assert response.status_code == 200
         data = response.json()
-        assert data["name"] == "research"
-        assert data["display_name"] == "Research Loop"
+        assert data["name"] == "extractgen_requirements"
+        assert data["display_name"] == "Extract Requirements Loop"
         assert "config" in data
         assert "config_yaml" in data
         # Verify config has expected structure
@@ -654,7 +654,7 @@ class TestTemplateEndpoints:
 
     def test_get_template_yaml(self, client):
         """Test getting template YAML config."""
-        response = client.get("/api/templates/research/yaml")
+        response = client.get("/api/templates/extractgen_requirements/yaml")
         assert response.status_code == 200
         data = response.json()
         assert "yaml" in data

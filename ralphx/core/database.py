@@ -25,7 +25,7 @@ from ralphx.core.workspace import get_backups_path, get_database_path
 # Schema version for migrations
 # NOTE: When the initial schema is updated, also update this version and ensure
 # migrations are idempotent (use IF EXISTS / IF NOT EXISTS clauses).
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # SQL schema
 SCHEMA_SQL = """
@@ -145,21 +145,43 @@ CREATE TABLE IF NOT EXISTS schema_version (
     applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- OAuth credentials table
-CREATE TABLE IF NOT EXISTS credentials (
+-- Accounts table - stores all logged-in Claude accounts
+CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    scope TEXT NOT NULL,  -- 'global' or 'project'
-    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    email TEXT NOT NULL UNIQUE,  -- Primary identifier
+    display_name TEXT,           -- Optional friendly name
     access_token TEXT NOT NULL,
     refresh_token TEXT,
     expires_at INTEGER NOT NULL,  -- Unix timestamp (seconds)
-    email TEXT,  -- User's email address from profile
-    scopes TEXT,  -- JSON array of OAuth scopes (e.g., '["user:inference", "user:profile"]')
+    scopes TEXT,  -- JSON array of OAuth scopes
     subscription_type TEXT,  -- Claude subscription tier ("free", "pro", "max")
     rate_limit_tier TEXT,  -- API rate limit tier (e.g., "default_claude_max_20x")
+    is_default BOOLEAN DEFAULT FALSE,  -- User-selected default account
+    is_active BOOLEAN DEFAULT TRUE,    -- Account enabled/disabled
+    is_deleted BOOLEAN DEFAULT FALSE,  -- Soft delete for safety
+    last_used_at TIMESTAMP,
+    -- Usage cache (avoid N API calls)
+    cached_usage_5h REAL,
+    cached_usage_7d REAL,
+    cached_5h_resets_at TEXT,  -- ISO timestamp string
+    cached_7d_resets_at TEXT,  -- ISO timestamp string
+    usage_cached_at INTEGER,   -- Unix timestamp when cache was updated
+    -- Error tracking
+    last_error TEXT,
+    last_error_at TIMESTAMP,
+    consecutive_failures INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(scope, project_id)  -- One credential per scope/project
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Project account assignments table - links projects to accounts
+CREATE TABLE IF NOT EXISTS project_account_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,  -- RESTRICT prevents deletion while assigned
+    allow_fallback BOOLEAN DEFAULT TRUE,  -- Allow falling back to other accounts on usage limit
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id)  -- One account per project
 );
 """
 
@@ -177,6 +199,14 @@ CREATE INDEX IF NOT EXISTS idx_guardrails_project ON guardrails(project_id, enab
 CREATE INDEX IF NOT EXISTS idx_guardrails_source ON guardrails(source);
 CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(project_id, level, timestamp);
+
+-- Accounts indexes
+CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active, is_deleted);
+CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
+
+-- Project account assignments indexes
+CREATE INDEX IF NOT EXISTS idx_assignments_project ON project_account_assignments(project_id);
+CREATE INDEX IF NOT EXISTS idx_assignments_account ON project_account_assignments(account_id);
 """
 
 
@@ -1327,210 +1357,560 @@ class Database:
             return cursor.rowcount > 0
 
     # =========================================================================
-    # Credential Operations
+    # =========================================================================
+    # Account Operations (Multi-Account Authentication)
     # =========================================================================
 
-    def store_credentials(
+    def create_account(
         self,
-        scope: str,
+        email: str,
         access_token: str,
         expires_at: int,
         refresh_token: Optional[str] = None,
-        project_id: Optional[str] = None,
-        email: Optional[str] = None,
+        display_name: Optional[str] = None,
         scopes: Optional[str] = None,
         subscription_type: Optional[str] = None,
         rate_limit_tier: Optional[str] = None,
-    ) -> int:
-        """Store or update OAuth credentials.
+    ) -> dict:
+        """Create a new account or update if email already exists.
 
         Args:
-            scope: 'global' or 'project'
+            email: User email (unique identifier)
             access_token: OAuth access token
-            expires_at: Unix timestamp (seconds) when token expires
-            refresh_token: Optional refresh token
-            project_id: Project ID for project-scoped credentials
-            email: User's email address from profile
-            scopes: JSON array string of OAuth scopes
-            subscription_type: Claude subscription type (e.g., 'max')
-            rate_limit_tier: Rate limit tier (e.g., 'default_claude_max_20x')
+            expires_at: Token expiry as Unix timestamp
+            refresh_token: OAuth refresh token
+            display_name: Optional friendly name
+            scopes: JSON string of OAuth scopes
+            subscription_type: Claude subscription tier
+            rate_limit_tier: API rate limit tier
 
         Returns:
-            Credential record ID
+            Account dict with all fields
         """
         now = datetime.utcnow().isoformat()
+
         with self._writer() as conn:
-            # Check for existing credential - handle NULL project_id explicitly
-            # (SQLite's ON CONFLICT doesn't work with NULL values)
-            if project_id is None:
-                cursor = conn.execute(
-                    "SELECT id FROM credentials WHERE scope = ? AND project_id IS NULL",
-                    (scope,),
-                )
-            else:
-                cursor = conn.execute(
-                    "SELECT id FROM credentials WHERE scope = ? AND project_id = ?",
-                    (scope, project_id),
-                )
-            existing = cursor.fetchone()
+            # Check if this is the first account (make it default)
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM accounts WHERE is_deleted = 0"
+            )
+            count = cursor.fetchone()[0]
+            is_default = count == 0
 
-            if existing:
-                # Update existing credential
-                conn.execute(
-                    """
-                    UPDATE credentials SET
-                        access_token = ?, refresh_token = ?, expires_at = ?,
-                        email = ?, scopes = ?, subscription_type = ?,
-                        rate_limit_tier = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (access_token, refresh_token, expires_at, email, scopes,
-                     subscription_type, rate_limit_tier, now, existing[0]),
-                )
-                return existing[0]
-            else:
-                # Insert new credential
-                cursor = conn.execute(
-                    """
-                    INSERT INTO credentials
-                    (scope, project_id, access_token, refresh_token, expires_at, email,
-                     scopes, subscription_type, rate_limit_tier, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (scope, project_id, access_token, refresh_token, expires_at, email,
-                     scopes, subscription_type, rate_limit_tier, now, now),
-                )
-                return cursor.lastrowid or 0
+            # Use INSERT OR REPLACE to handle existing accounts
+            cursor = conn.execute(
+                """INSERT INTO accounts (
+                    email, access_token, refresh_token, expires_at, display_name,
+                    scopes, subscription_type, rate_limit_tier, is_default,
+                    is_active, is_deleted, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                ON CONFLICT(email) DO UPDATE SET
+                    access_token = excluded.access_token,
+                    refresh_token = excluded.refresh_token,
+                    expires_at = excluded.expires_at,
+                    scopes = excluded.scopes,
+                    subscription_type = excluded.subscription_type,
+                    rate_limit_tier = excluded.rate_limit_tier,
+                    is_active = 1,
+                    is_deleted = 0,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    email,
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    display_name,
+                    scopes,
+                    subscription_type,
+                    rate_limit_tier,
+                    is_default,
+                    now,
+                    now,
+                ),
+            )
 
-    def get_credentials(self, project_id: Optional[str] = None) -> Optional[dict]:
-        """Get credentials, checking project-specific first then global.
+            # Get the account
+            cursor = conn.execute(
+                "SELECT * FROM accounts WHERE email = ?", (email,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else {}
+
+    def get_account(self, account_id: int) -> Optional[dict]:
+        """Get an account by ID.
 
         Args:
-            project_id: Optional project ID to check for project-scoped creds first
+            account_id: Account ID
 
         Returns:
-            Credential dict or None if not found
+            Account dict or None
         """
         with self._reader() as conn:
-            # Check project-specific first if project_id provided
-            if project_id:
-                cursor = conn.execute(
-                    "SELECT * FROM credentials WHERE scope = 'project' AND project_id = ?",
-                    (project_id,),
-                )
-                row = cursor.fetchone()
-                if row:
-                    return dict(row)
-
-            # Fall back to global
             cursor = conn.execute(
-                "SELECT * FROM credentials WHERE scope = 'global' AND project_id IS NULL"
+                "SELECT * FROM accounts WHERE id = ? AND is_deleted = 0",
+                (account_id,),
             )
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def get_credentials_by_scope(
-        self, scope: str, project_id: Optional[str] = None
-    ) -> Optional[dict]:
-        """Get credentials for exact scope match (no fallback).
-
-        Unlike get_credentials(), this returns only the exact scope requested
-        without falling back to global credentials.
+    def get_account_by_email(self, email: str) -> Optional[dict]:
+        """Get an account by email.
 
         Args:
-            scope: 'global' or 'project'
-            project_id: Project ID (required if scope is 'project')
+            email: Account email
 
         Returns:
-            Credential dict or None if not found for this exact scope
+            Account dict or None
         """
         with self._reader() as conn:
-            if scope == "project" and project_id:
-                cursor = conn.execute(
-                    "SELECT * FROM credentials WHERE scope = 'project' AND project_id = ?",
-                    (project_id,),
-                )
-            elif scope == "global":
-                cursor = conn.execute(
-                    "SELECT * FROM credentials WHERE scope = 'global' AND project_id IS NULL"
-                )
-            else:
-                return None
+            cursor = conn.execute(
+                "SELECT * FROM accounts WHERE email = ? AND is_deleted = 0",
+                (email,),
+            )
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def get_credentials_by_id(self, id: int) -> Optional[dict]:
-        """Get credentials by ID."""
-        with self._reader() as conn:
-            cursor = conn.execute("SELECT * FROM credentials WHERE id = ?", (id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+    def list_accounts(
+        self, include_inactive: bool = False, include_deleted: bool = False
+    ) -> list[dict]:
+        """List all accounts.
 
-    def get_all_credentials(self) -> list[dict]:
-        """Get all stored credentials (global + all projects).
-
-        Used by background token refresh task to check all credentials.
+        Args:
+            include_inactive: Include disabled accounts
+            include_deleted: Include soft-deleted accounts
 
         Returns:
-            List of credential dicts
+            List of account dicts
         """
+        conditions = []
+        if not include_deleted:
+            conditions.append("is_deleted = 0")
+        if not include_inactive:
+            conditions.append("is_active = 1")
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
         with self._reader() as conn:
-            cursor = conn.execute("SELECT * FROM credentials")
+            cursor = conn.execute(
+                f"SELECT * FROM accounts {where} ORDER BY is_default DESC, created_at ASC"
+            )
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
 
-    # Allowed columns for credential update operations
-    _CREDENTIAL_UPDATE_COLS = frozenset({
-        "access_token", "refresh_token", "expires_at", "updated_at", "email",
-        "scopes", "subscription_type", "rate_limit_tier"
+    # Allowed columns for account update operations
+    _ACCOUNT_UPDATE_COLS = frozenset({
+        "display_name", "access_token", "refresh_token", "expires_at",
+        "scopes", "subscription_type", "rate_limit_tier", "is_active",
+        "last_used_at", "cached_usage_5h", "cached_usage_7d",
+        "cached_5h_resets_at", "cached_7d_resets_at", "usage_cached_at",
+        "last_error", "last_error_at", "consecutive_failures",
     })
 
-    def update_credentials(self, id: int, **kwargs) -> bool:
-        """Update credentials by ID.
+    def update_account(self, account_id: int, **kwargs) -> bool:
+        """Update an account by ID.
+
+        Args:
+            account_id: Account ID
+            **kwargs: Fields to update
+
+        Returns:
+            True if updated, False otherwise
 
         Raises:
-            ValueError: If invalid column names are provided.
+            ValueError: If invalid column names are provided
         """
         if not kwargs:
             return False
 
         # Security: validate column names against whitelist
-        invalid_cols = set(kwargs.keys()) - self._CREDENTIAL_UPDATE_COLS - {"updated_at"}
+        invalid_cols = set(kwargs.keys()) - self._ACCOUNT_UPDATE_COLS - {"updated_at"}
         if invalid_cols:
-            raise ValueError(f"Invalid columns for credential update: {invalid_cols}")
+            raise ValueError(f"Invalid columns for account update: {invalid_cols}")
 
         kwargs["updated_at"] = datetime.utcnow().isoformat()
         set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
-        values = list(kwargs.values()) + [id]
+        values = list(kwargs.values()) + [account_id]
 
         with self._writer() as conn:
             cursor = conn.execute(
-                f"UPDATE credentials SET {set_clause} WHERE id = ?", values
+                f"UPDATE accounts SET {set_clause} WHERE id = ? AND is_deleted = 0",
+                values,
             )
             return cursor.rowcount > 0
 
-    def delete_credentials(
-        self, scope: str, project_id: Optional[str] = None
-    ) -> bool:
-        """Delete credentials for a scope.
+    def delete_account(self, account_id: int, hard_delete: bool = False) -> bool:
+        """Delete an account (soft delete by default).
 
         Args:
-            scope: 'global' or 'project'
-            project_id: Project ID for project-scoped credentials
+            account_id: Account ID
+            hard_delete: If True, permanently delete instead of soft delete
 
         Returns:
-            True if deleted, False if not found
+            True if deleted, False otherwise
         """
         with self._writer() as conn:
-            if scope == "project" and project_id:
+            # Check if account has project assignments (ON DELETE RESTRICT)
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM project_account_assignments WHERE account_id = ?",
+                (account_id,),
+            )
+            if cursor.fetchone()[0] > 0:
+                raise ValueError(
+                    "Cannot delete account: still assigned to projects. "
+                    "Reassign or remove project assignments first."
+                )
+
+            if hard_delete:
                 cursor = conn.execute(
-                    "DELETE FROM credentials WHERE scope = 'project' AND project_id = ?",
-                    (project_id,),
+                    "DELETE FROM accounts WHERE id = ?", (account_id,)
                 )
             else:
                 cursor = conn.execute(
-                    "DELETE FROM credentials WHERE scope = 'global' AND project_id IS NULL"
+                    """UPDATE accounts
+                       SET is_deleted = 1, is_default = 0, updated_at = ?
+                       WHERE id = ?""",
+                    (datetime.utcnow().isoformat(), account_id),
                 )
+            return cursor.rowcount > 0
+
+    def set_default_account(self, account_id: int) -> bool:
+        """Set an account as the default.
+
+        Args:
+            account_id: Account ID to set as default
+
+        Returns:
+            True if updated, False otherwise
+        """
+        now = datetime.utcnow().isoformat()
+
+        with self._writer() as conn:
+            # Check account exists and is active
+            cursor = conn.execute(
+                "SELECT is_active FROM accounts WHERE id = ? AND is_deleted = 0",
+                (account_id,),
+            )
+            row = cursor.fetchone()
+            if not row or not row["is_active"]:
+                return False
+
+            # Clear existing default
+            conn.execute(
+                "UPDATE accounts SET is_default = 0, updated_at = ? WHERE is_default = 1",
+                (now,),
+            )
+
+            # Set new default
+            cursor = conn.execute(
+                "UPDATE accounts SET is_default = 1, updated_at = ? WHERE id = ?",
+                (now, account_id),
+            )
+            return cursor.rowcount > 0
+
+    def get_default_account(self) -> Optional[dict]:
+        """Get the default account.
+
+        Returns:
+            Account dict or None
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM accounts WHERE is_default = 1 AND is_active = 1 AND is_deleted = 0"
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_first_active_account(self) -> Optional[dict]:
+        """Get the first active account (fallback when no default).
+
+        Returns:
+            Account dict or None
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT * FROM accounts
+                   WHERE is_active = 1 AND is_deleted = 0
+                   ORDER BY created_at ASC LIMIT 1"""
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def count_projects_using_account(self, account_id: int) -> int:
+        """Count how many projects are assigned to an account.
+
+        Args:
+            account_id: Account ID
+
+        Returns:
+            Number of projects using this account
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM project_account_assignments WHERE account_id = ?",
+                (account_id,),
+            )
+            return cursor.fetchone()[0]
+
+    # =========================================================================
+    # Project Account Assignment Operations
+    # =========================================================================
+
+    def assign_account_to_project(
+        self,
+        project_id: str,
+        account_id: int,
+        allow_fallback: bool = True,
+    ) -> dict:
+        """Assign an account to a project.
+
+        Args:
+            project_id: Project ID
+            account_id: Account ID
+            allow_fallback: Allow fallback to other accounts on rate limit
+
+        Returns:
+            Assignment dict
+        """
+        now = datetime.utcnow().isoformat()
+
+        with self._writer() as conn:
+            # Verify account exists and is active
+            cursor = conn.execute(
+                "SELECT id FROM accounts WHERE id = ? AND is_active = 1 AND is_deleted = 0",
+                (account_id,),
+            )
+            if not cursor.fetchone():
+                raise ValueError(f"Account {account_id} not found or inactive")
+
+            # Upsert assignment
+            cursor = conn.execute(
+                """INSERT INTO project_account_assignments (
+                    project_id, account_id, allow_fallback, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    account_id = excluded.account_id,
+                    allow_fallback = excluded.allow_fallback
+                """,
+                (project_id, account_id, allow_fallback, now),
+            )
+
+            # Return the assignment
+            cursor = conn.execute(
+                "SELECT * FROM project_account_assignments WHERE project_id = ?",
+                (project_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else {}
+
+    def get_project_account_assignment(self, project_id: str) -> Optional[dict]:
+        """Get the account assignment for a project.
+
+        Args:
+            project_id: Project ID
+
+        Returns:
+            Assignment dict or None
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT paa.*, a.email, a.display_name, a.subscription_type,
+                          a.is_active, a.is_default,
+                          a.cached_usage_5h, a.cached_usage_7d,
+                          a.cached_5h_resets_at, a.cached_7d_resets_at,
+                          a.usage_cached_at, a.expires_at
+                   FROM project_account_assignments paa
+                   JOIN accounts a ON a.id = paa.account_id
+                   WHERE paa.project_id = ? AND a.is_deleted = 0""",
+                (project_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def unassign_account_from_project(self, project_id: str) -> bool:
+        """Remove account assignment from a project.
+
+        Args:
+            project_id: Project ID
+
+        Returns:
+            True if removed, False if not found
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                "DELETE FROM project_account_assignments WHERE project_id = ?",
+                (project_id,),
+            )
+            return cursor.rowcount > 0
+
+    def get_effective_account(self, project_id: Optional[str] = None) -> Optional[dict]:
+        """Get the effective account for a project.
+
+        Resolution order:
+        1. If project has assignment -> use that account
+        2. Else -> use default account
+        3. If no default -> use first active account
+
+        Args:
+            project_id: Optional project ID
+
+        Returns:
+            Account dict or None
+        """
+        # Check project assignment first
+        if project_id:
+            assignment = self.get_project_account_assignment(project_id)
+            if assignment and assignment.get("is_active"):
+                account = self.get_account(assignment["account_id"])
+                if account:
+                    return account
+
+        # Fall back to default account
+        account = self.get_default_account()
+        if account:
+            return account
+
+        # Last resort: first active account
+        return self.get_first_active_account()
+
+    def get_fallback_account(
+        self,
+        exclude_ids: Optional[list[int]] = None,
+        prefer_lowest_usage: bool = True,
+    ) -> Optional[dict]:
+        """Get a fallback account (for 429 rate limit handling).
+
+        Args:
+            exclude_ids: Account IDs to exclude (already failed)
+            prefer_lowest_usage: Sort by lowest cached usage
+
+        Returns:
+            Account dict or None
+        """
+        exclude_ids = exclude_ids or []
+
+        with self._reader() as conn:
+            placeholders = ",".join("?" for _ in exclude_ids) if exclude_ids else ""
+            exclude_clause = f"AND id NOT IN ({placeholders})" if exclude_ids else ""
+
+            # Order by lowest usage (5h usage takes priority)
+            order_clause = """
+                ORDER BY
+                    COALESCE(cached_usage_5h, 0) ASC,
+                    COALESCE(cached_usage_7d, 0) ASC,
+                    consecutive_failures ASC,
+                    created_at ASC
+            """ if prefer_lowest_usage else "ORDER BY created_at ASC"
+
+            cursor = conn.execute(
+                f"""SELECT * FROM accounts
+                   WHERE is_active = 1
+                     AND is_deleted = 0
+                     AND consecutive_failures < 3
+                     {exclude_clause}
+                   {order_clause}
+                   LIMIT 1""",
+                exclude_ids,
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def update_account_usage_cache(
+        self,
+        account_id: int,
+        five_hour: Optional[float] = None,
+        seven_day: Optional[float] = None,
+        five_hour_resets_at: Optional[str] = None,
+        seven_day_resets_at: Optional[str] = None,
+    ) -> bool:
+        """Update the cached usage data for an account.
+
+        Args:
+            account_id: Account ID
+            five_hour: 5-hour utilization percentage (0-100)
+            seven_day: 7-day utilization percentage (0-100)
+            five_hour_resets_at: ISO timestamp when 5h limit resets
+            seven_day_resets_at: ISO timestamp when 7d limit resets
+
+        Returns:
+            True if updated, False otherwise
+        """
+        import time
+
+        updates = {"usage_cached_at": int(time.time())}
+        if five_hour is not None:
+            updates["cached_usage_5h"] = five_hour
+        if seven_day is not None:
+            updates["cached_usage_7d"] = seven_day
+        if five_hour_resets_at is not None:
+            updates["cached_5h_resets_at"] = five_hour_resets_at
+        if seven_day_resets_at is not None:
+            updates["cached_7d_resets_at"] = seven_day_resets_at
+
+        return self.update_account(account_id, **updates)
+
+    def record_account_error(
+        self,
+        account_id: int,
+        error_message: str,
+        increment_failures: bool = True,
+    ) -> bool:
+        """Record an error for an account.
+
+        Args:
+            account_id: Account ID
+            error_message: Error message
+            increment_failures: Whether to increment consecutive_failures
+
+        Returns:
+            True if updated, False otherwise
+        """
+        now = datetime.utcnow().isoformat()
+
+        with self._writer() as conn:
+            if increment_failures:
+                cursor = conn.execute(
+                    """UPDATE accounts SET
+                        last_error = ?,
+                        last_error_at = ?,
+                        consecutive_failures = consecutive_failures + 1,
+                        updated_at = ?
+                       WHERE id = ?""",
+                    (error_message, now, now, account_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE accounts SET
+                        last_error = ?,
+                        last_error_at = ?,
+                        updated_at = ?
+                       WHERE id = ?""",
+                    (error_message, now, now, account_id),
+                )
+            return cursor.rowcount > 0
+
+    def clear_account_errors(self, account_id: int) -> bool:
+        """Clear error state for an account (on successful use).
+
+        Args:
+            account_id: Account ID
+
+        Returns:
+            True if updated, False otherwise
+        """
+        now = datetime.utcnow().isoformat()
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE accounts SET
+                    last_error = NULL,
+                    last_error_at = NULL,
+                    consecutive_failures = 0,
+                    last_used_at = ?,
+                    updated_at = ?
+                   WHERE id = ?""",
+                (now, now, account_id),
+            )
             return cursor.rowcount > 0
 
     # =========================================================================
@@ -1834,24 +2214,10 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_work_items_claimed
                     ON work_items(project_id, claimed_by, claimed_at);
             """),
-            # Migration to v3: Add OAuth credentials table
-            (3, """
-                CREATE TABLE IF NOT EXISTS credentials (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scope TEXT NOT NULL,
-                    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-                    access_token TEXT NOT NULL,
-                    refresh_token TEXT,
-                    expires_at INTEGER NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(scope, project_id)
-                );
-            """),
-            # Migration to v4: Add email column to credentials
-            (4, """
-                ALTER TABLE credentials ADD COLUMN email TEXT;
-            """),
+            # Migration to v3: (Legacy - credentials table removed)
+            (3, """SELECT 1;"""),
+            # Migration to v4: (Legacy - credentials table removed)
+            (4, """SELECT 1;"""),
             # Migration to v5: Add category and event columns to logs for structured logging
             (5, """
                 -- Add category and event columns for structured logging
@@ -1870,17 +2236,8 @@ class Database:
                 -- Composite index for run drilldown (all logs for a run, ordered)
                 CREATE INDEX IF NOT EXISTS idx_logs_run_time ON logs(run_id, timestamp);
             """),
-            # Migration to v6: Add OAuth metadata columns to credentials for Claude Code compatibility
-            # These fields are required by Claude Code CLI when reading ~/.claude/.credentials.json:
-            # - scopes: JSON array of OAuth scopes (e.g., ["user:inference", "user:profile"])
-            # - subscription_type: Claude subscription tier ("free", "pro", "max")
-            # - rate_limit_tier: API rate limit tier (e.g., "default_claude_max_20x")
-            (6, """
-                -- Add OAuth metadata columns for full Claude Code credential compatibility
-                ALTER TABLE credentials ADD COLUMN scopes TEXT;
-                ALTER TABLE credentials ADD COLUMN subscription_type TEXT;
-                ALTER TABLE credentials ADD COLUMN rate_limit_tier TEXT;
-            """),
+            # Migration to v6: (Legacy - credentials table removed)
+            (6, """SELECT 1;"""),
             # Migration to v7: Rename source_loop to namespace for clarity
             # NOTE: For databases created after this migration was added, the column
             # is already named 'namespace' in the initial schema. This migration only
@@ -1923,6 +2280,63 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_logs_category ON logs(category);
                 CREATE INDEX IF NOT EXISTS idx_logs_cat_event ON logs(category, event, timestamp DESC);
                 CREATE INDEX IF NOT EXISTS idx_logs_run_time ON logs(run_id, timestamp);
+            """),
+            # Migration to v9: Add multi-account authentication tables
+            # accounts: stores all logged-in Claude accounts
+            # project_account_assignments: links projects to accounts
+            (9, """
+                -- Create accounts table
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL UNIQUE,
+                    display_name TEXT,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT,
+                    expires_at INTEGER NOT NULL,
+                    scopes TEXT,
+                    subscription_type TEXT,
+                    rate_limit_tier TEXT,
+                    is_default BOOLEAN DEFAULT FALSE,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    last_used_at TIMESTAMP,
+                    cached_usage_5h REAL,
+                    cached_usage_7d REAL,
+                    cached_5h_resets_at TEXT,
+                    cached_7d_resets_at TEXT,
+                    usage_cached_at INTEGER,
+                    last_error TEXT,
+                    last_error_at TIMESTAMP,
+                    consecutive_failures INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                -- Create project account assignments table
+                CREATE TABLE IF NOT EXISTS project_account_assignments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+                    allow_fallback BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(project_id)
+                );
+
+                -- Indexes for accounts
+                CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active, is_deleted);
+                CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
+
+                -- Indexes for project account assignments
+                CREATE INDEX IF NOT EXISTS idx_assignments_project ON project_account_assignments(project_id);
+                CREATE INDEX IF NOT EXISTS idx_assignments_account ON project_account_assignments(account_id);
+
+                -- Partial unique index: enforce single default account among active, non-deleted accounts
+                -- SQLite supports partial indexes via WHERE clause
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_single_default
+                    ON accounts (is_default) WHERE is_default = 1 AND is_deleted = 0;
+
+                -- Drop legacy credentials table if it exists
+                DROP TABLE IF EXISTS credentials;
             """),
         ]
 

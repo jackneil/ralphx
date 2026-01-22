@@ -9,15 +9,15 @@ from typing import Optional
 
 # Base loop templates
 TEMPLATES: dict[str, dict] = {
-    "research": {
-        "name": "research",
-        "display_name": "Research Loop",
+    "extractgen_requirements": {
+        "name": "extractgen_requirements",
+        "display_name": "Extract Requirements Loop",
         "description": "Discover and document user stories from design documents or web research",
         "type": "generator",
         "category": "discovery",
         "config": {
-            "name": "research",
-            "display_name": "Research Loop",
+            "name": "extractgen_requirements",
+            "display_name": "Extract Requirements Loop",
             "type": "generator",
             "description": "Discover and document user stories from design documents",
             "item_types": {
@@ -34,7 +34,7 @@ TEMPLATES: dict[str, dict] = {
                     "model": "claude-sonnet-4-20250514",
                     "timeout": 180,
                     "tools": [],
-                    "prompt_template": "prompts/research_turbo.md",
+                    "prompt_template": "prompts/extractgen_requirements_turbo.md",
                 },
                 {
                     "name": "deep",
@@ -42,7 +42,7 @@ TEMPLATES: dict[str, dict] = {
                     "model": "claude-sonnet-4-20250514",
                     "timeout": 900,
                     "tools": ["web_search"],
-                    "prompt_template": "prompts/research_deep.md",
+                    "prompt_template": "prompts/extractgen_requirements_deep.md",
                 },
             ],
             "mode_selection": {
@@ -109,7 +109,7 @@ TEMPLATES: dict[str, dict] = {
                 "input": {
                     "singular": "story",
                     "plural": "stories",
-                    "source": "research",
+                    "source": "extractgen_requirements",
                     "description": "Stories to implement",
                 },
                 "output": {
@@ -219,7 +219,7 @@ def get_template(name: str) -> Optional[dict]:
     """Get a template by name.
 
     Args:
-        name: Template name (e.g., 'research', 'implementation')
+        name: Template name (e.g., 'extractgen_requirements', 'implementation')
 
     Returns:
         Template dict or None if not found

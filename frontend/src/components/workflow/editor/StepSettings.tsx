@@ -4,7 +4,7 @@ import { getDefaultStepPrompt } from '../../../api'
 import { validatePrompt, isPromptModified } from '../../../utils/promptValidation'
 
 // Processing type definitions with their associated settings
-type ProcessingType = 'design_doc' | 'generator' | 'webgen_requirements' | 'consumer'
+type ProcessingType = 'design_doc' | 'extractgen_requirements' | 'webgen_requirements' | 'implementation'
 
 interface ExecutionDefaults {
   model: 'sonnet' | 'opus' | 'haiku' | 'sonnet-1m'
@@ -28,22 +28,23 @@ interface ProcessingTypeConfig {
 const PROCESSING_TYPES: Record<ProcessingType, ProcessingTypeConfig> = {
   design_doc: {
     label: 'Build Design Doc',
-    description: 'Interactive chat to create a PRD or design document',
+    description: 'Interactive chat with web research to create a comprehensive design document',
     icon: 'chat',
     step_type: 'interactive',
     loopType: 'design_doc',
-    defaultTools: [],
+    defaultTools: ['WebSearch', 'WebFetch', 'Bash', 'Read', 'Glob', 'Grep'],  // Web research + codebase exploration
     defaults: {
       model: 'opus',
-      timeout: 600,
+      timeout: 300,  // Per-response timeout (interactive)
     },
   },
-  generator: {
+  extractgen_requirements: {
     label: 'Generate Stories (Extract)',
     description: 'Extract user stories from design documents',
     icon: 'list',
     step_type: 'autonomous',
     loopType: 'generator',
+    template: 'extractgen_requirements',
     defaultTools: ['WebSearch', 'WebFetch'],
     defaults: {
       model: 'opus',
@@ -69,12 +70,13 @@ const PROCESSING_TYPES: Record<ProcessingType, ProcessingTypeConfig> = {
       max_consecutive_errors: 3,
     },
   },
-  consumer: {
+  implementation: {
     label: 'Implementation',
     description: 'Consumes stories and commits code to git',
     icon: 'code',
     step_type: 'autonomous',
     loopType: 'consumer',
+    template: 'implementation',
     defaultTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
     defaults: {
       model: 'opus',
@@ -111,8 +113,9 @@ function getProcessingType(step: WorkflowStep): ProcessingType {
   const template = step.config?.template
   if (loopType === 'design_doc' || step.step_type === 'interactive') return 'design_doc'
   if (template === 'webgen_requirements') return 'webgen_requirements'
-  if (loopType === 'generator' || loopType === 'planning') return 'generator'
-  return 'consumer' // implementation, consumer, or default
+  // Handle both new name and legacy "research" template from old database records
+  if (template === 'extractgen_requirements' || template === 'research' || loopType === 'generator' || loopType === 'planning') return 'extractgen_requirements'
+  return 'implementation' // implementation, consumer, or default
 }
 
 // Detect which fields have been modified from the current type's defaults
@@ -417,7 +420,7 @@ export default function StepSettings({ step, onChange }: StepSettingsProps) {
                   : currentProcessingType === type
                   ? type === 'design_doc'
                     ? 'bg-violet-900/30 border-violet-600'
-                    : type === 'generator'
+                    : type === 'extractgen_requirements'
                     ? 'bg-blue-900/30 border-blue-600'
                     : type === 'webgen_requirements'
                     ? 'bg-cyan-900/30 border-cyan-600'
@@ -431,7 +434,7 @@ export default function StepSettings({ step, onChange }: StepSettingsProps) {
                   : currentProcessingType === type
                   ? type === 'design_doc'
                     ? 'text-violet-400'
-                    : type === 'generator'
+                    : type === 'extractgen_requirements'
                     ? 'text-blue-400'
                     : type === 'webgen_requirements'
                     ? 'text-cyan-400'
@@ -699,7 +702,7 @@ export default function StepSettings({ step, onChange }: StepSettingsProps) {
                   </div>
                 ) : (
                   <div className="p-3 bg-gray-800/50 border border-gray-700 rounded-lg text-gray-400 text-sm">
-                    This is the recommended prompt for {currentProcessingType === 'generator' ? 'Generator (Story Extraction)' : 'Consumer (Implementation)'} steps.
+                    This is the recommended prompt for {currentProcessingType === 'extractgen_requirements' ? 'Extract Requirements (Story Extraction)' : 'Implementation'} steps.
                   </div>
                 )}
 

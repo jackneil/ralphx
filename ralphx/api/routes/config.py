@@ -187,12 +187,12 @@ async def check_loop_type_requirements_status(slug: str, loop_type: str):
             detail=f"No requirements found for loop type: {loop_type}",
         )
 
-    # Check credentials for auth requirement
+    # Check for authenticated account
     from ralphx.core.database import Database
 
     global_db = Database()
-    credentials = global_db.get_credentials()
-    has_auth = credentials is not None
+    accounts = global_db.list_accounts(include_inactive=False, include_deleted=False)
+    has_auth = len(accounts) > 0
 
     # Get resource counts by type
     resources = project_db.list_resources(enabled=True)

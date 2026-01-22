@@ -53,9 +53,6 @@ dev = [
     "httpx>=0.24",
     "ruff>=0.1",
 ]
-mcp = [
-    "mcp>=0.1",
-]
 
 [project.scripts]
 ralphx = "ralphx.cli:main"

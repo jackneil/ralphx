@@ -39,11 +39,11 @@ class ToolRegistry:
         """Check if a tool is registered."""
         return name in self._tools
 
-    def call(self, name: str, **kwargs) -> Any:
+    def call(self, tool_name: str, **kwargs) -> Any:
         """Call a tool by name with arguments."""
-        tool = self._tools.get(name)
+        tool = self._tools.get(tool_name)
         if not tool:
-            raise KeyError(f"Unknown tool: {name}")
+            raise KeyError(f"Unknown tool: {tool_name}")
         return tool.handler(**kwargs)
 
     def get_definitions(self) -> list[dict]:

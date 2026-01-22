@@ -1,10 +1,9 @@
-"""Tests for RalphX OAuth credential management.
+"""Tests for RalphX OAuth account management.
 
-Tests the complete credential flow:
-- store_oauth_tokens() with all fields including new OAuth metadata
+Tests the complete account flow:
+- store_oauth_tokens() storing to accounts table
 - swap_credentials_for_loop() writing correct JSON format to .credentials.json
-- Backwards compatibility with credentials missing new fields
-- Migration v6 adding new columns
+- Account-based credential swapping for loop execution
 """
 
 import json
@@ -45,10 +44,10 @@ def mock_credentials_path(tmp_path):
 
 
 class TestStoreOAuthTokens:
-    """Test store_oauth_tokens() with all credential fields."""
+    """Test store_oauth_tokens() with accounts table."""
 
     def test_store_tokens_with_all_fields(self, db):
-        """Test storing tokens with all new OAuth metadata fields."""
+        """Test storing tokens with all OAuth metadata fields."""
         tokens = {
             "access_token": "sk-ant-oat01-test-token",
             "refresh_token": "sk-ant-ort01-test-refresh",
@@ -60,42 +59,57 @@ class TestStoreOAuthTokens:
         }
 
         with patch("ralphx.core.auth.Database", return_value=db):
-            result = store_oauth_tokens(tokens, scope="global")
+            result = store_oauth_tokens(tokens)
 
         assert result is True
 
-        # Verify stored in database
-        creds = db.get_credentials()
-        assert creds is not None
-        assert creds["access_token"] == "sk-ant-oat01-test-token"
-        assert creds["refresh_token"] == "sk-ant-ort01-test-refresh"
-        assert creds["email"] == "user@example.com"
+        # Verify stored in accounts table
+        account = db.get_account_by_email("user@example.com")
+        assert account is not None
+        assert account["access_token"] == "sk-ant-oat01-test-token"
+        assert account["refresh_token"] == "sk-ant-ort01-test-refresh"
+        assert account["email"] == "user@example.com"
         # Scopes are stored as JSON string
-        assert json.loads(creds["scopes"]) == ["user:inference", "user:profile", "user:sessions:claude_code"]
-        assert creds["subscription_type"] == "max"
-        assert creds["rate_limit_tier"] == "default_claude_max_20x"
+        assert json.loads(account["scopes"]) == ["user:inference", "user:profile", "user:sessions:claude_code"]
+        assert account["subscription_type"] == "max"
+        assert account["rate_limit_tier"] == "default_claude_max_20x"
 
-    def test_store_tokens_minimal_fields(self, db):
-        """Test storing tokens with only required fields (backwards compatibility)."""
+    def test_store_tokens_requires_email(self, db):
+        """Test that email is required for storing tokens."""
         tokens = {
             "access_token": "sk-ant-oat01-minimal",
             "expires_in": 28800,
         }
 
         with patch("ralphx.core.auth.Database", return_value=db):
-            result = store_oauth_tokens(tokens, scope="global")
+            with pytest.raises(ValueError, match="Email is required"):
+                store_oauth_tokens(tokens)
+
+    def test_store_tokens_with_project_assignment(self, db):
+        """Test storing tokens with project assignment."""
+        # Create a project first
+        db.create_project("test-proj", "test-proj", "Test Project", "/tmp/test")
+
+        tokens = {
+            "access_token": "sk-ant-oat01-test-token",
+            "refresh_token": "sk-ant-ort01-test-refresh",
+            "expires_in": 28800,
+            "email": "user@example.com",
+        }
+
+        with patch("ralphx.core.auth.Database", return_value=db):
+            result = store_oauth_tokens(tokens, project_id="test-proj")
 
         assert result is True
 
-        creds = db.get_credentials()
-        assert creds is not None
-        assert creds["access_token"] == "sk-ant-oat01-minimal"
-        # Optional fields should be None
-        assert creds["refresh_token"] is None
-        assert creds["email"] is None
-        assert creds["scopes"] is None
-        assert creds["subscription_type"] is None
-        assert creds["rate_limit_tier"] is None
+        # Verify account created
+        account = db.get_account_by_email("user@example.com")
+        assert account is not None
+
+        # Verify project assignment created
+        assignment = db.get_project_account_assignment("test-proj")
+        assert assignment is not None
+        assert assignment["account_id"] == account["id"]
 
 
 class TestSwapCredentialsForLoop:
@@ -103,14 +117,13 @@ class TestSwapCredentialsForLoop:
 
     def test_swap_writes_all_six_fields(self, db, mock_credentials_path):
         """Test that swap_credentials_for_loop writes all 6 required fields."""
-        # Store credentials with all fields
+        # Create an account with all fields
         expires_at = int(time.time()) + 28800
-        db.store_credentials(
-            scope="global",
+        db.create_account(
+            email="user@example.com",
             access_token="sk-ant-oat01-test",
             refresh_token="sk-ant-ort01-test",
             expires_at=expires_at,
-            email="user@example.com",
             scopes=json.dumps(["user:inference", "user:profile"]),
             subscription_type="max",
             rate_limit_tier="default_claude_max_20x",
@@ -136,14 +149,13 @@ class TestSwapCredentialsForLoop:
 
     def test_swap_uses_defaults_for_missing_fields(self, db, mock_credentials_path):
         """Test backwards compatibility: uses defaults when fields are missing."""
-        # Store credentials WITHOUT new fields (simulates pre-migration data)
+        # Create account WITHOUT some optional fields
         expires_at = int(time.time()) + 28800
-        db.store_credentials(
-            scope="global",
+        db.create_account(
+            email="user@example.com",
             access_token="sk-ant-oat01-old",
             refresh_token="sk-ant-ort01-old",
             expires_at=expires_at,
-            email=None,  # Explicitly no email
             # Note: NOT passing scopes, subscription_type, rate_limit_tier
         )
 
@@ -163,14 +175,14 @@ class TestSwapCredentialsForLoop:
         """Test graceful handling of malformed JSON in scopes field."""
         expires_at = int(time.time()) + 28800
 
-        # Manually insert with malformed scopes JSON
-        with db._writer() as conn:
-            conn.execute(
-                """INSERT INTO credentials
-                   (scope, access_token, expires_at, scopes)
-                   VALUES (?, ?, ?, ?)""",
-                ("global", "sk-ant-oat01-test", expires_at, "not-valid-json{{{")
-            )
+        # Create account with malformed scopes JSON
+        db.create_account(
+            email="user@example.com",
+            access_token="sk-ant-oat01-test",
+            refresh_token="sk-ant-ort01-test",
+            expires_at=expires_at,
+            scopes="not-valid-json{{{",
+        )
 
         with patch("ralphx.core.auth.Database", return_value=db):
             with swap_credentials_for_loop() as has_creds:
@@ -182,57 +194,154 @@ class TestSwapCredentialsForLoop:
                 # Should fall back to default scopes
                 assert oauth["scopes"] == ["user:inference", "user:profile", "user:sessions:claude_code"]
 
-    def test_swap_returns_false_without_credentials(self, db, mock_credentials_path):
-        """Test swap returns False when no credentials exist."""
+    def test_swap_returns_false_without_accounts(self, db, mock_credentials_path):
+        """Test swap returns False when no accounts exist."""
         with patch("ralphx.core.auth.Database", return_value=db):
             with swap_credentials_for_loop() as has_creds:
                 assert has_creds is False
 
+    def test_swap_uses_effective_account_for_project(self, db, mock_credentials_path):
+        """Test swap uses effective account resolution for projects."""
+        expires_at = int(time.time()) + 28800
 
-class TestMigrationV6:
-    """Test migration v6 adds OAuth metadata columns."""
+        # Create default account
+        db.create_account(
+            email="default@example.com",
+            access_token="default-token",
+            refresh_token="default-refresh",
+            expires_at=expires_at,
+        )
 
-    def test_new_columns_exist(self, db):
-        """Test that migration v6 adds scopes, subscription_type, rate_limit_tier columns."""
-        # The fixture already runs migrations, so columns should exist
-        # Verify by storing credentials with new fields
-        db.store_credentials(
-            scope="global",
-            access_token="test",
-            expires_at=int(time.time()) + 3600,
-            scopes='["user:inference"]',
+        # Create project-specific account
+        db.create_account(
+            email="project@example.com",
+            access_token="project-token",
+            refresh_token="project-refresh",
+            expires_at=expires_at,
+        )
+
+        # Create project and assign the project-specific account
+        db.create_project("test-proj", "test-proj", "Test Project", "/tmp/test")
+        project_account = db.get_account_by_email("project@example.com")
+        db.assign_account_to_project("test-proj", project_account["id"])
+
+        with patch("ralphx.core.auth.Database", return_value=db):
+            with swap_credentials_for_loop(project_id="test-proj") as has_creds:
+                assert has_creds is True
+
+                written_data = json.loads(mock_credentials_path.read_text())
+                oauth = written_data.get("claudeAiOauth", {})
+
+                # Should use project-specific account
+                assert oauth["accessToken"] == "project-token"
+
+
+class TestAccountManagement:
+    """Test account table operations."""
+
+    def test_create_account(self, db):
+        """Test creating a new account."""
+        expires_at = int(time.time()) + 28800
+        account = db.create_account(
+            email="test@example.com",
+            access_token="test-token",
+            refresh_token="test-refresh",
+            expires_at=expires_at,
             subscription_type="pro",
-            rate_limit_tier="default_claude_pro",
         )
 
-        creds = db.get_credentials()
-        assert creds["scopes"] == '["user:inference"]'
-        assert creds["subscription_type"] == "pro"
-        assert creds["rate_limit_tier"] == "default_claude_pro"
+        assert account is not None
+        assert account["email"] == "test@example.com"
+        assert account["subscription_type"] == "pro"
+        assert account["is_default"]  # First account is default (SQLite stores as 1/0)
 
-    def test_update_credentials_with_new_fields(self, db):
-        """Test update_credentials can update new fields."""
-        # Create initial credentials
-        cred_id = db.store_credentials(
-            scope="global",
-            access_token="old-token",
-            expires_at=int(time.time()) + 3600,
+    def test_second_account_not_default(self, db):
+        """Test that second account is not default."""
+        expires_at = int(time.time()) + 28800
+
+        # First account becomes default
+        db.create_account(
+            email="first@example.com",
+            access_token="first-token",
+            expires_at=expires_at,
         )
 
-        # Update with new fields
-        db.update_credentials(
-            cred_id,
-            access_token="new-token",
-            scopes='["user:inference", "user:profile"]',
-            subscription_type="max",
-            rate_limit_tier="default_claude_max_20x",
+        # Second account should not be default
+        second = db.create_account(
+            email="second@example.com",
+            access_token="second-token",
+            expires_at=expires_at,
         )
 
-        creds = db.get_credentials()
-        assert creds["access_token"] == "new-token"
-        assert creds["scopes"] == '["user:inference", "user:profile"]'
-        assert creds["subscription_type"] == "max"
-        assert creds["rate_limit_tier"] == "default_claude_max_20x"
+        assert not second["is_default"]
+
+    def test_set_default_account(self, db):
+        """Test setting default account."""
+        expires_at = int(time.time()) + 28800
+
+        first = db.create_account(
+            email="first@example.com",
+            access_token="first-token",
+            expires_at=expires_at,
+        )
+
+        second = db.create_account(
+            email="second@example.com",
+            access_token="second-token",
+            expires_at=expires_at,
+        )
+
+        # Set second as default
+        db.set_default_account(second["id"])
+
+        # Re-fetch to get updated state
+        first = db.get_account(first["id"])
+        second = db.get_account(second["id"])
+
+        assert not first["is_default"]
+        assert second["is_default"]
+
+    def test_get_effective_account_uses_assignment(self, db):
+        """Test effective account uses project assignment."""
+        expires_at = int(time.time()) + 28800
+
+        # Default account
+        db.create_account(
+            email="default@example.com",
+            access_token="default-token",
+            expires_at=expires_at,
+        )
+
+        # Assigned account
+        assigned = db.create_account(
+            email="assigned@example.com",
+            access_token="assigned-token",
+            expires_at=expires_at,
+        )
+
+        # Create project and assign
+        db.create_project("test-proj", "test-proj", "Test", "/tmp/test")
+        db.assign_account_to_project("test-proj", assigned["id"])
+
+        # Effective account should be assigned, not default
+        effective = db.get_effective_account("test-proj")
+        assert effective["email"] == "assigned@example.com"
+
+    def test_get_effective_account_falls_back_to_default(self, db):
+        """Test effective account falls back to default when no assignment."""
+        expires_at = int(time.time()) + 28800
+
+        db.create_account(
+            email="default@example.com",
+            access_token="default-token",
+            expires_at=expires_at,
+        )
+
+        db.create_project("test-proj", "test-proj", "Test", "/tmp/test")
+
+        # No assignment - should use default
+        effective = db.get_effective_account("test-proj")
+        assert effective["email"] == "default@example.com"
 
 
 class TestCredentialFieldDocumentation:
@@ -247,9 +356,10 @@ class TestCredentialFieldDocumentation:
         # Claude Code expects expiresAt in milliseconds, not seconds
         expires_at_seconds = int(time.time()) + 28800
 
-        db.store_credentials(
-            scope="global",
+        db.create_account(
+            email="test@example.com",
             access_token="test",
+            refresh_token="test-refresh",
             expires_at=expires_at_seconds,
         )
 

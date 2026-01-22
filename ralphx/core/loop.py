@@ -188,11 +188,15 @@ class LoopLoader:
     def register_loop(
         self,
         config: LoopConfig,
+        workflow_id: Optional[str] = None,
+        step_id: Optional[int] = None,
     ) -> str:
         """Register a loop configuration in the database.
 
         Args:
             config: Validated loop configuration.
+            workflow_id: Parent workflow ID. Required for workflow-first architecture.
+            step_id: Parent workflow step ID. Required for workflow-first architecture.
 
         Returns:
             The loop ID.
@@ -213,6 +217,8 @@ class LoopLoader:
             id=loop_id,
             name=config.name,
             config_yaml=config.to_yaml(),
+            workflow_id=workflow_id,
+            step_id=step_id,
         )
         return loop_id
 
@@ -287,11 +293,18 @@ class LoopLoader:
 
         return sorted(set(loop_files))
 
-    def sync_loops(self, project: Project) -> dict:
+    def sync_loops(
+        self,
+        project: Project,
+        workflow_id: Optional[str] = None,
+        step_id: Optional[int] = None,
+    ) -> dict:
         """Sync loop configurations from project files to database.
 
         Args:
             project: Project to sync.
+            workflow_id: Parent workflow ID. Required for workflow-first architecture.
+            step_id: Parent workflow step ID. Required for workflow-first architecture.
 
         Returns:
             Dictionary with sync results (added, updated, removed counts).
@@ -312,7 +325,7 @@ class LoopLoader:
 
                 # Check if already exists
                 existing = self._require_db().get_loop(config.name)
-                self.register_loop(config)
+                self.register_loop(config, workflow_id=workflow_id, step_id=step_id)
 
                 if existing:
                     updated += 1
