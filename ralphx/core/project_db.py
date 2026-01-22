@@ -14,12 +14,16 @@ This makes projects portable - clone a repo with .ralphx/ and all data comes wit
 """
 
 import json
+import logging
+import shutil
 import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # Schema version for project DB
@@ -574,8 +578,28 @@ class ProjectDatabase:
                     (PROJECT_SCHEMA_VERSION,),
                 )
             elif current_version < PROJECT_SCHEMA_VERSION:
+                # Create backup before running migrations
+                self._backup_before_migration(current_version)
                 # Run migrations (for future versions > 6)
                 self._run_migrations(conn, current_version)
+
+    def _backup_before_migration(self, from_version: int) -> None:
+        """Create a backup of the database before running migrations.
+
+        Creates a timestamped backup file in the same directory as the database.
+        This allows recovery if a migration fails or causes data loss.
+
+        Args:
+            from_version: Current schema version before migration.
+        """
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = self.db_path.with_suffix(f".v{from_version}.{timestamp}.bak")
+            shutil.copy2(self.db_path, backup_path)
+            logger.info(f"Created database backup before migration: {backup_path}")
+        except Exception as e:
+            logger.warning(f"Failed to create backup before migration: {e}")
+            # Don't fail the migration if backup fails - just warn
 
     def _run_migrations(self, conn: sqlite3.Connection, from_version: int) -> None:
         """Run schema migrations from a version to the latest.
@@ -949,7 +973,13 @@ class ProjectDatabase:
         - idx_workflows_namespace index
 
         SQLite doesn't support DROP COLUMN directly, so we recreate the table.
+
+        IMPORTANT: We must disable foreign keys before dropping the old table,
+        otherwise the ON DELETE CASCADE on workflow_steps will delete all steps!
         """
+        # 0. Disable foreign keys to prevent CASCADE deletes during table swap
+        conn.execute("PRAGMA foreign_keys=OFF")
+
         # 1. Create new table without namespace
         conn.execute("""
             CREATE TABLE workflows_new (
@@ -980,6 +1010,9 @@ class ProjectDatabase:
 
         # 5. Recreate the status index on the new table
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status)")
+
+        # 6. Re-enable foreign keys
+        conn.execute("PRAGMA foreign_keys=ON")
 
     # ========== Loops ==========
 
