@@ -66,7 +66,7 @@ for product development. I'm not technical so please handle everything:
 1. Check if I have conda/miniconda installed. If not, install miniconda for my OS.
 2. Create a Python 3.11 environment called "ralphx" and activate it
 3. Install RalphX from PyPI: pip install ralphx
-4. Add RalphX as an MCP server so you can control it: claude mcp add ralphx -- ralphx mcp
+4. Add RalphX as an MCP server using the full path to the ralphx binary in the conda env (use the right command for my OS to find it)
 5. Start the RalphX dashboard: ralphx serve
 6. Ask me if I want a desktop shortcut to launch the dashboard. If yes, create
    a shortcut for my OS that uses the full path to the Python executable in the
@@ -93,13 +93,23 @@ Open `http://localhost:16768` to monitor progress.
 **Already technical?** Here's the quick setup:
 
 ```bash
-# Create a Python 3.11+ environment (pick one):
-conda create -n ralphx python=3.11 -y   # then: conda activate ralphx
-python3 -m venv ~/.venvs/ralphx         # then: source ~/.venvs/ralphx/bin/activate
+# Create and activate a Python 3.11+ environment:
+conda create -n ralphx python=3.11 -y && conda activate ralphx
 
-# Install and configure MCP:
+# Install RalphX:
 pip install ralphx
-claude mcp add ralphx -- "$(which ralphx)" mcp
+
+# Add MCP server with full path to ralphx binary:
+
+# Linux/Mac:
+claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- "$(which ralphx)" mcp
+
+# Mac (zsh) - if "which ralphx" fails, first run: conda init zsh && source ~/.zshrc
+
+# Windows - first find your path, then use it:
+#   CMD:        where.exe ralphx
+#   PowerShell: (Get-Command ralphx).Source
+claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- C:\Users\YOU\miniconda3\envs\ralphx\Scripts\ralphx.exe mcp
 ```
 
 ---
@@ -203,8 +213,12 @@ conda activate ralphx
 # Install RalphX
 pip install ralphx
 
-# Set up MCP so Claude can control RalphX (uses full path so it works outside the venv)
-claude mcp add ralphx -- "$(which ralphx)" mcp
+# Set up MCP so Claude can control RalphX (uses full path so it works outside the env)
+# Linux/Mac:
+claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- "$(which ralphx)" mcp
+# Mac (zsh): if "which" fails, run: conda init zsh && source ~/.zshrc
+# Windows: find path with "where.exe ralphx" (CMD) or "(Get-Command ralphx).Source" (PowerShell)
+#          then: claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- C:\Users\YOU\...\ralphx.exe mcp
 
 # Start the dashboard
 ralphx serve

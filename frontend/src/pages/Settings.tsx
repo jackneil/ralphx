@@ -258,8 +258,11 @@ export default function Settings() {
                   pip install ralphx
                 </code>
                 <code className="block mt-1 px-3 py-2 bg-gray-700 rounded text-xs font-mono text-gray-300">
-                  claude mcp add ralphx -- ralphx mcp
+                  claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- "$(which ralphx)" mcp
                 </code>
+                <p className="text-xs text-gray-500 mt-1">
+                  Windows: run <code className="bg-gray-600 px-1 rounded">where.exe ralphx</code> to find path, then use that instead of $(which ralphx)
+                </p>
               </div>
             </div>
           </div>

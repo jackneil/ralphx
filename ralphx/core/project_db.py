@@ -3145,11 +3145,12 @@ class ProjectDatabase:
         now = datetime.utcnow().isoformat()
 
         # Build Product workflow template
+        # Uses processing_type to reference PROCESSING_TYPES in mcp/tools/workflows.py
         build_product_phases = json.dumps([
             {
                 "number": 1,
-                "name": "Planning",
-                "type": "interactive",
+                "name": "Design Document",
+                "processing_type": "design_doc",
                 "description": "Describe what you want to build. Claude will help create a design document.",
                 "outputs": ["design_doc", "guardrails"],
                 "skippable": True,
@@ -3157,10 +3158,9 @@ class ProjectDatabase:
             },
             {
                 "number": 2,
-                "name": "Story Generation",
-                "type": "autonomous",
-                "loopType": "generator",
-                "description": "Claude generates detailed user stories from the design document.",
+                "name": "Story Generation (Extract)",
+                "processing_type": "extractgen_requirements",
+                "description": "Claude extracts user stories from the design document.",
                 "inputs": ["design_doc", "guardrails"],
                 "outputs": ["stories"],
                 "skippable": True,
@@ -3168,9 +3168,18 @@ class ProjectDatabase:
             },
             {
                 "number": 3,
+                "name": "Story Generation (Web)",
+                "processing_type": "webgen_requirements",
+                "description": "Claude discovers additional requirements via web research.",
+                "inputs": ["design_doc", "guardrails", "stories"],
+                "outputs": ["stories"],
+                "skippable": True,
+                "skipCondition": "Skip web research"
+            },
+            {
+                "number": 4,
                 "name": "Implementation",
-                "type": "autonomous",
-                "loopType": "consumer",
+                "processing_type": "implementation",
                 "description": "Claude implements each story, committing code to git.",
                 "inputs": ["stories", "design_doc", "guardrails"],
                 "outputs": ["code"],
@@ -3190,23 +3199,31 @@ class ProjectDatabase:
             ),
         )
 
-        # From Design Doc workflow - skips planning, starts with story generation
+        # From Design Doc workflow - skips design doc, starts with story generation
         from_design_doc_phases = json.dumps([
             {
                 "number": 1,
-                "name": "Story Generation",
-                "type": "autonomous",
-                "loopType": "generator",
-                "description": "Claude generates detailed user stories from your design document.",
+                "name": "Story Generation (Extract)",
+                "processing_type": "extractgen_requirements",
+                "description": "Claude extracts user stories from your design document.",
                 "inputs": ["design_doc"],
                 "outputs": ["stories"],
                 "skippable": False
             },
             {
                 "number": 2,
+                "name": "Story Generation (Web)",
+                "processing_type": "webgen_requirements",
+                "description": "Claude discovers additional requirements via web research.",
+                "inputs": ["design_doc", "stories"],
+                "outputs": ["stories"],
+                "skippable": True,
+                "skipCondition": "Skip web research"
+            },
+            {
+                "number": 3,
                 "name": "Implementation",
-                "type": "autonomous",
-                "loopType": "consumer",
+                "processing_type": "implementation",
                 "description": "Claude implements each story, committing code to git.",
                 "inputs": ["stories", "design_doc"],
                 "outputs": ["code"],
@@ -3231,8 +3248,7 @@ class ProjectDatabase:
             {
                 "number": 1,
                 "name": "Implementation",
-                "type": "autonomous",
-                "loopType": "consumer",
+                "processing_type": "implementation",
                 "description": "Claude implements each story, committing code to git.",
                 "inputs": ["stories"],
                 "outputs": ["code"],
@@ -3252,12 +3268,12 @@ class ProjectDatabase:
             ),
         )
 
-        # Planning Only workflow - just the interactive planning step
+        # Design Doc Only workflow - just the interactive design doc step
         planning_only_phases = json.dumps([
             {
                 "number": 1,
-                "name": "Planning",
-                "type": "interactive",
+                "name": "Design Document",
+                "processing_type": "design_doc",
                 "description": "Collaborate with Claude to create a comprehensive design document.",
                 "outputs": ["design_doc", "guardrails"],
                 "skippable": False

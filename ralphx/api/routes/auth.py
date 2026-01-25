@@ -1,6 +1,7 @@
 """Authentication routes for Claude accounts."""
 
 import asyncio
+import logging
 import secrets
 import time
 from typing import Optional
@@ -11,6 +12,8 @@ from pydantic import BaseModel, Field
 
 from ralphx.core.database import Database
 from ralphx.core.oauth import OAuthFlow
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -51,6 +54,9 @@ class AccountResponse(BaseModel):
     last_error: Optional[str] = None
     last_error_at: Optional[str] = None
     consecutive_failures: int = 0
+    # Token validation status
+    last_validated_at: Optional[int] = None
+    validation_status: Optional[str] = None  # 'unknown', 'valid', 'invalid', 'checking'
     created_at: Optional[str] = None
 
 
@@ -148,6 +154,8 @@ def _build_account_response(account: dict, db: Database) -> AccountResponse:
         last_error=account.get("last_error"),
         last_error_at=account.get("last_error_at"),
         consecutive_failures=account.get("consecutive_failures", 0),
+        last_validated_at=account.get("last_validated_at"),
+        validation_status=account.get("validation_status", "unknown"),
         created_at=account.get("created_at"),
     )
 
@@ -174,6 +182,8 @@ from typing import Literal
 
 from ralphx.core.auth import (
     AuthStatus,
+    CLIENT_ID,
+    TOKEN_URL,
     get_auth_status,
     refresh_token_if_needed,
     force_refresh_token,
@@ -389,11 +399,15 @@ async def list_accounts(
 
 
 @router.post("/accounts/add")
-async def add_account():
+async def add_account(expected_email: Optional[str] = None):
     """Start OAuth flow to add a new account.
 
     Opens browser for authentication. On success, creates a new account
     or updates existing if email matches.
+
+    Args:
+        expected_email: If provided (re-auth flow), checks if OAuth email matches.
+                        On mismatch, still saves the account but flags the mismatch.
     """
 
     async def run_flow():
@@ -405,18 +419,14 @@ async def add_account():
             if not email:
                 return {"success": False, "error": "No email in OAuth response"}
 
-            db = Database()
-            account = db.create_account(
-                email=email,
-                access_token=tokens["access_token"],
-                refresh_token=tokens.get("refresh_token"),
-                expires_at=int(time.time()) + tokens.get("expires_in", 28800),
-                scopes=tokens.get("scopes"),
-                subscription_type=tokens.get("subscription_type"),
-                rate_limit_tier=tokens.get("rate_limit_tier"),
-            )
+            # Check for email mismatch (re-auth flow)
+            email_mismatch = expected_email and email.lower() != expected_email.lower()
+
+            # Use store_oauth_tokens to properly serialize scopes to JSON
+            account = store_oauth_tokens(tokens)
 
             # Fetch usage data immediately
+            db = Database()
             usage_data = await _fetch_account_usage(tokens["access_token"])
             if usage_data:
                 db.update_account_usage_cache(
@@ -427,7 +437,17 @@ async def add_account():
                     seven_day_resets_at=usage_data.get("seven_day_resets_at"),
                 )
 
-            return {"success": True, "account_id": account["id"], "email": email}
+            # Return success with mismatch info if applicable
+            response = {"success": True, "account_id": account["id"], "email": email}
+            if email_mismatch:
+                response["email_mismatch"] = True
+                response["expected_email"] = expected_email
+                response["message"] = (
+                    f"Signed in as {email} instead of {expected_email}. "
+                    f"Tokens saved for {email}. "
+                    f"To fix {expected_email}, sign out of {email} in your browser first, then re-auth."
+                )
+            return response
         return result
 
     flow_id = secrets.token_urlsafe(8)
@@ -547,11 +567,11 @@ async def refresh_account_token(account_id: int):
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://api.anthropic.com/api/oauth/token",
+                TOKEN_URL,
                 json={
                     "grant_type": "refresh_token",
                     "refresh_token": account["refresh_token"],
-                    "client_id": "9d1c250a-e61b-44b9-b2e4-8c4c53cd68d5",
+                    "client_id": CLIENT_ID,
                 },
                 headers={
                     "Content-Type": "application/json",
@@ -565,14 +585,26 @@ async def refresh_account_token(account_id: int):
             tokens = resp.json()
             new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
 
-            db.update_account(
-                account_id,
-                access_token=tokens["access_token"],
-                refresh_token=tokens.get("refresh_token", account["refresh_token"]),
-                expires_at=new_expires_at,
-            )
+            # Build update dict with all available fields
+            update_data = {
+                "access_token": tokens["access_token"],
+                "refresh_token": tokens.get("refresh_token", account["refresh_token"]),
+                "expires_at": new_expires_at,
+            }
 
-            return {"success": True, "expires_at": new_expires_at}
+            # Capture subscription/plan info if present in refresh response
+            if tokens.get("subscription_type"):
+                update_data["subscription_type"] = tokens["subscription_type"]
+            if tokens.get("rate_limit_tier"):
+                update_data["rate_limit_tier"] = tokens["rate_limit_tier"]
+
+            db.update_account(account_id, **update_data)
+
+            return {
+                "success": True,
+                "expires_at": new_expires_at,
+                "subscription_type": tokens.get("subscription_type"),
+            }
     except Exception as e:
         return {"success": False, "message": str(e)}
 
@@ -600,6 +632,56 @@ async def refresh_account_usage(account_id: int):
     )
 
     return {"success": True, "usage": usage_data}
+
+
+@router.post("/accounts/{account_id}/validate")
+async def validate_account(account_id: int):
+    """Validate that an account's token is actually working.
+
+    Makes a real API call to verify the refresh_token is still valid.
+    Returns validation result without blocking.
+    """
+    db = Database()
+    account = db.get_account(account_id)
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    is_valid, error = await validate_account_token(account)
+
+    # Update account with validation status
+    now = int(time.time())
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    update_kwargs = {
+        "last_validated_at": now,
+        "validation_status": 'valid' if is_valid else 'invalid',
+    }
+    if is_valid:
+        update_kwargs["last_error"] = None
+        update_kwargs["last_error_at"] = None
+    else:
+        update_kwargs["last_error"] = error
+        update_kwargs["last_error_at"] = now_iso
+
+    try:
+        updated = db.update_account(account_id, **update_kwargs)
+        if not updated:
+            # Account was deleted between get and update - rare race condition
+            raise HTTPException(status_code=404, detail="Account was deleted during validation")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Log but don't fail - validation result is still valid
+        # The validation already happened (and token may have been refreshed)
+        logger.warning(
+            f"Failed to update validation status for account {account_id}: {e}"
+        )
+
+    return {
+        "valid": is_valid,
+        "error": error if not is_valid else None,
+        "email": account.get("email"),
+    }
 
 
 @router.post("/accounts/refresh-all-usage")

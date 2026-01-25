@@ -25,7 +25,7 @@ from ralphx.core.workspace import get_backups_path, get_database_path
 # Schema version for migrations
 # NOTE: When the initial schema is updated, also update this version and ensure
 # migrations are idempotent (use IF EXISTS / IF NOT EXISTS clauses).
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # SQL schema
 SCHEMA_SQL = """
@@ -170,6 +170,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_error TEXT,
     last_error_at TIMESTAMP,
     consecutive_failures INTEGER DEFAULT 0,
+    -- Token validation status
+    last_validated_at INTEGER,  -- Unix timestamp of last validation check
+    validation_status TEXT DEFAULT 'unknown',  -- 'unknown', 'valid', 'invalid', 'checking'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -1505,6 +1508,7 @@ class Database:
         "last_used_at", "cached_usage_5h", "cached_usage_7d",
         "cached_5h_resets_at", "cached_7d_resets_at", "usage_cached_at",
         "last_error", "last_error_at", "consecutive_failures",
+        "last_validated_at", "validation_status",
     })
 
     def update_account(self, account_id: int, **kwargs) -> bool:
@@ -2337,6 +2341,12 @@ class Database:
 
                 -- Drop legacy credentials table if it exists
                 DROP TABLE IF EXISTS credentials;
+            """),
+            # Migration to v10: Add async token validation columns to accounts
+            (10, """
+                -- Add validation status columns to accounts
+                ALTER TABLE accounts ADD COLUMN last_validated_at INTEGER;
+                ALTER TABLE accounts ADD COLUMN validation_status TEXT DEFAULT 'unknown';
             """),
         ]
 

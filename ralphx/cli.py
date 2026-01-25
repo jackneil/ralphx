@@ -1319,7 +1319,10 @@ def mcp_server() -> None:
     67 tools for full RalphX management through Claude Code.
 
     To add RalphX to Claude Code, run:
-        claude mcp add ralphx -- ralphx mcp
+        Linux/Mac: claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- "$(which ralphx)" mcp
+        Mac (zsh): if "which" fails, first run: conda init zsh && source ~/.zshrc
+        Windows:   find path with "where.exe ralphx", then:
+                   claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- C:\\path\\to\\ralphx.exe mcp
 
     Then in Claude Code, you can ask Claude to:
         - Manage projects (add, remove, list, diagnose)

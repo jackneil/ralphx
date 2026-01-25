@@ -3,7 +3,6 @@ import { Link } from 'react-router-dom'
 import {
   Account,
   AccountUsage,
-  ProjectAccountAssignment,
   listAccounts,
   getProjectAccount,
   assignProjectAccount,
@@ -21,7 +20,6 @@ export default function ProjectAccountSelector({
   onAccountChange,
 }: ProjectAccountSelectorProps) {
   const [accounts, setAccounts] = useState<Account[]>([])
-  const [, setAssignment] = useState<ProjectAccountAssignment | null>(null)
   const [effectiveAccount, setEffectiveAccount] = useState<Account | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -41,7 +39,6 @@ export default function ProjectAccountSelector({
       ])
 
       setAccounts(accountsData)
-      setAssignment(assignmentData)
       setEffectiveAccount(effectiveData)
 
       // Update local state from loaded data

@@ -1185,6 +1185,9 @@ export interface Account {
   last_error?: string
   last_error_at?: string
   consecutive_failures: number
+  // Token validation status
+  last_validated_at?: number
+  validation_status?: 'unknown' | 'valid' | 'invalid' | 'checking'
   created_at?: string
 }
 
@@ -1212,8 +1215,36 @@ export async function listAccounts(includeInactive: boolean = false): Promise<Ac
 }
 
 // Start OAuth flow to add a new account
-export async function addAccount(): Promise<{ success: boolean; flow_id: string; message: string }> {
-  return request('/auth/accounts/add', { method: 'POST' })
+// If expectedEmail is provided (re-auth flow), backend checks if OAuth email matches.
+// On mismatch, account is still saved for actual email with email_mismatch flag.
+export async function addAccount(expectedEmail?: string): Promise<{
+  success: boolean;
+  flow_id?: string;
+  message?: string;
+  error?: string;
+}> {
+  const params = expectedEmail ? `?expected_email=${encodeURIComponent(expectedEmail)}` : ''
+  return request(`/auth/accounts/add${params}`, { method: 'POST' })
+}
+
+// OAuth flow result (returned when flow completes)
+export interface OAuthFlowResult {
+  success: boolean;
+  account_id?: number;
+  email?: string;
+  email_mismatch?: boolean;
+  expected_email?: string;
+  message?: string;
+  error?: string;
+}
+
+// Check status of an OAuth flow
+export async function getFlowStatus(flowId: string): Promise<{
+  status: 'pending' | 'completed' | 'error' | 'not_found';
+  result?: OAuthFlowResult;
+  error?: string;
+}> {
+  return request(`/auth/flow/${flowId}`)
 }
 
 // Get a specific account
@@ -1250,6 +1281,15 @@ export async function refreshAccountToken(accountId: number): Promise<{ success:
 // Refresh usage cache for a single account
 export async function refreshAccountUsage(accountId: number): Promise<{ success: boolean; usage?: AccountUsage; error?: string }> {
   return request(`/auth/accounts/${accountId}/refresh-usage`, { method: 'POST' })
+}
+
+// Validate account token (checks if refresh token is still valid)
+export async function validateAccount(accountId: number): Promise<{
+  valid: boolean
+  error?: string
+  email?: string
+}> {
+  return request(`/auth/accounts/${accountId}/validate`, { method: 'POST' })
 }
 
 // Refresh usage cache for all accounts

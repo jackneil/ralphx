@@ -61,7 +61,8 @@ class TestStoreOAuthTokens:
         with patch("ralphx.core.auth.Database", return_value=db):
             result = store_oauth_tokens(tokens)
 
-        assert result is True
+        assert result is not None
+        assert result["email"] == "user@example.com"
 
         # Verify stored in accounts table
         account = db.get_account_by_email("user@example.com")
@@ -100,7 +101,8 @@ class TestStoreOAuthTokens:
         with patch("ralphx.core.auth.Database", return_value=db):
             result = store_oauth_tokens(tokens, project_id="test-proj")
 
-        assert result is True
+        assert result is not None
+        assert result["email"] == "user@example.com"
 
         # Verify account created
         account = db.get_account_by_email("user@example.com")
@@ -397,3 +399,77 @@ class TestCredentialFieldDocumentation:
         """
         # This test documents expected values
         assert "default_claude_max_20x".endswith("20x")  # 20x multiplier
+
+
+class TestValidateAccountEndpoint:
+    """Tests for POST /auth/accounts/{account_id}/validate endpoint.
+
+    TODO: These test skeletons need implementation. They validate:
+    - Token validation correctly calls validate_account_token
+    - Validation status is persisted to database
+    - Error handling for missing/deleted accounts
+    - Concurrent validation requests are handled safely
+    """
+
+    def test_validate_account_success(self, db):
+        """Test successful token validation updates status correctly.
+
+        TODO: Verify expected behavior with user:
+        - When validation succeeds, last_validated_at is set to current timestamp
+        - validation_status is set to 'valid'
+        - last_error is cleared to None
+        - last_error_at is cleared to None
+        """
+        # TODO: Implement - mock validate_account_token to return (True, "")
+        pass
+
+    def test_validate_account_failure(self, db):
+        """Test failed token validation updates status correctly.
+
+        TODO: Verify expected behavior with user:
+        - When validation fails, last_validated_at is still set
+        - validation_status is set to 'invalid'
+        - last_error contains the error message
+        - last_error_at is set to current timestamp (ISO format)
+        """
+        # TODO: Implement - mock validate_account_token to return (False, "error msg")
+        pass
+
+    def test_validate_nonexistent_account_returns_404(self, db):
+        """Test validating non-existent account returns 404.
+
+        TODO: Verify expected behavior with user:
+        - Request to validate account_id that doesn't exist returns 404
+        """
+        # TODO: Implement - call endpoint with invalid account_id
+        pass
+
+    def test_validate_deleted_account_returns_404(self, db):
+        """Test validating soft-deleted account returns 404.
+
+        TODO: Verify expected behavior with user:
+        - Request to validate account_id that was soft-deleted returns 404
+        """
+        # TODO: Implement - create account, soft delete, try to validate
+        pass
+
+    def test_validate_concurrent_requests_handled_safely(self, db):
+        """Test concurrent validation requests use locking correctly.
+
+        TODO: Verify expected behavior with user:
+        - Two concurrent validate requests don't cause duplicate API calls
+        - File lock prevents race conditions on token refresh
+        - Second request sees updated token from first and returns early
+        """
+        # TODO: Implement - mock validate_account_token and verify lock behavior
+        pass
+
+    def test_validate_updates_db_even_if_validation_succeeds(self, db):
+        """Test that validation status is persisted even on success.
+
+        TODO: Verify expected behavior with user:
+        - Even when token is valid, we update the database with validation timestamp
+        - This allows UI to show "last checked at" time
+        """
+        # TODO: Implement - mock success, verify DB was updated
+        pass

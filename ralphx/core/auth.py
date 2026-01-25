@@ -210,7 +210,7 @@ async def _token_refresh_lock() -> AsyncGenerator[None, None]:
 def store_oauth_tokens(
     tokens: dict,
     project_id: Optional[str] = None,
-) -> bool:
+) -> dict:
     """Store OAuth tokens in database (accounts table).
 
     Args:
@@ -219,7 +219,7 @@ def store_oauth_tokens(
         project_id: Optional project ID to assign this account to
 
     Returns:
-        True if tokens stored successfully
+        Account dict with id, email, and other fields
 
     Raises:
         ValueError: If email not provided in tokens
@@ -237,7 +237,7 @@ def store_oauth_tokens(
         scopes_json = json.dumps(tokens["scopes"])
 
     # Create or update account
-    db.create_account(
+    account = db.create_account(
         email=email,
         access_token=tokens["access_token"],
         refresh_token=tokens.get("refresh_token"),
@@ -249,9 +249,7 @@ def store_oauth_tokens(
 
     # If project_id provided, assign this account to the project
     if project_id:
-        account = db.get_account_by_email(email)
-        if account:
-            db.assign_account_to_project(project_id, account["id"])
+        db.assign_account_to_project(project_id, account["id"])
 
     auth_log.info(
         "login",
@@ -259,7 +257,7 @@ def store_oauth_tokens(
         email=email,
         project_id=project_id,
     )
-    return True
+    return account
 
 
 def get_effective_account_for_project(project_id: Optional[str] = None) -> Optional[dict]:
@@ -426,7 +424,7 @@ def swap_credentials_for_account(
             pass
 
 
-async def _do_token_refresh(creds: dict, project_id: Optional[str] = None) -> bool:
+async def _do_token_refresh(account: dict, project_id: Optional[str] = None) -> bool:
     """Actually perform the token refresh via OAuth for an account.
 
     Args:
@@ -485,16 +483,22 @@ async def _do_token_refresh(creds: dict, project_id: Optional[str] = None) -> bo
             tokens = resp.json()
             new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
 
+            # Build update dict - capture subscription/plan info if present
+            update_data = {
+                "access_token": tokens["access_token"],
+                "refresh_token": tokens.get("refresh_token", account["refresh_token"]),
+                "expires_at": new_expires_at,
+                "consecutive_failures": 0,  # Reset failure count on success
+            }
+            if tokens.get("subscription_type"):
+                update_data["subscription_type"] = tokens["subscription_type"]
+            if tokens.get("rate_limit_tier"):
+                update_data["rate_limit_tier"] = tokens["rate_limit_tier"]
+
             # CRITICAL: If DB update fails after refresh, we've consumed the
             # refresh_token but not saved the new one. Log this clearly.
             try:
-                db.update_account(
-                    account["id"],
-                    access_token=tokens["access_token"],
-                    refresh_token=tokens.get("refresh_token", account["refresh_token"]),
-                    expires_at=new_expires_at,
-                    consecutive_failures=0,  # Reset failure count on success
-                )
+                db.update_account(account["id"], **update_data)
             except Exception as db_error:
                 auth_log.error(
                     "token_db_update_failed",
@@ -589,16 +593,22 @@ async def validate_account_token(account: dict) -> tuple[bool, str]:
                     tokens = resp.json()
                     new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
 
+                    # Build update dict - capture subscription/plan info if present
+                    update_data = {
+                        "access_token": tokens["access_token"],
+                        "refresh_token": tokens.get("refresh_token", account["refresh_token"]),
+                        "expires_at": new_expires_at,
+                        "consecutive_failures": 0,
+                    }
+                    if tokens.get("subscription_type"):
+                        update_data["subscription_type"] = tokens["subscription_type"]
+                    if tokens.get("rate_limit_tier"):
+                        update_data["rate_limit_tier"] = tokens["rate_limit_tier"]
+
                     # CRITICAL: If DB update fails, we've consumed the refresh_token
                     # but not saved the new one. Handle this carefully.
                     try:
-                        db.update_account(
-                            account["id"],
-                            access_token=tokens["access_token"],
-                            refresh_token=tokens.get("refresh_token", account["refresh_token"]),
-                            expires_at=new_expires_at,
-                            consecutive_failures=0,
-                        )
+                        db.update_account(account["id"], **update_data)
                     except Exception as db_error:
                         auth_log.error(
                             "token_db_update_failed",
@@ -788,14 +798,20 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 7200) -> dict:
                         tokens = resp.json()
                         new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
 
+                        # Build update dict - capture subscription/plan info if present
+                        update_data = {
+                            "access_token": tokens["access_token"],
+                            "refresh_token": tokens.get("refresh_token", account["refresh_token"]),
+                            "expires_at": new_expires_at,
+                            "consecutive_failures": 0,
+                        }
+                        if tokens.get("subscription_type"):
+                            update_data["subscription_type"] = tokens["subscription_type"]
+                        if tokens.get("rate_limit_tier"):
+                            update_data["rate_limit_tier"] = tokens["rate_limit_tier"]
+
                         try:
-                            db.update_account(
-                                account["id"],
-                                access_token=tokens["access_token"],
-                                refresh_token=tokens.get("refresh_token", account["refresh_token"]),
-                                expires_at=new_expires_at,
-                                consecutive_failures=0,
-                            )
+                            db.update_account(account["id"], **update_data)
                             result["refreshed"] += 1
                             auth_log.info(
                                 "token_refresh",

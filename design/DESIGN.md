@@ -1271,7 +1271,7 @@ RalphX can run as an MCP server for Claude Code integration:
 
 ```bash
 # Register with Claude Code
-claude mcp add ralphx -- ralphx mcp
+claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- "$(which ralphx)" mcp
 ```
 
 **MCP Tools Exposed:**

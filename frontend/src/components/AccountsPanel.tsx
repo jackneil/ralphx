@@ -3,12 +3,14 @@ import {
   Account,
   listAccounts,
   addAccount,
+  getFlowStatus,
   removeAccount,
   setDefaultAccount,
   refreshAccountToken,
   refreshAccountUsage,
   refreshAllAccountsUsage,
   updateAccount,
+  validateAccount,
 } from '../api'
 
 interface AccountsPanelProps {
@@ -21,8 +23,11 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
   const [error, setError] = useState<string | null>(null)
   const [addingAccount, setAddingAccount] = useState(false)
   const [actionInProgress, setActionInProgress] = useState<number | null>(null)
+  const [validatingAccounts, setValidatingAccounts] = useState<Set<number>>(new Set())
   const pollRef = useRef<number | null>(null)
   const timeoutRef = useRef<number | null>(null)
+  const validatedAccountsRef = useRef<Set<number>>(new Set())  // Track which accounts we've validated this session
+  const mountedRef = useRef(true)  // Track if component is mounted
 
   const loadAccounts = async (refreshUsageIfStale = false) => {
     try {
@@ -50,41 +55,123 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
   }
 
   useEffect(() => {
+    mountedRef.current = true
     loadAccounts(true) // Refresh usage on initial load if stale
     // Refresh accounts list periodically
     const interval = setInterval(() => loadAccounts(false), 30000)
     return () => {
+      mountedRef.current = false
       clearInterval(interval)
       if (pollRef.current) clearInterval(pollRef.current)
       if (timeoutRef.current) clearTimeout(timeoutRef.current)
     }
   }, [])
 
-  const handleAddAccount = async () => {
+  // Validate accounts that haven't been validated recently (5 minutes)
+  useEffect(() => {
+    if (loading || accounts.length === 0) return
+
+    const fiveMinAgo = Date.now() / 1000 - 300
+
+    // Find accounts that need validation
+    const accountsToValidate = accounts.filter((account) => {
+      // Skip if we already validated this account in this session
+      if (validatedAccountsRef.current.has(account.id)) return false
+      // Skip if recently validated (within 5 minutes) by backend
+      if (account.last_validated_at && account.last_validated_at > fiveMinAgo) return false
+      // Skip if already known expired (no point validating)
+      if (account.is_expired) return false
+      // Skip if disabled
+      if (!account.is_active) return false
+      return true
+    })
+
+    if (accountsToValidate.length === 0) return
+
+    // Validate each account
+    accountsToValidate.forEach(async (account) => {
+      // Mark as validated for this session immediately to prevent duplicate calls
+      validatedAccountsRef.current.add(account.id)
+
+      // Check if component still mounted before state updates
+      if (!mountedRef.current) return
+
+      setValidatingAccounts(prev => new Set(prev).add(account.id))
+      try {
+        await validateAccount(account.id)
+      } catch {
+        // Validation errors are stored on backend, we'll fetch them below
+      } finally {
+        // Check mounted before updating state
+        if (mountedRef.current) {
+          setValidatingAccounts(prev => {
+            const next = new Set(prev)
+            next.delete(account.id)
+            return next
+          })
+          // Always refresh to get updated validation status (success or failure)
+          await loadAccounts(false)
+        }
+      }
+    })
+  }, [loading, accounts])  // Re-run when accounts change to catch newly added accounts
+
+  const handleAddAccount = async (expectedEmail?: string) => {
     setAddingAccount(true)
     setError(null)
 
     try {
-      const result = await addAccount()
-      if (!result.success) {
-        setError('Failed to start login')
+      const startResult = await addAccount(expectedEmail)
+      if (!startResult.success || !startResult.flow_id) {
+        setError(startResult.error || 'Failed to start login')
         setAddingAccount(false)
         return
       }
 
-      // Poll for account addition completion
+      const flowId = startResult.flow_id
+
+      // Poll for OAuth flow completion
       pollRef.current = window.setInterval(async () => {
         try {
-          const data = await listAccounts(true)
-          if (data.length > accounts.length) {
-            setAccounts(data)
+          const flowStatus = await getFlowStatus(flowId)
+
+          if (flowStatus.status === 'completed' && flowStatus.result) {
+            // Clear polling
             if (pollRef.current) clearInterval(pollRef.current)
             if (timeoutRef.current) clearTimeout(timeoutRef.current)
+
+            const result = flowStatus.result
+
+            if (!result.success) {
+              setError(result.error || 'OAuth flow failed')
+              setAddingAccount(false)
+              return
+            }
+
+            // Handle email mismatch warning
+            if (result.email_mismatch && result.message) {
+              setError(`\u26A0\uFE0F ${result.message}`)
+            }
+
+            // Refresh accounts list to show the new/updated account
+            await loadAccounts()
             setAddingAccount(false)
             onAccountChange?.()
+          } else if (flowStatus.status === 'error') {
+            if (pollRef.current) clearInterval(pollRef.current)
+            if (timeoutRef.current) clearTimeout(timeoutRef.current)
+            setError(flowStatus.error || 'OAuth flow failed')
+            setAddingAccount(false)
+          } else if (flowStatus.status === 'not_found') {
+            // Flow expired or was cleaned up - stop polling
+            if (pollRef.current) clearInterval(pollRef.current)
+            if (timeoutRef.current) clearTimeout(timeoutRef.current)
+            setError('OAuth flow expired. Please try again.')
+            setAddingAccount(false)
           }
+          // status === 'pending' - keep polling
         } catch {
-          // Ignore polling errors
+          // Ignore polling errors, keep trying
         }
       }, 1000)
 
@@ -251,7 +338,7 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
             Connect your Claude account to start running workflows automatically.
           </p>
           <button
-            onClick={handleAddAccount}
+            onClick={() => handleAddAccount()}
             disabled={addingAccount}
             className="px-4 py-2 bg-primary-600 text-white rounded hover:bg-primary-500 disabled:opacity-50"
           >
@@ -267,7 +354,7 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold text-white">Claude Accounts</h2>
         <button
-          onClick={handleAddAccount}
+          onClick={() => handleAddAccount()}
           disabled={addingAccount}
           className="flex items-center space-x-1 px-3 py-1.5 bg-primary-600 text-white text-sm rounded hover:bg-primary-500 disabled:opacity-50"
         >
@@ -279,11 +366,19 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
       </div>
 
       {error && (
-        <div className="mb-4 p-3 bg-red-900/30 border border-red-800 rounded text-red-400 text-sm">
+        <div className={`mb-4 p-3 rounded text-sm ${
+          error.startsWith('\u26A0\uFE0F')
+            ? 'bg-yellow-900/30 border border-yellow-800 text-yellow-400'
+            : 'bg-red-900/30 border border-red-800 text-red-400'
+        }`}>
           {error}
           <button
             onClick={() => setError(null)}
-            className="ml-2 text-red-300 hover:text-red-200"
+            className={`ml-2 ${
+              error.startsWith('\u26A0\uFE0F')
+                ? 'text-yellow-300 hover:text-yellow-200'
+                : 'text-red-300 hover:text-red-200'
+            }`}
           >
             &times;
           </button>
@@ -297,6 +392,8 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
             className={`p-4 rounded-lg border ${
               account.is_expired
                 ? 'bg-yellow-900/10 border-yellow-800/50'
+                : account.validation_status === 'invalid'
+                ? 'bg-orange-900/10 border-orange-800/50'
                 : account.is_active
                 ? 'bg-gray-700/50 border-gray-600'
                 : 'bg-gray-800/50 border-gray-700 opacity-60'
@@ -307,11 +404,13 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
               <div className="flex items-center space-x-3">
                 <div
                   className={`w-2.5 h-2.5 rounded-full ${
-                    account.is_expired
-                      ? 'bg-yellow-500'
+                    validatingAccounts.has(account.id)
+                      ? 'bg-blue-500 animate-pulse'  // Pulsing blue = checking
+                      : account.is_expired || account.validation_status === 'invalid'
+                      ? 'bg-yellow-500'  // Yellow = needs attention
                       : account.is_active
-                      ? 'bg-green-500'
-                      : 'bg-gray-500'
+                      ? 'bg-green-500'   // Green = valid
+                      : 'bg-gray-500'    // Gray = disabled
                   }`}
                 />
                 <div>
@@ -322,6 +421,16 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                     {account.is_default && (
                       <span className="px-1.5 py-0.5 bg-primary-600/30 text-primary-400 text-xs rounded font-medium">
                         DEFAULT
+                      </span>
+                    )}
+                    {validatingAccounts.has(account.id) && (
+                      <span className="px-1.5 py-0.5 bg-blue-600/30 text-blue-400 text-xs rounded font-medium">
+                        CHECKING...
+                      </span>
+                    )}
+                    {account.validation_status === 'invalid' && !account.is_expired && !validatingAccounts.has(account.id) && (
+                      <span className="px-1.5 py-0.5 bg-orange-600/30 text-orange-400 text-xs rounded font-medium">
+                        TOKEN INVALID
                       </span>
                     )}
                     {account.is_expired && (
@@ -355,11 +464,15 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
 
               {/* Actions */}
               <div className="flex items-center space-x-1">
-                {account.is_expired ? (
+                {account.is_expired || (account.validation_status === 'invalid' && !validatingAccounts.has(account.id)) ? (
                   <button
-                    onClick={handleAddAccount}
+                    onClick={() => handleAddAccount(account.email)}
                     disabled={addingAccount}
-                    className="px-2 py-1 text-sm bg-yellow-600 text-white rounded hover:bg-yellow-500 disabled:opacity-50"
+                    className={`px-2 py-1 text-sm text-white rounded disabled:opacity-50 ${
+                      account.is_expired
+                        ? 'bg-yellow-600 hover:bg-yellow-500'
+                        : 'bg-orange-600 hover:bg-orange-500'
+                    }`}
                   >
                     Re-auth
                   </button>
@@ -442,8 +555,8 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
               </div>
             </div>
 
-            {/* Usage section - always show for non-expired accounts */}
-            {!account.is_expired && (
+            {/* Usage section - always show for non-expired, valid accounts */}
+            {!account.is_expired && account.validation_status !== 'invalid' && (
               <div className="mt-3 pt-3 border-t border-gray-600/50">
                 {account.usage ? (
                   <>
@@ -520,8 +633,22 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
               </div>
             )}
 
-            {/* Error state */}
-            {account.last_error && (
+            {/* Invalid token state */}
+            {account.validation_status === 'invalid' && !account.is_expired && (
+              <div className="mt-3 pt-3 border-t border-gray-600/50">
+                <p className="text-orange-400 text-sm">
+                  Token validation failed. Please re-authenticate to continue using this account.
+                </p>
+                {account.last_error && (
+                  <p className="text-gray-500 text-xs mt-1">
+                    {account.last_error}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Error state (only show if not invalid - invalid has its own section) */}
+            {account.last_error && account.validation_status !== 'invalid' && (
               <div className="mt-3 pt-3 border-t border-gray-600/50">
                 <p className="text-red-400 text-xs">
                   {account.last_error}

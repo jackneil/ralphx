@@ -194,16 +194,35 @@ def create_workflow(
 
         # Create steps from template
         for step_def in template_steps:
+            # Look up processing_type config if specified
+            processing_type = step_def.get("processing_type")
+            if processing_type and processing_type in PROCESSING_TYPES:
+                type_config = PROCESSING_TYPES[processing_type]
+                step_type = type_config["step_type"]
+                config = {
+                    **type_config["config"],
+                    "description": step_def.get("description"),
+                    "skippable": step_def.get("skippable", False),
+                    "inputs": step_def.get("inputs", []),
+                    "outputs": step_def.get("outputs", []),
+                }
+                if step_def.get("skipCondition"):
+                    config["skipCondition"] = step_def["skipCondition"]
+            else:
+                # Fallback for legacy templates without processing_type
+                step_type = step_def.get("type", "autonomous")
+                config = {
+                    "description": step_def.get("description"),
+                    "loopType": step_def.get("loopType"),
+                    "skippable": step_def.get("skippable", False),
+                }
+
             project_db.create_workflow_step(
                 workflow_id=workflow_id,
                 step_number=step_def["number"],
                 name=step_def["name"],
-                step_type=step_def["type"],
-                config={
-                    "description": step_def.get("description"),
-                    "loopType": step_def.get("loopType"),
-                    "skippable": step_def.get("skippable", False),
-                },
+                step_type=step_type,
+                config=config,
                 status="pending",
             )
     except Exception as e:
