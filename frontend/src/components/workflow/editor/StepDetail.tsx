@@ -19,6 +19,7 @@ interface StepDetailProps {
   projectSlug: string
   workflowId: string
   step: WorkflowStep
+  allSteps: WorkflowStep[]
   onChange: (step: WorkflowStep) => void
   onClone: () => void
   onArchive: () => void
@@ -29,6 +30,7 @@ export default function StepDetail({
   projectSlug,
   workflowId,
   step,
+  allSteps,
   onChange,
   onClone,
   onArchive,
@@ -286,6 +288,8 @@ export default function StepDetail({
         {(activeTab === 'settings' || step.step_type === 'interactive') && (
           <StepSettings
             step={step}
+            projectSlug={projectSlug}
+            allSteps={allSteps}
             onChange={onChange}
           />
         )}

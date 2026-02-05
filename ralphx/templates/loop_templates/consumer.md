@@ -23,9 +23,9 @@ At the end of your response, include ONE of these status markers:
 - `STATUS: EXTERNAL` - Requires external action (explain what's needed)
 - `STATUS: ERROR` - Encountered an error that prevented implementation
 
-## Context
+## Previously Implemented
 
-{{existing_stories}}
+{{implemented_summary}}
 
 ---
 

@@ -73,8 +73,8 @@ def list_runs(
                 "workflow_id": r.get("workflow_id"),
                 "step_id": r.get("step_id"),
                 "status": r["status"],
-                "current_iteration": r.get("current_iteration"),
-                "current_mode": r.get("current_mode"),
+                "iterations_completed": r.get("iterations_completed", 0),
+                "items_generated": r.get("items_generated", 0),
                 "executor_pid": r.get("executor_pid"),
                 "started_at": r.get("started_at"),
                 "completed_at": r.get("completed_at"),
@@ -117,8 +117,8 @@ def get_run(
         "workflow_id": run.get("workflow_id"),
         "step_id": run.get("step_id"),
         "status": run["status"],
-        "current_iteration": run.get("current_iteration"),
-        "current_mode": run.get("current_mode"),
+        "iterations_completed": run.get("iterations_completed", 0),
+        "items_generated": run.get("items_generated", 0),
         "executor_pid": run.get("executor_pid"),
         "started_at": run.get("started_at"),
         "completed_at": run.get("completed_at"),
@@ -130,11 +130,11 @@ def get_run(
         sessions = project_db.list_sessions(run_id=run_id)
         result["sessions"] = [
             {
-                "id": s["id"],
+                "id": s.get("session_id", s.get("id")),
+                "iteration": s.get("iteration"),
                 "status": s.get("status"),
                 "started_at": s.get("started_at"),
-                "completed_at": s.get("completed_at"),
-                "event_count": s.get("event_count", 0),
+                "duration_seconds": s.get("duration_seconds"),
             }
             for s in sessions
         ]
@@ -146,7 +146,6 @@ def get_run(
 def get_logs(
     slug: str,
     level: Optional[str] = None,
-    category: Optional[str] = None,
     run_id: Optional[str] = None,
     session_id: Optional[str] = None,
     search: Optional[str] = None,
@@ -170,7 +169,6 @@ def get_logs(
     try:
         logs, total = project_db.get_logs(
             level=level,
-            category=category,
             run_id=run_id,
             session_id=session_id,
             search=search,
@@ -190,10 +188,8 @@ def get_logs(
                 "id": log.get("id"),
                 "timestamp": log.get("timestamp"),
                 "level": log.get("level"),
-                "category": log.get("category"),
                 "message": scrub_sensitive_data(log.get("message", "")),
                 "run_id": log.get("run_id"),
-                "session_id": log.get("session_id"),
             }
             for log in logs
         ],
@@ -311,13 +307,12 @@ def list_sessions(
     return PaginatedResult(
         items=[
             {
-                "id": s["id"],
+                "id": s.get("session_id", s.get("id")),
                 "run_id": s.get("run_id"),
+                "iteration": s.get("iteration"),
                 "status": s.get("status"),
                 "started_at": s.get("started_at"),
-                "completed_at": s.get("completed_at"),
-                "event_count": s.get("event_count", 0),
-                "item_id": s.get("item_id"),
+                "duration_seconds": s.get("duration_seconds"),
             }
             for s in paginated
         ],
@@ -432,7 +427,6 @@ def get_monitoring_tools() -> list[ToolDefinition]:
                 properties={
                     "slug": prop_string("Project slug"),
                     "level": prop_enum("Filter by log level", ["debug", "info", "warning", "error"]),
-                    "category": prop_string("Filter by category"),
                     "run_id": prop_string("Filter by run ID"),
                     "session_id": prop_string("Filter by session ID"),
                     "search": prop_string("Search text in messages"),

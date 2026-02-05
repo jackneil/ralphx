@@ -225,6 +225,12 @@ class ResourceManager:
         """
         file_path = self._resources_path / resource_data["file_path"]
 
+        # Security: verify path stays within resources directory
+        resolved = file_path.resolve()
+        resources_root = self._resources_path.resolve()
+        if not str(resolved).startswith(str(resources_root) + "/") and resolved != resources_root:
+            return None
+
         if not file_path.exists():
             return None
 
@@ -426,7 +432,18 @@ class ResourceManager:
         else:
             file_name = name
 
+        # Security: prevent path traversal in resource names
+        # Only allow simple filenames (alphanumeric, hyphens, underscores, dots)
+        if ".." in file_name or "/" in file_name or "\\" in file_name or "\0" in file_name:
+            raise ValueError(f"Invalid resource name: {name} (path traversal characters not allowed)")
+
         file_path = self.get_resources_path(resource_type) / f"{file_name}.md"
+
+        # Verify resolved path stays within resources directory
+        resolved = file_path.resolve()
+        resources_root = self.get_resources_path(resource_type).resolve()
+        if not str(resolved).startswith(str(resources_root) + "/") and resolved != resources_root:
+            raise ValueError(f"Invalid resource name: {name} (resolves outside resources directory)")
 
         # Ensure directory exists
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -483,6 +500,11 @@ class ResourceManager:
         # Update file content if provided
         if content is not None:
             file_path = self._resources_path / resource["file_path"]
+            # Security: verify path stays within resources directory
+            resolved = file_path.resolve()
+            resources_root = self._resources_path.resolve()
+            if not str(resolved).startswith(str(resources_root) + "/") and resolved != resources_root:
+                return False
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
 
@@ -519,8 +541,12 @@ class ResourceManager:
         # Delete file if requested
         if delete_file:
             file_path = self._resources_path / resource["file_path"]
-            if file_path.exists():
-                file_path.unlink()
+            # Security: verify path stays within resources directory
+            resolved = file_path.resolve()
+            resources_root = self._resources_path.resolve()
+            if str(resolved).startswith(str(resources_root) + "/") or resolved == resources_root:
+                if file_path.exists():
+                    file_path.unlink()
 
         # Delete database entry
         return self.db.delete_resource(resource_id)

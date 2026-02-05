@@ -178,6 +178,19 @@ Return your findings as JSON:
 - Avoid duplicating stories that already exist
 - Flag any ambiguous requirements for clarification
 - Mark infrastructure/architecture stories with category "INFRA" or "ARCH"
+
+## Completion Signal
+
+When you have exhausted all stories from the documents and have nothing new to add,
+return an empty stories array and output `[GENERATION_COMPLETE]` at the end of your response:
+
+```json
+{"stories": [], "notes": "All requirements have been extracted."}
+```
+
+[GENERATION_COMPLETE]
+
+Do NOT emit this signal if you are returning new stories in this response.
 """
 
 PLANNING_RESEARCH_PROMPT = """# Research Mode
@@ -290,6 +303,19 @@ Total: {{total_stories}}
 4. If web search returns nothing useful, return empty stories array with explanation
 5. DO NOT duplicate existing stories - check IDs and titles carefully
 6. Focus on GAPS - things genuinely missing, not rephrasing existing stories
+
+## Completion Signal
+
+When you have exhausted all gaps and have nothing new to add,
+return an empty stories array and output `[GENERATION_COMPLETE]` at the end of your response:
+
+```json
+{"stories": [], "gaps_found": [], "notes": "All gaps have been addressed."}
+```
+
+[GENERATION_COMPLETE]
+
+Do NOT emit this signal if you are returning new stories in this response.
 """
 
 

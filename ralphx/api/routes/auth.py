@@ -93,6 +93,53 @@ class AssignAccountRequest(BaseModel):
 # ============================================================================
 
 
+async def _fetch_account_profile(access_token: str) -> Optional[dict]:
+    """Fetch account profile from Anthropic API.
+
+    Returns subscription type, rate limit tier, and other account info.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.anthropic.com/api/oauth/profile",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "anthropic-beta": "oauth-2025-04-20",
+                },
+                timeout=10.0,
+            )
+
+            if response.status_code != 200:
+                logger.warning(f"Profile fetch failed: {response.status_code}")
+                return None
+
+            data = response.json()
+            org = data.get("organization", {})
+            account = data.get("account", {})
+
+            # Map organization_type to subscription type
+            org_type = org.get("organization_type")
+            subscription_map = {
+                "claude_max": "max",
+                "claude_pro": "pro",
+                "claude_enterprise": "enterprise",
+                "claude_team": "team",
+            }
+            subscription_type = subscription_map.get(org_type)
+
+            return {
+                "subscription_type": subscription_type,
+                "rate_limit_tier": org.get("rate_limit_tier"),
+                "has_extra_usage_enabled": org.get("has_extra_usage_enabled"),
+                "display_name": account.get("display_name"),
+                "full_name": account.get("full_name"),
+            }
+    except Exception as e:
+        logger.warning(f"Profile fetch error: {e}")
+        return None
+
+
 async def _fetch_account_usage(access_token: str) -> Optional[dict]:
     """Fetch usage data from Anthropic API."""
     try:
@@ -112,6 +159,7 @@ async def _fetch_account_usage(access_token: str) -> Optional[dict]:
             data = response.json()
             five_hour = data.get("five_hour", {})
             seven_day = data.get("seven_day", {})
+
             return {
                 "five_hour": five_hour.get("utilization", 0),
                 "seven_day": seven_day.get("utilization", 0),
@@ -184,6 +232,7 @@ from ralphx.core.auth import (
     AuthStatus,
     CLIENT_ID,
     TOKEN_URL,
+    _token_refresh_lock,
     get_auth_status,
     refresh_token_if_needed,
     force_refresh_token,
@@ -424,9 +473,20 @@ async def add_account(expected_email: Optional[str] = None):
 
             # Use store_oauth_tokens to properly serialize scopes to JSON
             account = store_oauth_tokens(tokens)
-
-            # Fetch usage data immediately
             db = Database()
+
+            # Fetch profile to get subscription type
+            profile_data = await _fetch_account_profile(tokens["access_token"])
+            if profile_data:
+                update_fields = {}
+                if profile_data.get("subscription_type"):
+                    update_fields["subscription_type"] = profile_data["subscription_type"]
+                if profile_data.get("rate_limit_tier"):
+                    update_fields["rate_limit_tier"] = profile_data["rate_limit_tier"]
+                if update_fields:
+                    db.update_account(account["id"], **update_fields)
+
+            # Fetch usage data
             usage_data = await _fetch_account_usage(tokens["access_token"])
             if usage_data:
                 db.update_account_usage_cache(
@@ -565,45 +625,58 @@ async def refresh_account_token(account_id: int):
         return {"success": False, "message": "No refresh token available"}
 
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                TOKEN_URL,
-                json={
-                    "grant_type": "refresh_token",
-                    "refresh_token": account["refresh_token"],
-                    "client_id": CLIENT_ID,
-                },
-                headers={
-                    "Content-Type": "application/json",
-                    "anthropic-beta": "oauth-2025-04-20",
-                },
-            )
+        # Use token refresh lock to prevent race conditions with background
+        # refresh tasks or concurrent manual refresh requests
+        async with _token_refresh_lock():
+            # Re-fetch account inside lock to get latest refresh_token
+            # (another process may have refreshed while we waited for lock)
+            account = db.get_account(account_id)
+            if not account or not account.get("refresh_token"):
+                return {"success": False, "message": "No refresh token available"}
 
-            if resp.status_code != 200:
-                return {"success": False, "message": f"Token refresh failed: {resp.status_code}"}
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    TOKEN_URL,
+                    json={
+                        "grant_type": "refresh_token",
+                        "refresh_token": account["refresh_token"],
+                        "client_id": CLIENT_ID,
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-beta": "oauth-2025-04-20",
+                    },
+                )
 
-            tokens = resp.json()
-            new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
+                if resp.status_code != 200:
+                    return {"success": False, "message": f"Token refresh failed: {resp.status_code}"}
 
-            # Build update dict with all available fields
-            update_data = {
-                "access_token": tokens["access_token"],
-                "refresh_token": tokens.get("refresh_token", account["refresh_token"]),
-                "expires_at": new_expires_at,
-            }
+                tokens = resp.json()
+                new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
 
-            # Capture subscription/plan info if present in refresh response
-            if tokens.get("subscription_type"):
-                update_data["subscription_type"] = tokens["subscription_type"]
-            if tokens.get("rate_limit_tier"):
-                update_data["rate_limit_tier"] = tokens["rate_limit_tier"]
+                # Build update dict with all available fields
+                update_data = {
+                    "access_token": tokens["access_token"],
+                    "refresh_token": tokens.get("refresh_token", account["refresh_token"]),
+                    "expires_at": new_expires_at,
+                }
 
-            db.update_account(account_id, **update_data)
+                db.update_account(account_id, **update_data)
+
+            # Fetch profile outside the lock (uses the new access_token, not refresh_token)
+            profile_data = await _fetch_account_profile(tokens["access_token"])
+            subscription_type = None
+            if profile_data:
+                if profile_data.get("subscription_type"):
+                    subscription_type = profile_data["subscription_type"]
+                    db.update_account(account_id, subscription_type=subscription_type)
+                if profile_data.get("rate_limit_tier"):
+                    db.update_account(account_id, rate_limit_tier=profile_data["rate_limit_tier"])
 
             return {
                 "success": True,
                 "expires_at": new_expires_at,
-                "subscription_type": tokens.get("subscription_type"),
+                "subscription_type": subscription_type,
             }
     except Exception as e:
         return {"success": False, "message": str(e)}

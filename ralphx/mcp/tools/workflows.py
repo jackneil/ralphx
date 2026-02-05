@@ -582,7 +582,7 @@ PROCESSING_TYPES = {
         "step_type": "interactive",
         "config": {
             "loopType": "design_doc",
-            "allowedTools": ["WebSearch", "WebFetch", "Bash", "Read", "Glob", "Grep"],
+            "allowedTools": ["WebSearch", "WebFetch", "Bash", "Read", "Glob", "Grep", "Edit", "Write"],
             "model": "opus",
             "timeout": 300,
         },
@@ -1066,7 +1066,7 @@ def get_workflow_tools() -> list[ToolDefinition]:
         # Step management
         ToolDefinition(
             name="ralphx_create_workflow_step",
-            description="Create a new step in a workflow. Processing types: design_doc (interactive chat with web research), extractgen_requirements (extract stories from docs), webgen_requirements (web research for requirements), implementation (implement stories)",
+            description="Create a new step in a workflow. Processing types: design_doc (build design doc with web research), extractgen_requirements (extract stories from docs), webgen_requirements (discover requirements via web research), implementation (implement stories and commit code)",
             handler=create_workflow_step,
             input_schema=make_schema(
                 properties={
@@ -1075,7 +1075,7 @@ def get_workflow_tools() -> list[ToolDefinition]:
                     "step_name": prop_string("Step name (e.g., 'Design Document', 'Story Generation')"),
                     "processing_type": prop_enum("Processing type", ["design_doc", "extractgen_requirements", "webgen_requirements", "implementation"]),
                     "step_number": prop_int("Step number (optional, defaults to append)"),
-                    "loop_name": prop_string("Loop name for autonomous steps"),
+                    "loop_name": prop_string("Optional custom loop name"),
                 },
                 required=["slug", "workflow_id", "step_name", "processing_type"],
             ),

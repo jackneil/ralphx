@@ -237,10 +237,17 @@ class PlanningService:
             "format_rules", "request", "design_doc", "guardrails",
         ]
         for tag in dangerous_tags:
-            # Escape opening tags: <tag> or <tag ...>
+            # Escape opening tags with attributes: <tag ...>
             sanitized = re.sub(
-                rf'<\s*{tag}(\s|>)',
-                rf'&lt;{tag}\1',
+                rf'<\s*{tag}\s([^>]*)>',
+                rf'&lt;{tag} \1&gt;',
+                sanitized,
+                flags=re.IGNORECASE,
+            )
+            # Escape opening tags without attributes: <tag>
+            sanitized = re.sub(
+                rf'<\s*{tag}\s*>',
+                rf'&lt;{tag}&gt;',
                 sanitized,
                 flags=re.IGNORECASE,
             )

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 # Schema version for project DB
-PROJECT_SCHEMA_VERSION = 16
+PROJECT_SCHEMA_VERSION = 20
 
 # Project database schema - all project-specific data
 PROJECT_SCHEMA_SQL = """
@@ -306,18 +306,64 @@ CREATE TABLE IF NOT EXISTS workflow_steps (
 );
 
 -- Planning sessions (for interactive steps)
+-- New iteration-based paradigm: users provide a prompt + iteration count, system runs N iterations
 CREATE TABLE IF NOT EXISTS planning_sessions (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL,
     step_id INTEGER NOT NULL,
-    messages JSON NOT NULL DEFAULT '[]',    -- Conversation history
+    messages JSON NOT NULL DEFAULT '[]',    -- Conversation history (legacy chat-based sessions)
     artifacts JSON,                         -- Generated design doc, guardrails
     status TEXT DEFAULT 'active',           -- active, completed
+    -- New iteration-based fields (v17)
+    prompt TEXT,                            -- User's guidance for this session
+    iterations_requested INTEGER DEFAULT 1, -- Number of iterations requested
+    iterations_completed INTEGER DEFAULT 0, -- Number of iterations completed
+    current_iteration INTEGER DEFAULT 0,    -- Current iteration number (0 = not started)
+    run_status TEXT DEFAULT 'pending',      -- pending, running, completed, cancelled, error
+    is_legacy BOOLEAN DEFAULT FALSE,        -- TRUE for old chat-based sessions
+    error_message TEXT,                     -- Error message if run_status='error'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE,
     FOREIGN KEY (step_id) REFERENCES workflow_steps(id) ON DELETE CASCADE
 );
+
+-- Planning iterations (per-iteration tracking for iteration-based sessions)
+CREATE TABLE IF NOT EXISTS planning_iterations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    iteration_number INTEGER NOT NULL,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    status TEXT DEFAULT 'pending',          -- pending, running, completed, failed, skipped
+    chars_added INTEGER DEFAULT 0,
+    chars_removed INTEGER DEFAULT 0,
+    tool_calls JSON DEFAULT '[]',           -- [{tool, input_preview, duration_ms}] - truncated
+    summary TEXT,                           -- Brief summary of what changed
+    diff_text TEXT,                         -- Unified diff of changes
+    doc_before TEXT,                        -- Document content before iteration
+    doc_after TEXT,                         -- Document content after iteration
+    error_message TEXT,
+    FOREIGN KEY (session_id) REFERENCES planning_sessions(id) ON DELETE CASCADE
+);
+
+-- Planning iteration events (persistent event log for streaming/reconnection)
+CREATE TABLE IF NOT EXISTS planning_iteration_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    iteration_number INTEGER,
+    event_type TEXT NOT NULL,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    content TEXT,
+    tool_name TEXT,
+    tool_input TEXT,
+    tool_result TEXT,
+    event_data TEXT,
+    FOREIGN KEY (session_id) REFERENCES planning_sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_pie_session ON planning_iteration_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_pie_session_id ON planning_iteration_events(session_id, id);
 
 -- Workflow-scoped resources (design docs, guardrails, input files)
 CREATE TABLE IF NOT EXISTS workflow_resources (
@@ -452,6 +498,8 @@ CREATE INDEX IF NOT EXISTS idx_workflow_steps_workflow ON workflow_steps(workflo
 CREATE INDEX IF NOT EXISTS idx_workflow_steps_status ON workflow_steps(status);
 CREATE INDEX IF NOT EXISTS idx_planning_sessions_workflow ON planning_sessions(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_planning_sessions_status ON planning_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_planning_sessions_run_status ON planning_sessions(run_status);
+CREATE INDEX IF NOT EXISTS idx_planning_iterations_session ON planning_iterations(session_id);
 
 -- Workflow resources indexes
 CREATE INDEX IF NOT EXISTS idx_workflow_resources_workflow ON workflow_resources(workflow_id, resource_type);
@@ -567,9 +615,8 @@ class ProjectDatabase:
                     "Please delete your .ralphx/ralphx.db file and start fresh."
                 )
 
-            # Now safe to create schema and indexes
+            # Create schema tables (indexes created after migrations)
             conn.executescript(PROJECT_SCHEMA_SQL)
-            conn.executescript(PROJECT_INDEXES_SQL)
 
             if current_version == 0:
                 # Fresh database
@@ -582,6 +629,9 @@ class ProjectDatabase:
                 self._backup_before_migration(current_version)
                 # Run migrations (for future versions > 6)
                 self._run_migrations(conn, current_version)
+
+            # Create indexes AFTER migrations so all columns exist
+            conn.executescript(PROJECT_INDEXES_SQL)
 
     def _backup_before_migration(self, from_version: int) -> None:
         """Create a backup of the database before running migrations.
@@ -663,6 +713,26 @@ class ProjectDatabase:
         # Migration from v15 to v16: Remove namespace from workflows table
         if from_version == 15:
             self._migrate_v15_to_v16(conn)
+            from_version = 16  # Continue to next migration
+
+        # Migration from v16 to v17: Add iteration-based planning fields
+        if from_version == 16:
+            self._migrate_v16_to_v17(conn)
+            from_version = 17  # Continue to next migration
+
+        # Migration from v17 to v18: Add planning_iteration_events table
+        if from_version == 17:
+            self._migrate_v17_to_v18(conn)
+            from_version = 18  # Continue to next migration
+
+        # Migration from v18 to v19: Add diff_text column to planning_iterations
+        if from_version == 18:
+            self._migrate_v18_to_v19(conn)
+            from_version = 19  # Continue to next migration
+
+        # Migration from v19 to v20: Add doc_before/doc_after columns
+        if from_version == 19:
+            self._migrate_v19_to_v20(conn)
 
         # Seed workflow templates for fresh databases
         self._seed_workflow_templates(conn)
@@ -978,41 +1048,155 @@ class ProjectDatabase:
         otherwise the ON DELETE CASCADE on workflow_steps will delete all steps!
         """
         # 0. Disable foreign keys to prevent CASCADE deletes during table swap
+        # IMPORTANT: PRAGMA foreign_keys is NOT transactional, so we must
+        # re-enable in a finally block to prevent silent FK violations
         conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            # 1. Create new table without namespace
+            conn.execute("""
+                CREATE TABLE workflows_new (
+                    id TEXT PRIMARY KEY,
+                    template_id TEXT,
+                    name TEXT NOT NULL,
+                    status TEXT DEFAULT 'draft',
+                    current_step INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    archived_at TIMESTAMP
+                )
+            """)
 
-        # 1. Create new table without namespace
+            # 2. Copy data (excluding namespace)
+            conn.execute("""
+                INSERT INTO workflows_new (id, template_id, name, status, current_step, created_at, updated_at, archived_at)
+                SELECT id, template_id, name, status, current_step, created_at, updated_at, archived_at
+                FROM workflows
+            """)
+
+            # 3. Drop old table and index
+            conn.execute("DROP INDEX IF EXISTS idx_workflows_namespace")
+            conn.execute("DROP TABLE workflows")
+
+            # 4. Rename new table
+            conn.execute("ALTER TABLE workflows_new RENAME TO workflows")
+
+            # 5. Recreate the status index on the new table
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status)")
+        finally:
+            # 6. Re-enable foreign keys (must happen even on failure)
+            conn.execute("PRAGMA foreign_keys=ON")
+
+    def _migrate_v16_to_v17(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v16 to v17.
+
+        Adds:
+        - New columns to planning_sessions for iteration-based paradigm
+        - New planning_iterations table for per-iteration tracking
+        - Marks existing chat-based sessions as legacy
+        """
+        # 1. Add new columns to planning_sessions
+        conn.execute("ALTER TABLE planning_sessions ADD COLUMN prompt TEXT")
+        conn.execute(
+            "ALTER TABLE planning_sessions ADD COLUMN iterations_requested INTEGER DEFAULT 1"
+        )
+        conn.execute(
+            "ALTER TABLE planning_sessions ADD COLUMN iterations_completed INTEGER DEFAULT 0"
+        )
+        conn.execute(
+            "ALTER TABLE planning_sessions ADD COLUMN current_iteration INTEGER DEFAULT 0"
+        )
+        conn.execute(
+            "ALTER TABLE planning_sessions ADD COLUMN run_status TEXT DEFAULT 'pending'"
+        )
+        conn.execute(
+            "ALTER TABLE planning_sessions ADD COLUMN is_legacy BOOLEAN DEFAULT FALSE"
+        )
+        conn.execute("ALTER TABLE planning_sessions ADD COLUMN error_message TEXT")
+
+        # 2. Mark existing sessions with messages as legacy
         conn.execute("""
-            CREATE TABLE workflows_new (
-                id TEXT PRIMARY KEY,
-                template_id TEXT,
-                name TEXT NOT NULL,
-                status TEXT DEFAULT 'draft',
-                current_step INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                archived_at TIMESTAMP
+            UPDATE planning_sessions
+            SET is_legacy = TRUE, run_status = 'completed'
+            WHERE json_array_length(messages) > 0 AND prompt IS NULL
+        """)
+
+        # 3. Create planning_iterations table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS planning_iterations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                iteration_number INTEGER NOT NULL,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                status TEXT DEFAULT 'pending',
+                chars_added INTEGER DEFAULT 0,
+                chars_removed INTEGER DEFAULT 0,
+                tool_calls JSON DEFAULT '[]',
+                summary TEXT,
+                error_message TEXT,
+                FOREIGN KEY (session_id) REFERENCES planning_sessions(id) ON DELETE CASCADE
             )
         """)
 
-        # 2. Copy data (excluding namespace)
+        # 4. Add indexes
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_planning_sessions_run_status ON planning_sessions(run_status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_planning_iterations_session ON planning_iterations(session_id)"
+        )
+
+    def _migrate_v17_to_v18(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v17 to v18.
+
+        Adds:
+        - planning_iteration_events table for persistent event streaming/reconnection
+        """
         conn.execute("""
-            INSERT INTO workflows_new (id, template_id, name, status, current_step, created_at, updated_at, archived_at)
-            SELECT id, template_id, name, status, current_step, created_at, updated_at, archived_at
-            FROM workflows
+            CREATE TABLE IF NOT EXISTS planning_iteration_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                iteration_number INTEGER,
+                event_type TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                content TEXT,
+                tool_name TEXT,
+                tool_input TEXT,
+                tool_result TEXT,
+                event_data TEXT,
+                FOREIGN KEY (session_id) REFERENCES planning_sessions(id) ON DELETE CASCADE
+            )
         """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pie_session ON planning_iteration_events(session_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pie_session_id ON planning_iteration_events(session_id, id)"
+        )
 
-        # 3. Drop old table and index
-        conn.execute("DROP INDEX IF EXISTS idx_workflows_namespace")
-        conn.execute("DROP TABLE workflows")
+    def _migrate_v18_to_v19(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v18 to v19.
 
-        # 4. Rename new table
-        conn.execute("ALTER TABLE workflows_new RENAME TO workflows")
+        Adds:
+        - diff_text column to planning_iterations for storing unified diffs
+        """
+        conn.execute(
+            "ALTER TABLE planning_iterations ADD COLUMN diff_text TEXT"
+        )
 
-        # 5. Recreate the status index on the new table
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status)")
+    def _migrate_v19_to_v20(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v19 to v20.
 
-        # 6. Re-enable foreign keys
-        conn.execute("PRAGMA foreign_keys=ON")
+        Adds:
+        - doc_before column to planning_iterations for pre-iteration doc snapshot
+        - doc_after column to planning_iterations for post-iteration doc snapshot
+        """
+        conn.execute(
+            "ALTER TABLE planning_iterations ADD COLUMN doc_before TEXT"
+        )
+        conn.execute(
+            "ALTER TABLE planning_iterations ADD COLUMN doc_after TEXT"
+        )
 
     # ========== Loops ==========
 
@@ -1273,23 +1457,29 @@ class ProjectDatabase:
     def list_sessions(
         self,
         run_id: Optional[str] = None,
+        status: Optional[str] = None,
         limit: int = 100,
     ) -> list[dict]:
         """List sessions with optional filters."""
         with self._reader() as conn:
+            conditions = ["1=1"]
+            params: list[Any] = []
+
             if run_id:
-                cursor = conn.execute(
-                    """
-                    SELECT * FROM sessions WHERE run_id = ?
-                    ORDER BY iteration DESC LIMIT ?
-                    """,
-                    (run_id, limit),
-                )
-            else:
-                cursor = conn.execute(
-                    "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?",
-                    (limit,),
-                )
+                conditions.append("run_id = ?")
+                params.append(run_id)
+            if status:
+                conditions.append("status = ?")
+                params.append(status)
+
+            cursor = conn.execute(
+                f"""
+                SELECT * FROM sessions
+                WHERE {' AND '.join(conditions)}
+                ORDER BY started_at DESC LIMIT ?
+                """,
+                params + [limit],
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     _SESSION_UPDATE_COLS = frozenset({
@@ -1371,6 +1561,7 @@ class ProjectDatabase:
         self,
         session_id: str,
         after_id: Optional[int] = None,
+        event_type: Optional[str] = None,
         limit: int = 500,
     ) -> list[dict]:
         """Get events for a session.
@@ -1378,30 +1569,31 @@ class ProjectDatabase:
         Args:
             session_id: Session UUID.
             after_id: Only return events with ID greater than this (for polling).
+            event_type: Filter by event type (text, tool_call, tool_result, error).
             limit: Maximum number of events to return.
 
         Returns:
             List of event dicts.
         """
         with self._reader() as conn:
+            conditions = ["session_id = ?"]
+            params: list[Any] = [session_id]
+
             if after_id:
-                cursor = conn.execute(
-                    """
-                    SELECT * FROM session_events
-                    WHERE session_id = ? AND id > ?
-                    ORDER BY id ASC LIMIT ?
-                    """,
-                    (session_id, after_id, limit),
-                )
-            else:
-                cursor = conn.execute(
-                    """
-                    SELECT * FROM session_events
-                    WHERE session_id = ?
-                    ORDER BY id ASC LIMIT ?
-                    """,
-                    (session_id, limit),
-                )
+                conditions.append("id > ?")
+                params.append(after_id)
+            if event_type:
+                conditions.append("event_type = ?")
+                params.append(event_type)
+
+            cursor = conn.execute(
+                f"""
+                SELECT * FROM session_events
+                WHERE {' AND '.join(conditions)}
+                ORDER BY id ASC LIMIT ?
+                """,
+                params + [limit],
+            )
 
             events = []
             for row in cursor.fetchall():
@@ -1693,7 +1885,12 @@ class ProjectDatabase:
             return cursor.rowcount > 0
 
     def release_work_item(self, id: str) -> bool:
-        """Release a claimed work item back to pending state."""
+        """Release a claimed work item back to 'completed' state.
+
+        Items generated by producer loops have status 'completed' before being
+        claimed. We restore to 'completed' (not 'pending') so that consumer
+        loops, which query for status='completed', can find and retry them.
+        """
         with self._writer() as conn:
             now = datetime.utcnow().isoformat()
             cursor = conn.execute(
@@ -1701,7 +1898,7 @@ class ProjectDatabase:
                 UPDATE work_items
                 SET claimed_by = NULL,
                     claimed_at = NULL,
-                    status = 'pending',
+                    status = 'completed',
                     updated_at = ?
                 WHERE id = ? AND status = 'claimed'
                 """,
@@ -1831,6 +2028,9 @@ class ProjectDatabase:
     def release_stale_claims(self, max_age_minutes: int = 30) -> int:
         """Release claims that have been held too long (likely crashed consumer).
 
+        Released items are restored to 'completed' status so consumer loops
+        (which query for status='completed') can find and retry them.
+
         Args:
             max_age_minutes: Claims older than this are released.
 
@@ -1848,7 +2048,7 @@ class ProjectDatabase:
                 UPDATE work_items
                 SET claimed_by = NULL,
                     claimed_at = NULL,
-                    status = 'pending',
+                    status = 'completed',
                     updated_at = ?
                 WHERE claimed_at < ?
                   AND claimed_by IS NOT NULL
@@ -1862,8 +2062,8 @@ class ProjectDatabase:
         """Release all claims held by a specific loop.
 
         Used when deleting a loop to prevent orphaned claims.
-        Released items are restored to 'pending' status so they can be
-        picked up by other loops.
+        Released items are restored to 'completed' status so they can be
+        picked up by other consumer loops.
 
         Args:
             loop_name: Name of the loop whose claims should be released.
@@ -1879,7 +2079,7 @@ class ProjectDatabase:
                 UPDATE work_items
                 SET claimed_by = NULL,
                     claimed_at = NULL,
-                    status = 'pending',
+                    status = 'completed',
                     updated_at = ?
                 WHERE claimed_by = ? AND status = 'claimed'
                 """,
@@ -1893,8 +2093,8 @@ class ProjectDatabase:
         This is an atomic operation that checks ownership and releases in one step
         to prevent TOCTOU race conditions.
 
-        Released items are restored to 'pending' status so they can be
-        picked up by other loops.
+        Released items are restored to 'completed' status so consumer loops
+        (which query for status='completed') can find and retry them.
 
         Args:
             id: Work item ID.
@@ -1910,7 +2110,7 @@ class ProjectDatabase:
                 UPDATE work_items
                 SET claimed_by = NULL,
                     claimed_at = NULL,
-                    status = 'pending',
+                    status = 'completed',
                     updated_at = ?
                 WHERE id = ? AND claimed_by = ? AND status = 'claimed'
                 """,
@@ -2550,26 +2750,50 @@ class ProjectDatabase:
         self,
         run_id: Optional[str] = None,
         level: Optional[str] = None,
+        session_id: Optional[str] = None,
+        search: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
-    ) -> list[dict]:
-        """Get logs with optional filters."""
+    ) -> tuple[list[dict], int]:
+        """Get logs with optional filters.
+
+        Returns:
+            Tuple of (logs list, total count).
+        """
         with self._reader() as conn:
             conditions = ["1=1"]
             params: list[Any] = []
 
             if run_id:
-                conditions.append("run_id = ?")
+                conditions.append("l.run_id = ?")
                 params.append(run_id)
             if level:
-                conditions.append("level = ?")
+                conditions.append("l.level = ?")
                 params.append(level)
+            if session_id:
+                # Filter logs by session: join through runs → sessions
+                conditions.append(
+                    "l.run_id IN (SELECT run_id FROM sessions WHERE session_id = ?)"
+                )
+                params.append(session_id)
+            if search:
+                conditions.append("l.message LIKE ?")
+                params.append(f"%{search}%")
+
+            where_clause = " AND ".join(conditions)
+
+            # Get total count
+            count_row = conn.execute(
+                f"SELECT COUNT(*) FROM logs l WHERE {where_clause}",
+                params,
+            ).fetchone()
+            total = count_row[0] if count_row else 0
 
             cursor = conn.execute(
                 f"""
-                SELECT * FROM logs
-                WHERE {' AND '.join(conditions)}
-                ORDER BY timestamp DESC
+                SELECT l.* FROM logs l
+                WHERE {where_clause}
+                ORDER BY l.timestamp DESC
                 LIMIT ? OFFSET ?
                 """,
                 params + [limit, offset],
@@ -2581,7 +2805,84 @@ class ProjectDatabase:
                 if result.get("metadata"):
                     result["metadata"] = json.loads(result["metadata"])
                 results.append(result)
-            return results
+            return results, total
+
+    def get_log_stats(
+        self,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> dict:
+        """Get log statistics (counts by level).
+
+        Returns:
+            Dict with by_level counts and total.
+        """
+        with self._reader() as conn:
+            conditions = ["1=1"]
+            params: list[Any] = []
+
+            if run_id:
+                conditions.append("run_id = ?")
+                params.append(run_id)
+            if session_id:
+                conditions.append(
+                    "run_id IN (SELECT run_id FROM sessions WHERE session_id = ?)"
+                )
+                params.append(session_id)
+
+            where_clause = " AND ".join(conditions)
+
+            # Count by level
+            cursor = conn.execute(
+                f"""
+                SELECT level, COUNT(*) as count FROM logs
+                WHERE {where_clause}
+                GROUP BY level
+                """,
+                params,
+            )
+            by_level = {row["level"]: row["count"] for row in cursor.fetchall()}
+
+            total = sum(by_level.values())
+
+            return {
+                "by_level": by_level,
+                "by_category": {},  # No category column in schema
+                "total": total,
+            }
+
+    def cleanup_logs(
+        self,
+        days: int = 30,
+        dry_run: bool = True,
+    ) -> dict:
+        """Delete logs older than specified days.
+
+        Args:
+            days: Delete logs older than this many days.
+            dry_run: If True, only report what would be deleted.
+
+        Returns:
+            Dict with deleted_count.
+        """
+        from datetime import datetime, timedelta
+
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+        if dry_run:
+            with self._reader() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM logs WHERE timestamp < ?",
+                    (cutoff,),
+                ).fetchone()
+                return {"deleted_count": row[0] if row else 0}
+        else:
+            with self._writer() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM logs WHERE timestamp < ?",
+                    (cutoff,),
+                )
+                return {"deleted_count": cursor.rowcount}
 
     # ========== Checkpoints ==========
 
@@ -4823,6 +5124,52 @@ class ProjectDatabase:
 
             return True
 
+    def reopen_workflow_step_atomic(
+        self,
+        workflow_id: str,
+        step_id: int,
+        step_number: int,
+    ) -> bool:
+        """Atomically reopen a completed/skipped step.
+
+        Sets the target step back to 'active', resets all later steps
+        to 'pending', and moves workflow.current_step back.
+
+        Args:
+            workflow_id: The workflow ID.
+            step_id: The ID of the step to reopen.
+            step_number: The step_number of the step to reopen.
+
+        Returns:
+            True if reopen succeeded, False otherwise.
+        """
+        with self._writer() as conn:
+            now = datetime.utcnow().isoformat()
+
+            # Set target step back to active, clear completed_at
+            conn.execute(
+                "UPDATE workflow_steps SET status = 'active', completed_at = NULL, updated_at = ? "
+                "WHERE id = ?",
+                (now, step_id),
+            )
+
+            # Reset all later steps to pending, clear timestamps
+            conn.execute(
+                "UPDATE workflow_steps SET status = 'pending', started_at = NULL, "
+                "completed_at = NULL, updated_at = ? "
+                "WHERE workflow_id = ? AND step_number > ? AND archived_at IS NULL",
+                (now, workflow_id, step_number),
+            )
+
+            # Move workflow.current_step back and ensure workflow is active
+            conn.execute(
+                "UPDATE workflows SET current_step = ?, status = 'active', updated_at = ? "
+                "WHERE id = ?",
+                (step_number, now, workflow_id),
+            )
+
+            return True
+
     # ========== Planning Sessions ==========
 
     def create_planning_session(
@@ -4833,6 +5180,11 @@ class ProjectDatabase:
         messages: Optional[list] = None,
         artifacts: Optional[dict] = None,
         status: str = "active",
+        # New iteration-based fields
+        prompt: Optional[str] = None,
+        iterations_requested: int = 1,
+        run_status: str = "pending",
+        is_legacy: bool = False,
     ) -> dict:
         """Create a planning session for an interactive step.
 
@@ -4843,6 +5195,10 @@ class ProjectDatabase:
             messages: Initial messages (default: empty list).
             artifacts: Optional artifacts dict.
             status: Session status (default: 'active').
+            prompt: User's guidance prompt for iteration-based sessions.
+            iterations_requested: Number of iterations requested (default: 1).
+            run_status: Execution status for iterations (default: 'pending').
+            is_legacy: Whether this is a legacy chat-based session.
 
         Returns:
             The created session dict.
@@ -4853,9 +5209,24 @@ class ProjectDatabase:
             artifacts_json = json.dumps(artifacts) if artifacts else None
             conn.execute(
                 """INSERT INTO planning_sessions
-                   (id, workflow_id, step_id, messages, artifacts, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (id, workflow_id, step_id, messages_json, artifacts_json, status, now, now),
+                   (id, workflow_id, step_id, messages, artifacts, status,
+                    prompt, iterations_requested, iterations_completed, current_iteration,
+                    run_status, is_legacy, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)""",
+                (
+                    id,
+                    workflow_id,
+                    step_id,
+                    messages_json,
+                    artifacts_json,
+                    status,
+                    prompt,
+                    iterations_requested,
+                    run_status,
+                    is_legacy,
+                    now,
+                    now,
+                ),
             )
         return self.get_planning_session(id)
 
@@ -4876,10 +5247,11 @@ class ProjectDatabase:
             return None
 
     def get_planning_session_by_step(self, step_id: int) -> Optional[dict]:
-        """Get planning session by step ID."""
+        """Get the most recent planning session for a step ID."""
         with self._reader() as conn:
             cursor = conn.execute(
-                "SELECT * FROM planning_sessions WHERE step_id = ?", (step_id,)
+                "SELECT * FROM planning_sessions WHERE step_id = ? ORDER BY created_at DESC LIMIT 1",
+                (step_id,),
             )
             row = cursor.fetchone()
             if row:
@@ -5000,6 +5372,11 @@ class ProjectDatabase:
         id: str,
         status: Optional[str] = None,
         artifacts: Optional[dict] = None,
+        # New iteration-based fields
+        run_status: Optional[str] = None,
+        current_iteration: Optional[int] = None,
+        iterations_completed: Optional[int] = None,
+        error_message: Optional[str] = None,
     ) -> bool:
         """Update planning session fields."""
         updates = []
@@ -5011,6 +5388,18 @@ class ProjectDatabase:
         if artifacts is not None:
             updates.append("artifacts = ?")
             params.append(json.dumps(artifacts))
+        if run_status is not None:
+            updates.append("run_status = ?")
+            params.append(run_status)
+        if current_iteration is not None:
+            updates.append("current_iteration = ?")
+            params.append(current_iteration)
+        if iterations_completed is not None:
+            updates.append("iterations_completed = ?")
+            params.append(iterations_completed)
+        if error_message is not None:
+            updates.append("error_message = ?")
+            params.append(error_message)
 
         if not updates:
             return False
@@ -5030,7 +5419,309 @@ class ProjectDatabase:
         self, id: str, artifacts: Optional[dict] = None
     ) -> bool:
         """Mark a planning session as completed."""
-        return self.update_planning_session(id, status="completed", artifacts=artifacts)
+        return self.update_planning_session(
+            id, status="completed", run_status="completed", artifacts=artifacts
+        )
+
+    def get_running_planning_session(self, workflow_id: str) -> Optional[dict]:
+        """Get any currently running planning session for a workflow.
+
+        Used to prevent multiple concurrent sessions.
+
+        Args:
+            workflow_id: The workflow ID to check.
+
+        Returns:
+            The running session dict if found, None otherwise.
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT * FROM planning_sessions
+                   WHERE workflow_id = ? AND run_status = 'running'
+                   ORDER BY created_at DESC LIMIT 1""",
+                (workflow_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                result = dict(row)
+                if result.get("messages"):
+                    result["messages"] = json.loads(result["messages"])
+                if result.get("artifacts"):
+                    result["artifacts"] = json.loads(result["artifacts"])
+                return result
+            return None
+
+    def cancel_planning_session(self, id: str) -> bool:
+        """Cancel a running planning session.
+
+        Args:
+            id: The session ID to cancel.
+
+        Returns:
+            True if session was cancelled, False otherwise.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE planning_sessions
+                   SET run_status = 'cancelled', updated_at = ?
+                   WHERE id = ? AND run_status = 'running'""",
+                (datetime.utcnow().isoformat(), id),
+            )
+            return cursor.rowcount > 0
+
+    # ========== Planning Iterations ==========
+
+    def create_planning_iteration(
+        self,
+        session_id: str,
+        iteration_number: int,
+        status: str = "pending",
+    ) -> Optional[dict]:
+        """Create a new planning iteration record.
+
+        Args:
+            session_id: Parent session ID.
+            iteration_number: The iteration number (1-indexed).
+            status: Initial status (default: 'pending').
+
+        Returns:
+            The created iteration dict.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """INSERT INTO planning_iterations
+                   (session_id, iteration_number, status)
+                   VALUES (?, ?, ?)""",
+                (session_id, iteration_number, status),
+            )
+            return self.get_planning_iteration(cursor.lastrowid)
+
+    def get_planning_iteration(self, iteration_id: int) -> Optional[dict]:
+        """Get a planning iteration by ID."""
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM planning_iterations WHERE id = ?", (iteration_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                result = dict(row)
+                if result.get("tool_calls"):
+                    result["tool_calls"] = json.loads(result["tool_calls"])
+                return result
+            return None
+
+    def list_planning_iterations(self, session_id: str) -> list[dict]:
+        """List all iterations for a planning session.
+
+        Args:
+            session_id: The session ID.
+
+        Returns:
+            List of iteration dicts ordered by iteration_number.
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT * FROM planning_iterations
+                   WHERE session_id = ?
+                   ORDER BY iteration_number ASC""",
+                (session_id,),
+            )
+            results = []
+            for row in cursor.fetchall():
+                result = dict(row)
+                if result.get("tool_calls"):
+                    result["tool_calls"] = json.loads(result["tool_calls"])
+                results.append(result)
+            return results
+
+    def update_planning_iteration(
+        self,
+        iteration_id: int,
+        status: Optional[str] = None,
+        started_at: Optional[str] = None,
+        completed_at: Optional[str] = None,
+        chars_added: Optional[int] = None,
+        chars_removed: Optional[int] = None,
+        tool_calls: Optional[list] = None,
+        summary: Optional[str] = None,
+        error_message: Optional[str] = None,
+        diff_text: Optional[str] = None,
+        doc_before: Optional[str] = None,
+        doc_after: Optional[str] = None,
+    ) -> bool:
+        """Update a planning iteration.
+
+        Args:
+            iteration_id: The iteration ID.
+            status: New status.
+            started_at: Start timestamp.
+            completed_at: Completion timestamp.
+            chars_added: Characters added to design doc.
+            chars_removed: Characters removed from design doc.
+            tool_calls: List of tool call records.
+            summary: Brief summary of changes.
+            error_message: Error message if failed.
+            diff_text: Unified diff of changes.
+            doc_before: Document content before iteration.
+            doc_after: Document content after iteration.
+
+        Returns:
+            True if updated, False otherwise.
+        """
+        updates = []
+        params: list[Any] = []
+
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if started_at is not None:
+            updates.append("started_at = ?")
+            params.append(started_at)
+        if completed_at is not None:
+            updates.append("completed_at = ?")
+            params.append(completed_at)
+        if chars_added is not None:
+            updates.append("chars_added = ?")
+            params.append(chars_added)
+        if chars_removed is not None:
+            updates.append("chars_removed = ?")
+            params.append(chars_removed)
+        if tool_calls is not None:
+            updates.append("tool_calls = ?")
+            params.append(json.dumps(tool_calls))
+        if summary is not None:
+            updates.append("summary = ?")
+            params.append(summary)
+        if error_message is not None:
+            updates.append("error_message = ?")
+            params.append(error_message)
+        if diff_text is not None:
+            updates.append("diff_text = ?")
+            params.append(diff_text)
+        if doc_before is not None:
+            updates.append("doc_before = ?")
+            params.append(doc_before)
+        if doc_after is not None:
+            updates.append("doc_after = ?")
+            params.append(doc_after)
+
+        if not updates:
+            return False
+
+        params.append(iteration_id)
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE planning_iterations SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            return cursor.rowcount > 0
+
+    def start_planning_iteration(self, iteration_id: int) -> bool:
+        """Mark an iteration as started."""
+        return self.update_planning_iteration(
+            iteration_id,
+            status="running",
+            started_at=datetime.utcnow().isoformat(),
+        )
+
+    def complete_planning_iteration(
+        self,
+        iteration_id: int,
+        chars_added: int = 0,
+        chars_removed: int = 0,
+        tool_calls: Optional[list] = None,
+        summary: Optional[str] = None,
+        diff_text: Optional[str] = None,
+        doc_before: Optional[str] = None,
+        doc_after: Optional[str] = None,
+    ) -> bool:
+        """Mark an iteration as completed with results."""
+        return self.update_planning_iteration(
+            iteration_id,
+            status="completed",
+            completed_at=datetime.utcnow().isoformat(),
+            chars_added=chars_added,
+            chars_removed=chars_removed,
+            tool_calls=tool_calls,
+            summary=summary,
+            diff_text=diff_text,
+            doc_before=doc_before,
+            doc_after=doc_after,
+        )
+
+    def fail_planning_iteration(
+        self, iteration_id: int, error_message: str
+    ) -> bool:
+        """Mark an iteration as failed."""
+        return self.update_planning_iteration(
+            iteration_id,
+            status="failed",
+            completed_at=datetime.utcnow().isoformat(),
+            error_message=error_message,
+        )
+
+    # ========== Planning Iteration Events ==========
+
+    def add_planning_iteration_event(
+        self,
+        session_id: str,
+        event_type: str,
+        iteration_number: Optional[int] = None,
+        content: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        tool_input: Optional[str] = None,
+        tool_result: Optional[str] = None,
+        event_data: Optional[str] = None,
+    ) -> int:
+        """Add a planning iteration event to the persistent log.
+
+        Returns:
+            The event ID.
+        """
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """INSERT INTO planning_iteration_events
+                   (session_id, iteration_number, event_type, content, tool_name, tool_input, tool_result, event_data)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, iteration_number, event_type, content, tool_name, tool_input, tool_result, event_data),
+            )
+            return cursor.lastrowid
+
+    def get_planning_iteration_events(
+        self,
+        session_id: str,
+        after_id: int = 0,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Get planning iteration events for a session.
+
+        Args:
+            session_id: The session ID.
+            after_id: Only return events with id > after_id (for pagination/polling).
+            limit: Maximum events to return.
+
+        Returns:
+            List of event dicts ordered by id ASC.
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                """SELECT * FROM planning_iteration_events
+                   WHERE session_id = ? AND id > ?
+                   ORDER BY id ASC
+                   LIMIT ?""",
+                (session_id, after_id, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_latest_event_timestamp(self, session_id: str) -> Optional[str]:
+        """Get the timestamp of the most recent event for a planning session."""
+        with self._reader() as conn:
+            row = conn.execute(
+                "SELECT MAX(timestamp) FROM planning_iteration_events WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row[0] if row and row[0] else None
 
     # ========== Utilities ==========
 

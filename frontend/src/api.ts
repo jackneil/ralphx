@@ -894,6 +894,100 @@ export async function getResourceTypes() {
   }>('/projects/_/resources/types')
 }
 
+// =============================================================================
+// Design Doc Files (for interactive design_doc steps)
+// These work directly with files in .ralphx/resources/design_doc/
+// =============================================================================
+
+export interface DesignDocFile {
+  path: string        // e.g., "design_doc/RCM_DESIGN.md"
+  name: string        // e.g., "RCM_DESIGN.md"
+  size: number        // bytes
+  modified: string    // ISO timestamp
+  content?: string    // Only included when fetching single file
+}
+
+export interface DesignDocBackup {
+  path: string
+  name: string
+  size: number
+  created: string
+}
+
+export async function listDesignDocFiles(slug: string) {
+  return request<DesignDocFile[]>(`/projects/${slug}/design-doc-files`)
+}
+
+export async function getDesignDocFile(slug: string, fileName: string) {
+  return request<DesignDocFile & { content: string }>(`/projects/${slug}/design-doc-files/${fileName}`)
+}
+
+export async function saveDesignDocFile(slug: string, fileName: string, content: string) {
+  return request<{ path: string; backup_path: string | null; size: number }>(
+    `/projects/${slug}/design-doc-files/${fileName}/save`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }
+  )
+}
+
+export async function createDesignDocFile(slug: string, name: string) {
+  return request<DesignDocFile>(`/projects/${slug}/design-doc-files/create?name=${encodeURIComponent(name)}`, {
+    method: 'POST',
+  })
+}
+
+export async function listDesignDocBackups(slug: string, fileName: string) {
+  return request<DesignDocBackup[]>(`/projects/${slug}/design-doc-files/${fileName}/backups`)
+}
+
+export async function getDesignDocBackup(slug: string, backupName: string) {
+  return request<DesignDocFile & { content: string }>(`/projects/${slug}/design-doc-files/backups/${backupName}`)
+}
+
+// Design Doc Diff and Restore
+export interface DiffLine {
+  line: string
+  type: 'add' | 'remove' | 'context' | 'hunk'
+}
+
+export interface DiffResult {
+  left_path: string
+  right_path: string
+  left_size: number
+  right_size: number
+  chars_added: number
+  chars_removed: number
+  diff_html: string
+  diff_lines: DiffLine[]
+}
+
+export async function diffDesignDocVersions(
+  slug: string,
+  fileName: string,
+  left: string,
+  right: string
+): Promise<DiffResult> {
+  return request<DiffResult>(
+    `/projects/${slug}/design-doc-files/${encodeURIComponent(fileName)}/diff?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`
+  )
+}
+
+export async function restoreDesignDocBackup(
+  slug: string,
+  fileName: string,
+  backupName: string
+): Promise<{ success: boolean; backup_created: string | null }> {
+  return request(
+    `/projects/${slug}/design-doc-files/${encodeURIComponent(fileName)}/restore`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ backup_name: backupName }),
+    }
+  )
+}
+
 // Project File Browsing
 export interface ProjectFile {
   name: string
@@ -1525,8 +1619,12 @@ export interface WorkflowStep {
     max_iterations?: number
     cooldown_between_iterations?: number
     max_consecutive_errors?: number
+    // Cross-step item context (step IDs whose items are visible as context)
+    context_from_steps?: number[]
     // Custom AI instructions (overrides default prompt)
     customPrompt?: string
+    // Design doc file path (for design_doc steps) - relative to .ralphx/resources/design_doc/
+    design_doc_path?: string
   }
   loop_name?: string
   artifacts?: Record<string, unknown>
@@ -1688,6 +1786,17 @@ export async function advanceWorkflowStep(
   })
 }
 
+export async function reopenWorkflowStep(
+  slug: string,
+  workflowId: string,
+  stepId: number
+): Promise<Workflow> {
+  return request<Workflow>(
+    `/projects/${slug}/workflows/${workflowId}/steps/${stepId}/reopen`,
+    { method: 'POST' }
+  )
+}
+
 // Step CRUD operations
 export async function createWorkflowStep(
   slug: string,
@@ -1708,6 +1817,8 @@ export async function createWorkflowStep(
     max_consecutive_errors?: number
     // Custom prompt (autonomous steps only)
     custom_prompt?: string
+    // Cross-step item context (step IDs whose items are visible)
+    context_from_steps?: number[]
   }
 ): Promise<WorkflowStep> {
   return request<WorkflowStep>(`/projects/${slug}/workflows/${workflowId}/steps`, {
@@ -1736,6 +1847,10 @@ export async function updateWorkflowStep(
     max_consecutive_errors?: number
     // Custom prompt (autonomous steps only)
     custom_prompt?: string
+    // Design doc file path (for design_doc interactive steps)
+    design_doc_path?: string
+    // Cross-step item context (step IDs whose items are visible)
+    context_from_steps?: number[]
   }
 ): Promise<WorkflowStep> {
   return request<WorkflowStep>(`/projects/${slug}/workflows/${workflowId}/steps/${stepId}`, {
@@ -1873,6 +1988,253 @@ export function streamPlanningArtifacts(
   workflowId: string
 ): EventSource {
   return new EventSource(`${API_BASE}/projects/${slug}/workflows/${workflowId}/planning/generate-artifacts`)
+}
+
+// Planning Session History Types
+export interface PlanningSessionSummary {
+  id: string
+  step_id: number
+  status: 'active' | 'completed' | 'interrupted'
+  message_count: number
+  first_user_message?: string
+  created_at: string
+  updated_at: string
+  chars_added?: number
+  chars_removed?: number
+  backup_created?: string
+}
+
+export interface PlanningSessionDetail {
+  id: string
+  workflow_id: string
+  step_id: number
+  status: string
+  messages: PlanningMessage[]
+  artifacts?: Record<string, unknown>
+  created_at: string
+  updated_at: string
+  initial_content_size?: number
+  final_content_size?: number
+}
+
+export async function listPlanningSessions(
+  slug: string,
+  workflowId: string
+): Promise<PlanningSessionSummary[]> {
+  return request<PlanningSessionSummary[]>(
+    `/projects/${slug}/workflows/${workflowId}/planning/sessions`
+  )
+}
+
+export async function getPlanningSessionDetail(
+  slug: string,
+  workflowId: string,
+  sessionId: string
+): Promise<PlanningSessionDetail> {
+  return request<PlanningSessionDetail>(
+    `/projects/${slug}/workflows/${workflowId}/planning/sessions/${sessionId}`
+  )
+}
+
+// ============================================================================
+// Iteration-Based Planning API (v17)
+// ============================================================================
+
+export interface IterationSession {
+  id: string
+  workflow_id: string
+  step_id: number
+  prompt: string | null
+  iterations_requested: number
+  iterations_completed: number
+  current_iteration: number
+  run_status: 'pending' | 'running' | 'completed' | 'cancelled' | 'error'
+  is_legacy: boolean
+  error_message: string | null
+  artifacts?: {
+    design_doc?: string
+    guardrails?: string
+  }
+  status: 'active' | 'completed'
+  created_at: string
+  updated_at: string
+}
+
+export interface PlanningIteration {
+  id: number
+  iteration_number: number
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped'
+  chars_added: number
+  chars_removed: number
+  summary: string | null
+  started_at: string | null
+  completed_at: string | null
+}
+
+export interface IterationSessionSummary {
+  id: string
+  step_id: number
+  status: string
+  run_status: string
+  is_legacy: boolean
+  prompt: string | null
+  iterations_requested: number
+  iterations_completed: number
+  current_iteration: number
+  created_at: string
+  updated_at: string
+  total_chars_added: number
+  total_chars_removed: number
+  iterations: PlanningIteration[]
+}
+
+// SSE Event types for iteration streaming
+export interface IterationDiffResponse {
+  iteration_id: number
+  iteration_number: number
+  diff_text: string | null
+  chars_added: number
+  chars_removed: number
+  diff_lines: DiffLine[]
+}
+
+export interface IterationSSEEvent {
+  type:
+    | 'iteration_start'
+    | 'tool_use'
+    | 'tool_result'
+    | 'content'
+    | 'design_doc_updated'
+    | 'heartbeat'
+    | 'iteration_complete'
+    | 'error'
+    | 'cancelled'
+    | 'done'
+  // Fields depend on type
+  iteration?: number
+  total?: number
+  tool?: string
+  input?: Record<string, unknown>
+  result?: string
+  text?: string
+  chars_added?: number
+  chars_removed?: number
+  summary?: string
+  message?: string
+  fatal?: boolean
+  iterations_completed?: number
+  iteration_id?: number
+  _event_id?: number
+}
+
+export interface IterationEvent {
+  id: number
+  session_id: string
+  iteration_number?: number
+  event_type: string
+  timestamp: string
+  content?: string
+  tool_name?: string
+  tool_input?: string
+  tool_result?: string
+  event_data?: string
+}
+
+export async function startIterationSession(
+  slug: string,
+  workflowId: string,
+  prompt: string,
+  iterations: number = 3,
+  model: string = 'opus'
+): Promise<IterationSession> {
+  return request<IterationSession>(
+    `/projects/${slug}/workflows/${workflowId}/planning/iterate`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ prompt, iterations, model }),
+    }
+  )
+}
+
+export function streamIterationProgress(
+  slug: string,
+  workflowId: string,
+  sessionId: string,
+  afterEventId: number = 0
+): EventSource {
+  const url = `${API_BASE}/projects/${slug}/workflows/${workflowId}/planning/iterate/stream/${sessionId}` +
+    (afterEventId > 0 ? `?after_event_id=${afterEventId}` : '')
+  return new EventSource(url)
+}
+
+export async function getIterationEvents(
+  slug: string,
+  workflowId: string,
+  sessionId: string,
+  afterId: number = 0,
+  limit: number = 500
+): Promise<IterationEvent[]> {
+  const params = new URLSearchParams()
+  if (afterId > 0) params.set('after_id', afterId.toString())
+  if (limit !== 500) params.set('limit', limit.toString())
+  const query = params.toString()
+  return request<IterationEvent[]>(
+    `/projects/${slug}/workflows/${workflowId}/planning/iterate/${sessionId}/events${query ? `?${query}` : ''}`
+  )
+}
+
+export async function cancelIterationSession(
+  slug: string,
+  workflowId: string,
+  sessionId: string
+): Promise<IterationSession> {
+  return request<IterationSession>(
+    `/projects/${slug}/workflows/${workflowId}/planning/iterate/cancel`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ session_id: sessionId }),
+    }
+  )
+}
+
+export async function getIterationSession(
+  slug: string,
+  workflowId: string,
+  sessionId: string
+): Promise<IterationSession> {
+  return request<IterationSession>(
+    `/projects/${slug}/workflows/${workflowId}/planning/iterate/${sessionId}`
+  )
+}
+
+export async function listSessionIterations(
+  slug: string,
+  workflowId: string,
+  sessionId: string
+): Promise<PlanningIteration[]> {
+  return request<PlanningIteration[]>(
+    `/projects/${slug}/workflows/${workflowId}/planning/iterate/${sessionId}/iterations`
+  )
+}
+
+export async function getIterationDiff(
+  slug: string,
+  workflowId: string,
+  sessionId: string,
+  iterationId: number
+): Promise<IterationDiffResponse> {
+  return request<IterationDiffResponse>(
+    `/projects/${slug}/workflows/${workflowId}/planning/iterate/${sessionId}/iterations/${iterationId}/diff`
+  )
+}
+
+export async function listIterationSessions(
+  slug: string,
+  workflowId: string
+): Promise<IterationSessionSummary[]> {
+  return request<IterationSessionSummary[]>(
+    `/projects/${slug}/workflows/${workflowId}/planning/sessions`
+  )
 }
 
 // ============================================================================

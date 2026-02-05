@@ -11,6 +11,59 @@ from ralphx.core.project_db import ProjectDatabase
 
 router = APIRouter()
 
+# Processing type configurations - maps processing_type to step_type and config
+# Matches frontend StepSettings.tsx and mcp/tools/workflows.py
+PROCESSING_TYPES = {
+    "design_doc": {
+        "step_type": "interactive",
+        "config": {
+            "loopType": "design_doc",
+            "allowedTools": ["WebSearch", "WebFetch", "Bash", "Read", "Glob", "Grep", "Edit", "Write"],
+            "model": "opus",
+            "timeout": 300,
+        },
+    },
+    "extractgen_requirements": {
+        "step_type": "autonomous",
+        "config": {
+            "loopType": "generator",
+            "template": "extractgen_requirements",
+            "allowedTools": ["WebSearch", "WebFetch"],
+            "model": "opus",
+            "timeout": 600,
+            "max_iterations": 100,
+            "cooldown_between_iterations": 5,
+            "max_consecutive_errors": 5,
+        },
+    },
+    "webgen_requirements": {
+        "step_type": "autonomous",
+        "config": {
+            "loopType": "generator",
+            "template": "webgen_requirements",
+            "allowedTools": ["WebSearch", "WebFetch"],
+            "model": "opus",
+            "timeout": 900,
+            "max_iterations": 15,
+            "cooldown_between_iterations": 15,
+            "max_consecutive_errors": 3,
+        },
+    },
+    "implementation": {
+        "step_type": "autonomous",
+        "config": {
+            "loopType": "consumer",
+            "template": "implementation",
+            "allowedTools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+            "model": "opus",
+            "timeout": 1800,
+            "max_iterations": 50,
+            "cooldown_between_iterations": 5,
+            "max_consecutive_errors": 3,
+        },
+    },
+}
+
 
 # ============================================================================
 # Request/Response Models
@@ -137,6 +190,8 @@ class CreateStepRequest(BaseModel):
     max_consecutive_errors: Optional[int] = Field(None, ge=1, le=100)
     # Custom prompt (autonomous steps only)
     custom_prompt: Optional[str] = Field(None, max_length=50000)
+    # Cross-step context: step IDs whose items should be visible as existing context
+    context_from_steps: Optional[list[int]] = None
 
 
 class UpdateStepRequest(BaseModel):
@@ -161,6 +216,11 @@ class UpdateStepRequest(BaseModel):
     max_consecutive_errors: Optional[int] = Field(None, ge=1, le=100)
     # Custom prompt (autonomous steps only)
     custom_prompt: Optional[str] = Field(None, max_length=50000)
+    # Cross-step context: step IDs whose items should be visible as existing context
+    context_from_steps: Optional[list[int]] = None
+    # Design doc file path (for design_doc interactive steps)
+    # Path is relative to .ralphx/resources/design_doc/ (e.g., "PROJECT_DESIGN.md")
+    design_doc_path: Optional[str] = Field(None, max_length=255)
 
 
 # Valid tools for autonomous steps
@@ -274,9 +334,9 @@ def _workflow_to_response(
             total_iterations = sum(
                 r.get("iterations_completed", 0) or 0 for r in step_runs
             )
-            total_items = sum(
-                r.get("items_generated", 0) or 0 for r in step_runs
-            )
+            # Count items from work_items table (includes imports + generated)
+            step_item_counts = item_counts_by_step_id.get(step_id, {})
+            total_items = sum(step_item_counts.values())
 
             # Check for active run
             running_run = next(
@@ -315,13 +375,15 @@ def _workflow_to_response(
                         total = sum(item_stats.values())
                         # Status mapping for display:
                         # - "completed" in DB = ready for consumer (display as "pending")
+                        # - "claimed" in DB = actively being processed (display as "in_progress")
                         # - "processed" in DB = already done (display as "completed")
                         # - "pending" in DB = not yet ready (shouldn't happen much)
                         input_items = {
                             "total": total,
                             # "completed" in DB means ready-to-process, so count as pending for display
                             "pending": item_stats.get("pending", 0) + item_stats.get("completed", 0),
-                            "in_progress": item_stats.get("in_progress", 0),
+                            # "claimed" in DB means actively being processed by a consumer loop
+                            "in_progress": item_stats.get("in_progress", 0) + item_stats.get("claimed", 0),
                             # "processed" in DB means actually done
                             "completed": item_stats.get("processed", 0),
                             "skipped": item_stats.get("skipped", 0),
@@ -329,6 +391,11 @@ def _workflow_to_response(
                             "duplicate": item_stats.get("duplicate", 0),
                             "rejected": item_stats.get("rejected", 0),
                         }
+
+            # Derive loop_name fallback from runs if step record is missing it
+            derived_loop_name = step.get("loop_name") or next(
+                (r.get("loop_name") for r in step_runs), None
+            )
 
             step_progress[step_id] = {
                 "has_active_run": running_run is not None,
@@ -342,6 +409,7 @@ def _workflow_to_response(
                 "items_generated": total_items,
                 "has_guardrails": step_has_guardrails or guardrails_count > 0,
                 "input_items": input_items,
+                "loop_name": derived_loop_name,
             }
 
     return WorkflowResponse(
@@ -362,7 +430,7 @@ def _workflow_to_response(
                 step_type=s["step_type"],
                 status=s["status"],
                 config=s.get("config"),
-                loop_name=s.get("loop_name"),
+                loop_name=step_progress.get(s["id"], {}).get("loop_name") or s.get("loop_name"),
                 artifacts=s.get("artifacts"),
                 started_at=s.get("started_at"),
                 completed_at=s.get("completed_at"),
@@ -518,19 +586,36 @@ async def create_workflow(slug: str, request: CreateWorkflowRequest):
     # Create steps from template
     created_steps = []
     for step_def in template_steps:
+        # Get step_type and config from processing_type if available
+        processing_type = step_def.get("processing_type")
+        if processing_type and processing_type in PROCESSING_TYPES:
+            type_config = PROCESSING_TYPES[processing_type]
+            step_type = type_config["step_type"]
+            # Merge template config with processing_type defaults
+            config = {**type_config["config"]}
+        else:
+            # Fallback to explicit type field (for backwards compatibility)
+            step_type = step_def.get("type", "autonomous")
+            config = {}
+
+        # Add template-specific config
+        config.update({
+            "description": step_def.get("description"),
+            "inputs": step_def.get("inputs", []),
+            "outputs": step_def.get("outputs", []),
+            "skippable": step_def.get("skippable", False),
+            "skipCondition": step_def.get("skipCondition"),
+        })
+        # Override loopType if explicitly specified in template
+        if step_def.get("loopType"):
+            config["loopType"] = step_def["loopType"]
+
         step = pdb.create_workflow_step(
             workflow_id=workflow_id,
             step_number=step_def["number"],
             name=step_def["name"],
-            step_type=step_def["type"],
-            config={
-                "description": step_def.get("description"),
-                "loopType": step_def.get("loopType"),
-                "inputs": step_def.get("inputs", []),
-                "outputs": step_def.get("outputs", []),
-                "skippable": step_def.get("skippable", False),
-                "skipCondition": step_def.get("skipCondition"),
-            },
+            step_type=step_type,
+            config=config,
             status="pending",
         )
         created_steps.append(step)
@@ -726,6 +811,70 @@ async def advance_workflow_step(
     return _workflow_to_response(workflow, steps, pdb)
 
 
+@router.post("/workflows/{workflow_id}/steps/{step_id}/reopen", response_model=WorkflowResponse)
+async def reopen_workflow_step(slug: str, workflow_id: str, step_id: int):
+    """Reopen a completed or skipped step.
+
+    Sets the step back to active, resets all later steps to pending,
+    and moves the workflow's current_step back.
+    """
+    pdb = _get_project_db(slug)
+    workflow = pdb.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow '{workflow_id}' not found",
+        )
+
+    if workflow["status"] == "completed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot reopen steps of a completed workflow.",
+        )
+
+    step = pdb.get_workflow_step(step_id)
+    if not step or step["workflow_id"] != workflow_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Step '{step_id}' not found in workflow '{workflow_id}'",
+        )
+
+    if step["status"] not in ("completed", "skipped"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot reopen step in status '{step['status']}'. Step must be 'completed' or 'skipped'.",
+        )
+
+    # Abort any active/paused runs on the reopened step and all later steps
+    from datetime import datetime
+
+    all_steps = pdb.list_workflow_steps(workflow_id)
+    affected_step_ids = {
+        s["id"]
+        for s in all_steps
+        if s["step_number"] >= step["step_number"]
+    }
+    runs = pdb.list_runs(workflow_id=workflow_id, status=["running", "paused"])
+    for run in runs:
+        if run.get("step_id") in affected_step_ids:
+            pdb.update_run(
+                run["id"],
+                status="aborted",
+                completed_at=datetime.utcnow().isoformat(),
+                error_message="Step reopened by user",
+            )
+
+    pdb.reopen_workflow_step_atomic(
+        workflow_id=workflow_id,
+        step_id=step["id"],
+        step_number=step["step_number"],
+    )
+
+    workflow = pdb.get_workflow(workflow_id)
+    steps = pdb.list_workflow_steps(workflow_id)
+    return _workflow_to_response(workflow, steps, pdb)
+
+
 @router.post("/workflows/{workflow_id}/start", response_model=WorkflowResponse)
 async def start_workflow(slug: str, workflow_id: str):
     """Start a workflow by activating the first step."""
@@ -771,17 +920,24 @@ async def start_workflow(slug: str, workflow_id: str):
         from ralphx.core.project import Project
         from ralphx.core.workflow_executor import WorkflowExecutor
 
-        db = Database()
-        project = db.get_project(slug)
-        if project:
-            project_obj = Project.from_dict(project)
-            executor = WorkflowExecutor(
-                project=project_obj,
-                db=pdb,
-                workflow_id=workflow_id,
-            )
-            # Start autonomous step in background
-            asyncio.create_task(executor._start_autonomous_step(first_pending))
+        # Guard against double-execution
+        existing_runs = pdb.list_runs(
+            workflow_id=workflow_id,
+            step_id=first_pending["id"],
+            status=["running", "paused"],
+        )
+        if not existing_runs:
+            db = Database()
+            project = db.get_project(slug)
+            if project:
+                project_obj = Project.from_dict(project)
+                executor = WorkflowExecutor(
+                    project=project_obj,
+                    db=pdb,
+                    workflow_id=workflow_id,
+                )
+                # Start autonomous step in background
+                asyncio.create_task(executor._start_autonomous_step(first_pending))
 
     # Return updated workflow
     workflow = pdb.get_workflow(workflow_id)
@@ -845,6 +1001,18 @@ async def run_workflow_step(slug: str, workflow_id: str):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Step must be active to run. Current status: {current_step['status']}",
+        )
+
+    # Guard against double-execution: check if there's already a running run for this step
+    existing_runs = pdb.list_runs(
+        workflow_id=workflow_id,
+        step_id=current_step["id"],
+        status=["running", "paused"],
+    )
+    if existing_runs:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Step already has a running executor (run {existing_runs[0]['id']}). Stop it first.",
         )
 
     # Create and use WorkflowExecutor to start the autonomous step
@@ -926,6 +1094,21 @@ async def run_specific_step(slug: str, workflow_id: str, step_number: int):
 
     # If autonomous step, trigger the loop execution
     if target_step["step_type"] == "autonomous":
+        # Guard against double-start: check if there's already a running run
+        # for this step's loop. Without this check, rapid double-clicks could
+        # spawn two concurrent loop executions for the same step.
+        step_loop_name = target_step.get("loop_name")
+        if step_loop_name:
+            existing_runs = pdb.list_runs(
+                loop_name=step_loop_name,
+                status=["running"],
+            )
+            if existing_runs:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Step already has an active run (run_id: {existing_runs[0]['id']})",
+                )
+
         project_obj = Project.from_dict(project)
         executor = WorkflowExecutor(
             project=project_obj,
@@ -1077,6 +1260,32 @@ async def create_step(slug: str, workflow_id: str, request: CreateStepRequest):
         if request.max_consecutive_errors is not None:
             config["max_consecutive_errors"] = request.max_consecutive_errors
 
+    # Cross-step context links
+    if request.context_from_steps is not None:
+        # Validate step IDs belong to the same workflow
+        if request.context_from_steps:
+            existing_step_ids = {s["id"] for s in pdb.list_workflow_steps(workflow_id)}
+            invalid_ids = [sid for sid in request.context_from_steps if sid not in existing_step_ids]
+            if invalid_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"context_from_steps contains invalid step IDs: {invalid_ids}",
+                )
+        config["context_from_steps"] = request.context_from_steps
+
+    # Auto-link: webgen steps should see extractgen items as context
+    if (
+        stripped_template == "webgen_requirements"
+        and not request.context_from_steps
+    ):
+        # Find preceding extractgen step in the same workflow
+        all_steps = pdb.list_workflow_steps(workflow_id)
+        for s in all_steps:
+            s_config = s.get("config") or {}
+            if s_config.get("template") == "extractgen_requirements":
+                config["context_from_steps"] = [s["id"]]
+                break
+
     # Create step atomically (step_number calculated inside transaction)
     step = pdb.create_workflow_step_atomic(
         workflow_id=workflow_id,
@@ -1166,6 +1375,18 @@ async def update_step(slug: str, workflow_id: str, step_id: int, request: Update
         config_updates["template"] = stripped_template if stripped_template else None
     if request.skippable is not None:
         config_updates["skippable"] = request.skippable
+    if request.design_doc_path is not None:
+        # Empty string means unlink, otherwise store the path
+        stripped_path = request.design_doc_path.strip()
+        if stripped_path:
+            # Security: validate design_doc_path is a safe filename (no traversal)
+            if (".." in stripped_path or "/" in stripped_path or "\\" in stripped_path
+                    or "\0" in stripped_path or stripped_path.startswith(".")):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid design_doc_path: must be a simple filename (e.g., 'PROJECT_DESIGN.md')",
+                )
+        config_updates["design_doc_path"] = stripped_path if stripped_path else None
 
     # Include autonomous settings only for autonomous steps
     if effective_step_type == "autonomous":
@@ -1182,6 +1403,17 @@ async def update_step(slug: str, workflow_id: str, step_id: int, request: Update
             config_updates["cooldown_between_iterations"] = request.cooldown_between_iterations
         if request.max_consecutive_errors is not None:
             config_updates["max_consecutive_errors"] = request.max_consecutive_errors
+        # Cross-step context links
+        if request.context_from_steps is not None:
+            if request.context_from_steps:
+                existing_step_ids = {s["id"] for s in pdb.list_workflow_steps(workflow_id)}
+                invalid_ids = [sid for sid in request.context_from_steps if sid not in existing_step_ids]
+                if invalid_ids:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"context_from_steps contains invalid step IDs: {invalid_ids}",
+                    )
+            config_updates["context_from_steps"] = request.context_from_steps
         # Custom prompt
         if request.custom_prompt is not None:
             # Empty string means clear custom prompt

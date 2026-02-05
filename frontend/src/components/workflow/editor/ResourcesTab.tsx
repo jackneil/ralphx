@@ -1,17 +1,19 @@
 import { useState, useEffect } from 'react'
-import type { WorkflowResource, ProjectResource } from '../../../api'
+import type { WorkflowResource, ProjectResource, Resource } from '../../../api'
 import {
   createWorkflowResource,
   updateWorkflowResource,
   deleteWorkflowResource,
   importProjectResourceToWorkflow,
 } from '../../../api'
+import { confirm } from '../../../lib/alerts'
 
 interface ResourcesTabProps {
   projectSlug: string
   workflowId: string
   resources: WorkflowResource[]
   projectResources: ProjectResource[]
+  filesystemResources?: Resource[]
   onResourcesChange: () => void
   onError: (error: string) => void
 }
@@ -21,6 +23,7 @@ export default function ResourcesTab({
   workflowId,
   resources,
   projectResources,
+  filesystemResources = [],
   onResourcesChange,
   onError,
 }: ResourcesTabProps) {
@@ -94,6 +97,30 @@ export default function ResourcesTab({
     }
   }
 
+  const handleImportFilesystemResource = async (fsResource: Resource) => {
+    if (operationPending) return
+    if (!fsResource.content) {
+      onError('Resource content not available')
+      return
+    }
+
+    setOperationPending(true)
+    try {
+      await createWorkflowResource(projectSlug, workflowId, {
+        name: fsResource.name,
+        resource_type: fsResource.resource_type,
+        content: fsResource.content,
+        source: 'imported',
+      })
+      setShowImportModal(false)
+      onResourcesChange()
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Failed to import filesystem resource')
+    } finally {
+      setOperationPending(false)
+    }
+  }
+
   const handleToggleResource = async (resource: WorkflowResource) => {
     if (operationPending) return
 
@@ -129,8 +156,13 @@ export default function ResourcesTab({
   }
 
   const handleDeleteResource = async (resource: WorkflowResource) => {
-    if (!confirm(`Delete "${resource.name}"? This cannot be undone.`)) return
     if (operationPending) return
+
+    const result = await confirm.danger(
+      'Delete Resource?',
+      `Are you sure you want to delete "${resource.name}"? This cannot be undone.`
+    )
+    if (!result.isConfirmed) return
 
     setOperationPending(true)
     try {
@@ -179,6 +211,12 @@ export default function ResourcesTab({
   )
   const availableForImport = projectResources.filter(
     pr => !importedSourceIds.has(pr.id)
+  )
+
+  // Filter out filesystem resources that are already imported (by name match)
+  const importedNames = new Set(resources.map(r => r.name.toLowerCase()))
+  const availableFilesystemResources = filesystemResources.filter(
+    fr => fr.enabled && !importedNames.has(fr.name.toLowerCase())
   )
 
   // Group resources by type
@@ -483,42 +521,92 @@ export default function ResourcesTab({
             if (e.target === e.currentTarget) setShowImportModal(false)
           }}
         >
-          <div className="bg-gray-800 rounded-xl border border-gray-600 p-6 w-full max-w-lg mx-4">
-            <h3 className="text-lg font-semibold text-white mb-4">Import from Project Library</h3>
+          <div className="bg-gray-800 rounded-xl border border-gray-600 p-6 w-full max-w-lg mx-4 max-h-[80vh] overflow-y-auto">
+            <h3 className="text-lg font-semibold text-white mb-4">Import from Library</h3>
             <p className="text-sm text-gray-400 mb-4">
-              Select a resource from the project's shared library.
+              Select a resource from the project library to import into this workflow.
             </p>
 
-            {availableForImport.length === 0 ? (
+            {availableForImport.length === 0 && availableFilesystemResources.length === 0 ? (
               <div className="text-center py-8">
                 <p className="text-gray-400">
-                  {projectResources.length === 0
-                    ? 'No shared resources in project library'
-                    : 'All project resources are already imported'}
+                  {projectResources.length === 0 && filesystemResources.length === 0
+                    ? 'No resources available in project library'
+                    : 'All resources are already imported'}
                 </p>
               </div>
             ) : (
-              <div className="space-y-2 max-h-64 overflow-y-auto">
-                {availableForImport.map((pr) => (
-                  <button
-                    key={pr.id}
-                    onClick={() => handleImportResource(pr)}
-                    disabled={operationPending}
-                    className="w-full p-3 bg-gray-700 rounded-lg hover:bg-gray-600 text-left disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <h4 className="text-white font-medium">{pr.name}</h4>
-                        <p className="text-sm text-gray-400">{getResourceTypeLabel(pr.resource_type)}</p>
-                      </div>
-                      {pr.auto_inherit && (
-                        <span className="text-xs bg-primary-500/20 text-primary-400 px-2 py-1 rounded">
-                          Auto
-                        </span>
-                      )}
+              <div className="space-y-4 max-h-96 overflow-y-auto">
+                {/* Filesystem Resources Section */}
+                {availableFilesystemResources.length > 0 && (
+                  <div>
+                    <h4 className="text-sm font-medium text-gray-300 mb-2 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                      </svg>
+                      Project Resources
+                    </h4>
+                    <div className="space-y-2">
+                      {availableFilesystemResources.map((fr) => (
+                        <button
+                          key={fr.id}
+                          onClick={() => handleImportFilesystemResource(fr)}
+                          disabled={operationPending}
+                          className="w-full p-3 bg-gray-700 rounded-lg hover:bg-gray-600 text-left disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <div className="flex items-center justify-between">
+                            <div className="min-w-0 flex-1">
+                              <h4 className="text-white font-medium truncate">{fr.name}</h4>
+                              <p className="text-sm text-gray-400">{getResourceTypeLabel(fr.resource_type)}</p>
+                              {fr.content && (
+                                <p className="text-xs text-gray-500 mt-1">
+                                  {(fr.content.length / 1024).toFixed(1)} KB
+                                </p>
+                              )}
+                            </div>
+                            <span className="text-xs bg-emerald-500/20 text-emerald-400 px-2 py-1 rounded ml-2">
+                              File
+                            </span>
+                          </div>
+                        </button>
+                      ))}
                     </div>
-                  </button>
-                ))}
+                  </div>
+                )}
+
+                {/* Shared Project Resources Section */}
+                {availableForImport.length > 0 && (
+                  <div>
+                    <h4 className="text-sm font-medium text-gray-300 mb-2 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                      </svg>
+                      Shared Resources
+                    </h4>
+                    <div className="space-y-2">
+                      {availableForImport.map((pr) => (
+                        <button
+                          key={pr.id}
+                          onClick={() => handleImportResource(pr)}
+                          disabled={operationPending}
+                          className="w-full p-3 bg-gray-700 rounded-lg hover:bg-gray-600 text-left disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <h4 className="text-white font-medium">{pr.name}</h4>
+                              <p className="text-sm text-gray-400">{getResourceTypeLabel(pr.resource_type)}</p>
+                            </div>
+                            {pr.auto_inherit && (
+                              <span className="text-xs bg-primary-500/20 text-primary-400 px-2 py-1 rounded">
+                                Auto
+                              </span>
+                            )}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

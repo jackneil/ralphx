@@ -28,6 +28,8 @@ export interface RunData {
   started_at: string | null
   completed_at: string | null
   iterations_completed: number
+  items_generated: number
+  error_message?: string
   iterations: Record<number, IterationData>
 }
 
@@ -88,10 +90,54 @@ export function useGroupedEvents({
       }
 
       const data = await response.json()
-      setRuns(data.runs || {})
+      const polledRuns: GroupedRuns = data.runs || {}
+
+      // Merge polled data with existing state, preserving live SSE events
+      // that may not have been persisted to DB yet. Without this merge,
+      // polling would overwrite SSE-inserted events causing them to flash
+      // and disappear from the UI.
+      setRuns((prev) => {
+        const merged: GroupedRuns = { ...polledRuns }
+
+        for (const [runId, prevRun] of Object.entries(prev)) {
+          for (const [iterKey, prevIter] of Object.entries(prevRun.iterations)) {
+            // Only preserve live SSE events that aren't in the polled data
+            if (!prevIter.is_live) continue
+
+            const polledRun = merged[runId]
+            if (!polledRun) continue
+
+            const polledIter = polledRun.iterations[Number(iterKey)]
+            if (!polledIter) {
+              // Polled data doesn't have this iteration yet - keep live data
+              polledRun.iterations[Number(iterKey)] = prevIter
+              continue
+            }
+
+            // Append any SSE events whose IDs are not in the polled set.
+            // SSE-generated events use large synthetic IDs (Date.now()*1000+counter)
+            // while DB events use small auto-increment IDs, so we can distinguish them.
+            const polledEventIds = new Set(polledIter.events.map((e: SessionEvent) => e.id))
+            const extraSseEvents = prevIter.events.filter(
+              (e: SessionEvent) => !polledEventIds.has(e.id) && e.id > 1_000_000_000_000
+            )
+
+            if (extraSseEvents.length > 0) {
+              polledIter.events = [...polledIter.events, ...extraSseEvents]
+            }
+
+            // Preserve the is_live flag if the previous state had it
+            if (prevIter.is_live) {
+              polledIter.is_live = true
+            }
+          }
+        }
+
+        return merged
+      })
 
       // Find the live run/iteration
-      for (const [runId, run] of Object.entries(data.runs as GroupedRuns)) {
+      for (const [runId, run] of Object.entries(polledRuns)) {
         if (run.status === 'running' || run.status === 'paused') {
           liveContextRef.current.runId = runId
           const iterations = Object.keys(run.iterations).map(Number)
@@ -114,8 +160,10 @@ export function useGroupedEvents({
   const handleSSEEvent = useCallback((event: SSEEvent) => {
     const { type, data } = event
 
-    // Skip non-content events
-    if (['heartbeat', 'connected', 'disconnected'].includes(type)) {
+    // Skip non-content events (heartbeat, connected, disconnected are control events;
+    // info is a backend status message like "No session found" that should not
+    // be inserted into the run/iteration event tree)
+    if (['heartbeat', 'connected', 'disconnected', 'info'].includes(type)) {
       return
     }
 
@@ -161,6 +209,7 @@ export function useGroupedEvents({
           started_at: null,
           completed_at: null,
           iterations_completed: 0,
+          items_generated: 0,
           iterations: {},
         }
       }
@@ -199,7 +248,7 @@ export function useGroupedEvents({
 
       return updated
     })
-  }, [])
+  }, [loopName])
 
   // SSE for live updates
   const sseUrl = enabled ? `/api/projects/${projectSlug}/loops/${loopName}/stream` : ''

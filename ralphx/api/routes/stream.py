@@ -92,7 +92,7 @@ async def event_generator(
             yield sse_event
         return
 
-    # If watching a loop, get latest session
+    # If watching a loop, get latest session and follow new sessions
     if loop_name:
         # Check for active run
         runs = project_db.list_runs(
@@ -113,26 +113,47 @@ async def event_generator(
                 "mode": run.get("current_mode"),
             })
 
-            # If running, try to tail latest session
+            # If running, tail latest session then follow new sessions
             if run_status in [RunStatus.RUNNING.value, RunStatus.PAUSED.value]:
-                session = session_manager.get_latest_session(
-                    run_id=run.get("id"),
-                )
+                run_id = run.get("id")
+                last_session_id = None
 
-                if session:
-                    async for sse_event in _tail_session(
-                        session_manager=session_manager,
-                        session_id=session.session_id,
-                        project_path=project_path,
-                        project_db=project_db,
-                        from_beginning=from_beginning,
-                        run_id=run.get("id"),
-                        iteration=session.iteration,
-                    ):
-                        yield sse_event
-                    return
-                else:
-                    yield await format_sse("info", {"message": "No session found"})
+                # Keep following new sessions until the run is no longer active.
+                # Without this loop, the SSE stream would stop streaming after
+                # the first iteration's session completes, leaving the client
+                # receiving only heartbeats for subsequent iterations.
+                while True:
+                    session = session_manager.get_latest_session(
+                        run_id=run_id,
+                    )
+
+                    if session and session.session_id != last_session_id:
+                        last_session_id = session.session_id
+                        async for sse_event in _tail_session(
+                            session_manager=session_manager,
+                            session_id=session.session_id,
+                            project_path=project_path,
+                            project_db=project_db,
+                            from_beginning=from_beginning,
+                            run_id=run_id,
+                            iteration=session.iteration,
+                        ):
+                            yield sse_event
+                        # After first session, always start from beginning for new sessions
+                        from_beginning = True
+                    else:
+                        # No new session yet - check if run is still active
+                        current_run = project_db.get_run(run_id)
+                        if not current_run or current_run.get("status") not in [
+                            RunStatus.RUNNING.value,
+                            RunStatus.PAUSED.value,
+                        ]:
+                            break
+                        # Wait briefly before checking for a new session
+                        await asyncio.sleep(2)
+                        yield await format_sse("heartbeat", {
+                            "timestamp": asyncio.get_event_loop().time(),
+                        })
             else:
                 yield await format_sse("info", {
                     "message": f"Loop not running (status: {run_status})"
@@ -259,25 +280,14 @@ async def _tail_session(
             if event.type == SessionEventType.UNKNOWN:
                 continue
 
-            # Store event to DB for history
+            # Stream events to client (persistence handled by executor)
             if event.type == SessionEventType.TEXT:
-                project_db.add_session_event(
-                    session_id=session_id,
-                    event_type="text",
-                    content=event.text,
-                )
                 yield await format_sse("text", {
                     "content": event.text,
                     **event_meta,
                 })
 
             elif event.type == SessionEventType.TOOL_CALL:
-                project_db.add_session_event(
-                    session_id=session_id,
-                    event_type="tool_call",
-                    tool_name=event.tool_name,
-                    tool_input=event.tool_input,
-                )
                 yield await format_sse("tool_call", {
                     "name": event.tool_name,
                     "input": event.tool_input,
@@ -285,12 +295,6 @@ async def _tail_session(
                 })
 
             elif event.type == SessionEventType.TOOL_RESULT:
-                project_db.add_session_event(
-                    session_id=session_id,
-                    event_type="tool_result",
-                    tool_name=event.tool_name,
-                    tool_result=event.tool_result[:1000] if event.tool_result else None,
-                )
                 yield await format_sse("tool_result", {
                     "name": event.tool_name,
                     "result": event.tool_result[:1000] if event.tool_result else None,
@@ -298,30 +302,16 @@ async def _tail_session(
                 })
 
             elif event.type == SessionEventType.ERROR:
-                project_db.add_session_event(
-                    session_id=session_id,
-                    event_type="error",
-                    error_message=event.error_message,
-                )
                 yield await format_sse("error", {
                     "message": event.error_message,
                     **event_meta,
                 })
 
             elif event.type == SessionEventType.COMPLETE:
-                project_db.add_session_event(
-                    session_id=session_id,
-                    event_type="complete",
-                )
                 yield await format_sse("complete", event_meta)
                 break
 
             elif event.type == SessionEventType.INIT:
-                project_db.add_session_event(
-                    session_id=session_id,
-                    event_type="init",
-                    raw_data=event.raw_data,
-                )
                 yield await format_sse("init", {
                     "data": event.raw_data,
                     **event_meta,
@@ -538,11 +528,18 @@ async def get_grouped_events(
     slug: str,
     loop_name: str,
     limit_runs: int = Query(5, ge=1, le=50, description="Max runs to return"),
+    limit_sessions: int = Query(20, ge=1, le=100, description="Max sessions per run"),
+    limit_events: int = Query(200, ge=1, le=1000, description="Max events per session"),
 ):
     """Get events grouped by run and iteration.
 
     Returns events organized in a tree structure:
     - runs: { run_id: { status, iterations: { iteration: { events, session_id, is_live } } } }
+
+    Limits are applied at each level to prevent unbounded data loads:
+    - limit_runs: max runs to return (default 5)
+    - limit_sessions: max sessions per run (default 20)
+    - limit_events: max events per session (default 200)
     """
     manager, project, project_db = get_project(slug)
     session_manager = SessionManager(project_db)
@@ -559,15 +556,17 @@ async def get_grouped_events(
         run_id = run.get("id")
         run_status = run.get("status", "unknown")
 
-        # Get all sessions for this run
-        sessions = session_manager.list_sessions(run_id=run_id, limit=100)
+        # Get sessions for this run (bounded)
+        sessions = session_manager.list_sessions(run_id=run_id, limit=limit_sessions)
 
         iterations = {}
         for session in sessions:
             iter_num = session.iteration
 
-            # Get events for this session
-            events = project_db.get_session_events(session.session_id)
+            # Get events for this session (bounded to prevent memory issues)
+            events = project_db.get_session_events(
+                session.session_id, limit=limit_events
+            )
 
             # Determine if this is the live session
             is_live = (
@@ -581,6 +580,7 @@ async def get_grouped_events(
                 "status": session.status,
                 "is_live": is_live,
                 "events": events,
+                "events_truncated": len(events) >= limit_events,
             }
 
         result["runs"][run_id] = {
@@ -589,6 +589,8 @@ async def get_grouped_events(
             "started_at": run.get("started_at"),
             "completed_at": run.get("completed_at"),
             "iterations_completed": run.get("iterations_completed", 0),
+            "items_generated": run.get("items_generated", 0),
+            "error_message": run.get("error_message"),
             "iterations": iterations,
         }
 

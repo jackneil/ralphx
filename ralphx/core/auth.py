@@ -128,7 +128,7 @@ class AuthStatus(BaseModel):
     """Authentication status."""
 
     connected: bool
-    scope: Optional[Literal["project", "global"]] = None
+    scope: Optional[Literal["project", "global", "account"]] = None
     email: Optional[str] = None  # User's email address
     subscription_type: Optional[str] = None
     rate_limit_tier: Optional[str] = None
@@ -357,6 +357,7 @@ def swap_credentials_for_account(
             }
             CLAUDE_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
             CLAUDE_CREDENTIALS_PATH.write_text(json.dumps(creds_data, indent=2))
+            os.chmod(CLAUDE_CREDENTIALS_PATH, 0o600)  # Restrict to owner-only read/write
             has_creds = True
 
             # Update last_used_at for the account
@@ -711,7 +712,17 @@ async def refresh_token_if_needed(
     if now < account["expires_at"] - 300:
         return True  # Token assumed valid based on expiry
 
-    return await _do_token_refresh(account, project_id)
+    # Use lock to prevent concurrent refresh operations.
+    # Re-read account inside lock in case another process already refreshed.
+    async with _token_refresh_lock():
+        # Re-fetch account to get latest token state
+        fresh_account = db.get_effective_account(project_id)
+        if not fresh_account:
+            return False
+        # Check if another process already refreshed while we waited for lock
+        if int(time.time()) < fresh_account["expires_at"] - 300:
+            return True
+        return await _do_token_refresh(fresh_account, project_id)
 
 
 async def force_refresh_token(project_id: Optional[str] = None) -> dict:
@@ -733,7 +744,13 @@ async def force_refresh_token(project_id: Optional[str] = None) -> dict:
         return {"success": False, "error": "No refresh token available"}
 
     try:
-        success = await _do_token_refresh(account, project_id)
+        # Use lock to prevent concurrent refresh operations.
+        # Re-read account inside lock in case another process already refreshed.
+        async with _token_refresh_lock():
+            fresh_account = db.get_effective_account(project_id)
+            if not fresh_account or not fresh_account.get("refresh_token"):
+                return {"success": False, "error": "No account or refresh token available"}
+            success = await _do_token_refresh(fresh_account, project_id)
         if success:
             return {"success": True, "message": "Token refreshed successfully"}
         else:
@@ -780,12 +797,16 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 7200) -> dict:
                     # Token was refreshed by another process, skip
                     continue
 
+                # Use fresh_account's refresh_token (not the pre-lock stale one)
+                # Another process may have refreshed and changed the token while we waited
+                refresh_token = fresh_account["refresh_token"] if fresh_account else account["refresh_token"]
+
                 async with httpx.AsyncClient() as client:
                     resp = await client.post(
                         TOKEN_URL,
                         json={
                             "grant_type": "refresh_token",
-                            "refresh_token": account["refresh_token"],
+                            "refresh_token": refresh_token,
                             "client_id": CLIENT_ID,
                         },
                         headers={
@@ -799,9 +820,11 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 7200) -> dict:
                         new_expires_at = int(time.time()) + tokens.get("expires_in", 28800)
 
                         # Build update dict - capture subscription/plan info if present
+                        # Use refresh_token (the fresh value used for this request) as fallback,
+                        # not account["refresh_token"] which is the pre-lock stale copy
                         update_data = {
                             "access_token": tokens["access_token"],
-                            "refresh_token": tokens.get("refresh_token", account["refresh_token"]),
+                            "refresh_token": tokens.get("refresh_token", refresh_token),
                             "expires_at": new_expires_at,
                             "consecutive_failures": 0,
                         }
@@ -830,10 +853,11 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 7200) -> dict:
                             )
                     else:
                         result["failed"] += 1
-                        # Track consecutive failures
+                        # Track consecutive failures (use fresh_account for accurate count)
+                        failure_count = (fresh_account or account).get("consecutive_failures", 0)
                         db.update_account(
                             account["id"],
-                            consecutive_failures=account.get("consecutive_failures", 0) + 1,
+                            consecutive_failures=failure_count + 1,
                         )
                         auth_log.warning(
                             "token_refresh_failed",
@@ -937,6 +961,7 @@ def swap_credentials_for_loop(
             }
             CLAUDE_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
             CLAUDE_CREDENTIALS_PATH.write_text(json.dumps(creds_data, indent=2))
+            os.chmod(CLAUDE_CREDENTIALS_PATH, 0o600)  # Restrict to owner-only read/write
             has_creds = True
 
         try:

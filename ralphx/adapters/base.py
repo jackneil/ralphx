@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 
 
 class AdapterEvent(str, Enum):
@@ -100,6 +100,8 @@ class LLMAdapter(ABC):
         tools: Optional[list[str]] = None,
         timeout: int = 300,
         json_schema: Optional[dict] = None,
+        on_session_start: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[["StreamEvent"], None]] = None,
     ) -> ExecutionResult:
         """Execute a prompt and return the result.
 
@@ -110,6 +112,8 @@ class LLMAdapter(ABC):
             timeout: Timeout in seconds.
             json_schema: Optional JSON schema for structured output validation.
                         When provided, the result will include structured_output.
+            on_session_start: Optional callback fired when session ID is available.
+            on_event: Optional callback fired for each streaming event (for persistence).
 
         Returns:
             ExecutionResult with session info and output.
@@ -174,6 +178,10 @@ class LLMAdapter(ABC):
             Marker string to append to prompt.
         """
         now = datetime.utcnow().isoformat()
+        # Sanitize values to prevent HTML comment injection (e.g., --> in mode name)
+        safe_run_id = run_id.replace("--", "").replace('"', "")
+        safe_slug = project_slug.replace("--", "").replace('"', "")
+        safe_mode = mode.replace("--", "").replace('"', "")
         return f"""
 
-<!-- RALPHX_TRACKING run_id="{run_id}" project="{project_slug}" iteration={iteration} mode="{mode}" ts="{now}" -->"""
+<!-- RALPHX_TRACKING run_id="{safe_run_id}" project="{safe_slug}" iteration={iteration} mode="{safe_mode}" ts="{now}" -->"""

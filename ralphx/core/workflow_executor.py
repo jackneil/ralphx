@@ -6,9 +6,12 @@ step transitions.
 """
 
 import asyncio
+import logging
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+_logger = logging.getLogger(__name__)
 
 from ralphx.core.executor import LoopExecutor
 from ralphx.core.loop import LoopLoader
@@ -50,6 +53,7 @@ class WorkflowExecutor:
         self.workflow_id = workflow_id
         self._on_step_change = on_step_change
         self._running_executors: dict[int, LoopExecutor] = {}
+        self._running_tasks: dict[int, asyncio.Task] = {}
 
     def get_workflow(self) -> Optional[dict]:
         """Get the current workflow."""
@@ -161,6 +165,9 @@ class WorkflowExecutor:
             # Create new loop for this step
             loop_config = self._create_step_loop(step, loop_name, loop_type)
 
+        # Save loop_name to the step record so the UI can find logs
+        self.db.update_workflow_step(step_id, loop_name=loop_name)
+
         if not loop_config:
             raise ValueError(f"Failed to create loop config for step {step_id}")
 
@@ -188,6 +195,9 @@ class WorkflowExecutor:
         # Check if architecture-first mode is enabled
         architecture_first = step_config.get("architecture_first", False)
 
+        # Get cross-step context links (for generator loops)
+        context_from_steps = step_config.get("context_from_steps") or []
+
         # Create and start executor
         executor = LoopExecutor(
             project=self.project,
@@ -197,12 +207,14 @@ class WorkflowExecutor:
             step_id=step_id,
             consume_from_step_id=consume_from_step_id,
             architecture_first=architecture_first,
+            context_from_steps=context_from_steps,
         )
 
         self._running_executors[step_id] = executor
 
-        # Run executor in background
-        asyncio.create_task(self._run_loop_and_advance(executor, step))
+        # Run executor in background (store task reference to prevent GC and enable cancellation)
+        task = asyncio.create_task(self._run_loop_and_advance(executor, step))
+        self._running_tasks[step_id] = task
 
     async def _run_loop_and_advance(
         self, executor: LoopExecutor, step: dict
@@ -241,8 +253,25 @@ class WorkflowExecutor:
             if auto_advance:
                 await self.complete_step(step_id)
 
+        except Exception:
+            _logger.exception(
+                "Unhandled exception in background loop execution for step %s",
+                step_id,
+            )
+            # Mark step as failed so the error is visible in the UI
+            try:
+                self.db.update_workflow_step(
+                    step_id,
+                    status="error",
+                    artifacts={"error": "Unexpected executor crash - check logs"},
+                )
+                self._emit_step_change(step["step_number"], "error")
+            except Exception:
+                _logger.exception("Failed to mark step %s as errored", step_id)
+
         finally:
             self._running_executors.pop(step_id, None)
+            self._running_tasks.pop(step_id, None)
 
     def _create_step_loop(
         self, step: dict, loop_name: str, loop_type: str
@@ -610,7 +639,7 @@ class WorkflowExecutor:
 
         # Stop running executors
         for executor in self._running_executors.values():
-            executor.stop()
+            await executor.stop()
 
         self.db.update_workflow(self.workflow_id, status="paused")
         return self.get_workflow()

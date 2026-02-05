@@ -210,6 +210,7 @@ export default function StepsTab({
             projectSlug={projectSlug}
             workflowId={workflowId}
             step={selectedStep}
+            allSteps={steps}
             onChange={handleUpdateStep}
             onClone={() => handleCloneStep(selectedIndex!)}
             onArchive={() => handleArchiveStep(selectedIndex!)}

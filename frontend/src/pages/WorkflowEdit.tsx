@@ -9,8 +9,9 @@ import {
   reorderWorkflowSteps,
   listWorkflowResources,
   listProjectResources,
+  listResources,
 } from '../api'
-import type { Workflow, WorkflowStep, WorkflowResource, ProjectResource } from '../api'
+import type { Workflow, WorkflowStep, WorkflowResource, ProjectResource, Resource } from '../api'
 import EditorHeader from '../components/workflow/editor/EditorHeader'
 import OverviewTab from '../components/workflow/editor/OverviewTab'
 import StepsTab from '../components/workflow/editor/StepsTab'
@@ -33,6 +34,7 @@ export default function WorkflowEdit() {
   const [steps, setSteps] = useState<WorkflowStep[]>([])
   const [resources, setResources] = useState<WorkflowResource[]>([])
   const [projectResources, setProjectResources] = useState<ProjectResource[]>([])
+  const [filesystemResources, setFilesystemResources] = useState<Resource[]>([])
 
   // UI state
   const [activeTab, setActiveTab] = useState<EditorTab>('overview')
@@ -59,12 +61,14 @@ export default function WorkflowEdit() {
   const loadResources = useCallback(async () => {
     if (!slug || !workflowId || !workflow) return
     try {
-      const [wfResources, projResources] = await Promise.all([
+      const [wfResources, projResources, fsResources] = await Promise.all([
         listWorkflowResources(slug, workflow.id),
         listProjectResources(slug),
+        listResources(slug, { include_content: true }),
       ])
       setResources(wfResources)
       setProjectResources(projResources)
+      setFilesystemResources(fsResources)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load resources')
     }
@@ -143,6 +147,9 @@ export default function WorkflowEdit() {
             stepData.max_iterations = step.config?.max_iterations
             stepData.cooldown_between_iterations = step.config?.cooldown_between_iterations
             stepData.max_consecutive_errors = step.config?.max_consecutive_errors
+            if (step.config?.context_from_steps?.length) {
+              stepData.context_from_steps = step.config.context_from_steps
+            }
           }
           const created = await createWorkflowStep(slug, workflow.id, stepData)
           finalStepIds.push(created.id)
@@ -162,7 +169,8 @@ export default function WorkflowEdit() {
             originalStep.config?.max_iterations !== step.config?.max_iterations ||
             originalStep.config?.cooldown_between_iterations !== step.config?.cooldown_between_iterations ||
             originalStep.config?.max_consecutive_errors !== step.config?.max_consecutive_errors ||
-            originalStep.config?.customPrompt !== step.config?.customPrompt
+            originalStep.config?.customPrompt !== step.config?.customPrompt ||
+            JSON.stringify(originalStep.config?.context_from_steps) !== JSON.stringify(step.config?.context_from_steps)
           )
           if (configChanged) {
             const updateData: Parameters<typeof updateWorkflowStep>[3] = {
@@ -183,6 +191,10 @@ export default function WorkflowEdit() {
               // Send custom_prompt (empty string to clear, undefined to skip)
               if (step.config?.customPrompt !== undefined) {
                 updateData.custom_prompt = step.config.customPrompt || ''
+              }
+              // Send context_from_steps (empty array clears, undefined skips)
+              if (step.config?.context_from_steps !== undefined) {
+                updateData.context_from_steps = step.config.context_from_steps
               }
             }
             await updateWorkflowStep(slug, workflow.id, step.id, updateData)
@@ -353,6 +365,7 @@ export default function WorkflowEdit() {
             workflowId={workflow.id}
             resources={resources}
             projectResources={projectResources}
+            filesystemResources={filesystemResources}
             onResourcesChange={loadResources}
             onError={(err) => setError(err)}
           />

@@ -23,7 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Optional
 
-from ralphx.adapters.base import ExecutionResult, LLMAdapter
+from ralphx.adapters.base import AdapterEvent, ExecutionResult, LLMAdapter, StreamEvent
 from ralphx.adapters.claude_cli import ClaudeCLIAdapter
 from ralphx.core.dependencies import DependencyGraph, order_items_by_dependency
 from ralphx.core.project_db import ProjectDatabase
@@ -47,6 +47,7 @@ class ExecutorEvent(str, Enum):
     GIT_COMMIT = "git_commit"  # Git commit after successful iteration
     ERROR = "error"
     WARNING = "warning"
+    INFO = "info"
     HEARTBEAT = "heartbeat"
     RUN_PAUSED = "run_paused"
     RUN_RESUMED = "run_resumed"
@@ -123,6 +124,7 @@ class LoopExecutor:
         batch_size: int = 10,
         consume_from_step_id: Optional[int] = None,
         architecture_first: bool = False,
+        context_from_steps: Optional[list[int]] = None,
     ):
         """Initialize the executor.
 
@@ -142,6 +144,8 @@ class LoopExecutor:
             consume_from_step_id: For consumer loops, the step ID to consume items from.
             architecture_first: If True, prioritize foundational stories (FND, DBM, SEC, ARC)
                                for new codebases. Batches them together for initial build.
+            context_from_steps: For generator loops, additional step IDs whose items
+                               should be included as existing context (avoid duplicates).
         """
         self.project = project
         self.config = loop_config
@@ -149,6 +153,7 @@ class LoopExecutor:
         self.workflow_id = workflow_id
         self.step_id = step_id
         self._consume_from_step_id = consume_from_step_id
+        self._context_from_steps = context_from_steps or []
         # Create adapter with per-loop settings path for permission templates
         # Pass project_id for credential lookup (project-scoped auth)
         if adapter is None:
@@ -403,15 +408,24 @@ class LoopExecutor:
             mode_name = list(modes.keys())[0]
             return mode_name, modes[mode_name]
 
-    def _resolve_loop_resource_content(self, resource: dict) -> Optional[str]:
+    def _resolve_loop_resource_content(self, resource: dict, _depth: int = 0) -> Optional[str]:
         """Resolve content for a loop resource based on its source_type.
 
         Args:
             resource: Loop resource dict from database.
+            _depth: Internal recursion depth counter (max 5 to prevent cycles).
 
         Returns:
             Resolved content string, or None if unable to resolve.
         """
+        if _depth > 5:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"[RESOLVE] Max recursion depth reached resolving loop resource "
+                f"(possible circular loop_ref). Resource: {resource.get('name', 'unknown')}"
+            )
+            return None
+
         source_type = resource.get("source_type", "")
 
         if source_type == "system":
@@ -425,22 +439,30 @@ class LoopExecutor:
             return None
 
         elif source_type == "project_file":
-            # Load from project file path
+            # Load from project file path (must stay within project directory)
             source_path = resource.get("source_path")
             if source_path:
-                file_path = Path(self.project.path) / source_path
+                file_path = (Path(self.project.path) / source_path).resolve()
+                project_root = Path(self.project.path).resolve()
+                # Prevent path traversal outside project directory
+                if not str(file_path).startswith(str(project_root) + "/") and file_path != project_root:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"[RESOLVE] Path traversal blocked: {source_path} resolves outside project"
+                    )
+                    return None
                 if file_path.exists():
                     return file_path.read_text()
             return None
 
         elif source_type == "loop_ref":
-            # Load from another loop's resource (recursively)
+            # Load from another loop's resource (recursively, with depth limit)
             source_loop = resource.get("source_loop")
             source_resource_id = resource.get("source_resource_id")
             if source_loop and source_resource_id:
                 source_resource = self.db.get_loop_resource(source_resource_id)
                 if source_resource:
-                    return self._resolve_loop_resource_content(source_resource)
+                    return self._resolve_loop_resource_content(source_resource, _depth=_depth + 1)
             return None
 
         elif source_type == "project_resource":
@@ -528,7 +550,7 @@ class LoopExecutor:
 
         return "\n".join(sections)
 
-    def _load_prompt_template(self, mode: Mode) -> str:
+    def _load_prompt_template(self, mode: Mode, loop_resources: Optional[list[dict]] = None) -> str:
         """Load prompt template for a mode.
 
         Priority order:
@@ -539,12 +561,14 @@ class LoopExecutor:
 
         Args:
             mode: Mode configuration.
+            loop_resources: Pre-loaded loop resources (avoids redundant DB query).
 
         Returns:
             Prompt template content.
         """
         # Priority 1: Check for loop-level LOOP_TEMPLATE resource
-        loop_resources = self._load_loop_resources()
+        if loop_resources is None:
+            loop_resources = self._load_loop_resources()
         for resource in loop_resources:
             if (resource.get("resource_type") == "loop_template" and
                 resource.get("injection_position") == "template_body"):
@@ -627,10 +651,11 @@ class LoopExecutor:
         Returns:
             Complete prompt with all resources and tracking marker.
         """
-        template = self._load_prompt_template(mode)
-
         # Load loop-specific resources first (from loop_resources table)
+        # Pass to _load_prompt_template to avoid redundant DB query
         loop_resources = self._load_loop_resources()
+
+        template = self._load_prompt_template(mode, loop_resources=loop_resources)
 
         # Also load project-level resources as fallback
         resource_manager = ResourceManager(self.project.path, db=self.db)
@@ -692,6 +717,17 @@ class LoopExecutor:
             escaped_design_doc = self._escape_template_vars(design_doc_content)
             template = template.replace("{DESIGN_DOC}", escaped_design_doc)
 
+        # Substitute {{design_doc}} (RalphX style) with actual design doc content
+        # Note: {{design_doc}} may have already been used as a position marker for
+        # after_design_doc resources above, but the marker text itself remains.
+        # Replace it with the actual design doc content (or empty string if none).
+        if "{{design_doc}}" in template:
+            if design_doc_content:
+                escaped_design_doc = self._escape_template_vars(design_doc_content)
+                template = template.replace("{{design_doc}}", escaped_design_doc)
+            else:
+                template = template.replace("{{design_doc}}", "")
+
         # BEFORE_TASK: Insert before the main task instruction
         # Look for {{task}} marker or insert near the end
         if before_task:
@@ -701,9 +737,20 @@ class LoopExecutor:
                 # Append before the final section
                 template = template + "\n\n" + before_task
 
-        # AFTER_TASK: Append at the end
-        if after_task:
+        # AFTER_TASK: Append at the end, unless the template has a dedicated
+        # {{custom_context}} placeholder (which serves the same purpose)
+        if "{{custom_context}}" in template:
+            # Template has a designated place for custom context - substitute there
+            template = template.replace("{{custom_context}}", after_task or "")
+        elif after_task:
+            # No placeholder - append at end
             template = template + "\n\n" + after_task
+
+        # Substitute {{backlog_status}} for hybrid loops
+        # Shows current item counts to help mode detection
+        if "{{backlog_status}}" in template:
+            backlog_status = self._build_backlog_status()
+            template = template.replace("{{backlog_status}}", backlog_status)
 
         # Inject generator loop context (existing stories, category stats, inputs)
         # This MUST happen before any variable substitution
@@ -776,7 +823,7 @@ class LoopExecutor:
         # Support both {{implemented_summary}} (RalphX style) and {IMPLEMENTED_SUMMARY} (hank-rcm style)
         if self._is_consumer_loop():
             if "{{implemented_summary}}" in template or "{IMPLEMENTED_SUMMARY}" in template:
-                impl_summary = self._build_implemented_summary()
+                impl_summary = self._escape_template_vars(self._build_implemented_summary())
                 template = template.replace("{{implemented_summary}}", impl_summary)
                 template = template.replace("{IMPLEMENTED_SUMMARY}", impl_summary)
 
@@ -807,7 +854,48 @@ class LoopExecutor:
             )
             template = template + marker
 
+        # Warn if prompt exceeds reasonable size (200K chars ~ 50K tokens)
+        prompt_size = len(template)
+        if prompt_size > 200_000:
+            self._emit_event(
+                ExecutorEvent.WARNING,
+                f"Prompt is very large ({prompt_size:,} chars, ~{prompt_size // 4:,} tokens). "
+                f"This may exceed the model's context window. Consider reducing resource sizes.",
+            )
+
         return template
+
+    def _build_backlog_status(self) -> str:
+        """Build backlog status summary for hybrid loop templates.
+
+        Shows the current state of work items to help the hybrid template
+        decide whether to generate new items or implement existing ones.
+
+        Returns:
+            Status string describing pending/completed item counts.
+        """
+        try:
+            # Get all items for this workflow step
+            all_items, total = self.db.list_work_items(
+                workflow_id=self.workflow_id,
+                source_step_id=self.step_id,
+                limit=10000,
+            )
+
+            if total == 0:
+                return "Backlog is EMPTY. No work items exist yet."
+
+            # Count by status
+            pending = sum(1 for i in all_items if i.get("status") == "pending")
+            completed = sum(1 for i in all_items if i.get("status") in ("completed", "processed"))
+            in_progress = sum(1 for i in all_items if i.get("status") == "in_progress")
+
+            return (
+                f"Backlog has {total} items: "
+                f"{pending} pending, {in_progress} in progress, {completed} completed."
+            )
+        except Exception:
+            return "Backlog status unavailable."
 
     def _is_consumer_loop(self) -> bool:
         """Check if this loop consumes items from another loop.
@@ -873,6 +961,15 @@ class LoopExecutor:
             limit=10000,  # Get all existing items
         )
 
+        # Also include items from linked context steps (cross-step visibility)
+        for ctx_step_id in self._context_from_steps:
+            ctx_items, _ = self.db.list_work_items(
+                workflow_id=self.workflow_id,
+                source_step_id=ctx_step_id,
+                limit=10000,
+            )
+            existing_items.extend(ctx_items)
+
         # 2. Build category stats with next available ID
         category_stats: dict[str, dict] = {}
         for item in existing_items:
@@ -920,10 +1017,13 @@ class LoopExecutor:
             json.dumps(category_stats, indent=2)
         )
 
+        # Escape inputs_list to prevent template injection from filenames
+        inputs_list_escaped = self._escape_template_vars(inputs_list)
+
         template = template.replace("{{existing_stories}}", existing_stories_json)
         template = template.replace("{{category_stats}}", category_stats_json)
         template = template.replace("{{total_stories}}", str(len(existing_items)))
-        template = template.replace("{{inputs_list}}", inputs_list)
+        template = template.replace("{{inputs_list}}", inputs_list_escaped)
 
         return template
 
@@ -1637,9 +1737,13 @@ class LoopExecutor:
             if self._is_consumer_loop() and not self._batch_mode:
                 json_schema = IMPLEMENTATION_STATUS_SCHEMA
 
+            # Mutable holder for session_id (set by INIT event before other events)
+            session_id_holder: list[Optional[str]] = [None]
+
             # Callback to register session immediately when it starts
             # This enables live streaming in the UI before execution completes
             def register_session_early(session_id: str) -> None:
+                session_id_holder[0] = session_id
                 if self._run:
                     self.db.create_session(
                         session_id=session_id,
@@ -1649,6 +1753,55 @@ class LoopExecutor:
                         status="running",
                     )
 
+            # Callback to persist events to DB for history/debugging
+            def persist_event(event: StreamEvent) -> None:
+                sid = session_id_holder[0]
+                if not sid:
+                    return
+                try:
+                    if event.type == AdapterEvent.INIT:
+                        self.db.add_session_event(
+                            session_id=sid,
+                            event_type="init",
+                            raw_data=event.data if event.data else None,
+                        )
+                    elif event.type == AdapterEvent.TEXT and event.text:
+                        self.db.add_session_event(
+                            session_id=sid,
+                            event_type="text",
+                            content=event.text,
+                        )
+                    elif event.type == AdapterEvent.TOOL_USE:
+                        self.db.add_session_event(
+                            session_id=sid,
+                            event_type="tool_call",
+                            tool_name=event.tool_name,
+                            tool_input=event.tool_input,
+                        )
+                    elif event.type == AdapterEvent.TOOL_RESULT:
+                        self.db.add_session_event(
+                            session_id=sid,
+                            event_type="tool_result",
+                            tool_name=event.tool_name,
+                            tool_result=event.tool_result[:1000] if event.tool_result else None,
+                        )
+                    elif event.type == AdapterEvent.ERROR:
+                        self.db.add_session_event(
+                            session_id=sid,
+                            event_type="error",
+                            error_message=event.error_message,
+                        )
+                    elif event.type == AdapterEvent.COMPLETE:
+                        self.db.add_session_event(
+                            session_id=sid,
+                            event_type="complete",
+                        )
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).debug(
+                        f"[PERSIST] Failed to persist {event.type} event for session {sid}: {exc}"
+                    )
+
             exec_result = await self.adapter.execute(
                 prompt=prompt,
                 model=mode.model,
@@ -1656,6 +1809,7 @@ class LoopExecutor:
                 timeout=mode.timeout,
                 json_schema=json_schema,
                 on_session_start=register_session_early,
+                on_event=persist_event,
             )
 
             result.session_id = exec_result.session_id
@@ -1945,8 +2099,8 @@ class LoopExecutor:
                         generator_done = True
                         stop_reason = f"Generator signaled completion after {self._iteration} iterations, {self._items_generated} items"
 
-                    elif effective_max <= 0 and self._no_items_streak >= 3:
-                        # Unlimited mode (-1 or 0) and 3 consecutive empty iterations
+                    elif self._no_items_streak >= 3:
+                        # 3 consecutive empty iterations — extraction is exhausted
                         generator_done = True
                         stop_reason = f"Generator exhausted (3 empty iterations), {self._items_generated} items generated"
 

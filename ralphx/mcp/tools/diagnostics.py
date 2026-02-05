@@ -243,7 +243,7 @@ def get_stop_reason(
         if sessions:
             last_session = sessions[-1]
             events = project_db.get_session_events(
-                session_id=last_session["id"],
+                session_id=last_session.get("session_id", last_session.get("id")),
                 event_type="error",
                 limit=5,
             )

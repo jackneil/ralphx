@@ -446,9 +446,14 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                   </div>
                   <div className="text-gray-400 text-sm mt-0.5 flex items-center gap-2">
                     {account.subscription_type ? (
-                      <span className="capitalize font-medium text-gray-300">{account.subscription_type}</span>
+                      <span className="capitalize font-medium text-gray-300">
+                        {account.subscription_type}
+                        {account.rate_limit_tier?.includes('20x') && ' 20x'}
+                      </span>
+                    ) : account.usage ? (
+                      <span className="text-gray-400">Claude</span>
                     ) : (
-                      <span className="text-gray-500">Unknown plan</span>
+                      <span className="text-gray-500">Not verified</span>
                     )}
                     <span className="text-gray-600">&middot;</span>
                     <span>{account.projects_using} project{account.projects_using !== 1 ? 's' : ''}</span>
@@ -502,6 +507,14 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                           d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
                         />
                       </svg>
+                    </button>
+                    <button
+                      onClick={() => handleAddAccount(account.email)}
+                      disabled={addingAccount}
+                      className="px-2 py-1 text-xs text-gray-400 hover:text-white hover:bg-gray-600 rounded"
+                      title="Re-authenticate this account"
+                    >
+                      Re-auth
                     </button>
                     <button
                       onClick={() => handleToggleActive(account)}

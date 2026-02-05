@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { Link, useParams, useNavigate } from 'react-router-dom'
 import Swal from 'sweetalert2'
 import {
@@ -6,11 +6,15 @@ import {
   runSpecificStep,
   stopWorkflow,
   advanceWorkflowStep,
+  updateWorkflowStep,
+  reopenWorkflowStep,
 } from '../api'
 import type { Workflow } from '../api'
-import PlanningChat from '../components/planning/PlanningChat'
+import PlanningIterationPanel from '../components/planning/PlanningIterationPanel'
+import PlanningSessionHistory from '../components/planning/PlanningSessionHistory'
 import SessionHistory from '../components/SessionHistory'
 import WorkflowItemsTab from '../components/workflow/WorkflowItemsTab'
+import DesignDocCard from '../components/workflow/DesignDocCard'
 
 type TabType = 'overview' | 'logs' | 'items'
 
@@ -27,6 +31,8 @@ export default function StepDetail() {
   const [error, setError] = useState<string | null>(null)
   const [actionLoading, setActionLoading] = useState(false)
   const [activeTab, setActiveTab] = useState<TabType>('overview')
+  const [justStartedRun, setJustStartedRun] = useState(false)
+  const justStartedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const stepNum = stepNumber ? parseInt(stepNumber, 10) : null
 
@@ -47,16 +53,35 @@ export default function StepDetail() {
     loadWorkflow()
   }, [loadWorkflow])
 
-  // Poll for updates when step is running
+  // Cleanup justStartedRun timer on unmount
+  useEffect(() => {
+    return () => {
+      if (justStartedTimerRef.current) {
+        clearTimeout(justStartedTimerRef.current)
+      }
+    }
+  }, [])
+
+  // Poll for updates when step is running or just started
   useEffect(() => {
     if (!workflow) return
 
     const step = workflow.steps?.find(s => s.step_number === stepNum)
-    if (!step?.has_active_run) return
+    const isRunning = step?.has_active_run
+    if (!isRunning && !justStartedRun) return
+
+    // Once backend confirms run is active, clear the startup flag and its timer
+    if (isRunning && justStartedRun) {
+      setJustStartedRun(false)
+      if (justStartedTimerRef.current) {
+        clearTimeout(justStartedTimerRef.current)
+        justStartedTimerRef.current = null
+      }
+    }
 
     const interval = setInterval(loadWorkflow, 2000)
     return () => clearInterval(interval)
-  }, [workflow, stepNum, loadWorkflow])
+  }, [workflow, stepNum, loadWorkflow, justStartedRun])
 
   // Get current step
   const steps = workflow?.steps || []
@@ -101,6 +126,20 @@ export default function StepDetail() {
     try {
       const updated = await runSpecificStep(slug, workflowId, stepNum)
       setWorkflow(updated)
+      // Force polling until backend confirms the run exists
+      setJustStartedRun(true)
+      // Clear any previous timer before setting a new one (double-click protection)
+      if (justStartedTimerRef.current) {
+        clearTimeout(justStartedTimerRef.current)
+      }
+      justStartedTimerRef.current = setTimeout(() => {
+        setJustStartedRun(false)
+        justStartedTimerRef.current = null
+        // Reload workflow to check for errors - the run may have failed
+        // to start and we need to surface that to the user rather than
+        // silently reverting to a "not running" state.
+        loadWorkflow()
+      }, 15000)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to run step')
     } finally {
@@ -127,6 +166,14 @@ export default function StepDetail() {
     if (!result.isConfirmed) return
 
     setActionLoading(true)
+    // Clear justStartedRun immediately on stop intent, regardless of API result.
+    // If the backend run hasn't been created yet, the stop API may fail,
+    // but the user clearly wants to abort — don't leave them stuck in "Running" state.
+    setJustStartedRun(false)
+    if (justStartedTimerRef.current) {
+      clearTimeout(justStartedTimerRef.current)
+      justStartedTimerRef.current = null
+    }
     try {
       const updated = await stopWorkflow(slug, workflowId)
       setWorkflow(updated)
@@ -147,6 +194,53 @@ export default function StepDetail() {
       setError(err instanceof Error ? err.message : 'Failed to advance workflow')
     } finally {
       setActionLoading(false)
+    }
+  }
+
+  const handleReopenStep = async () => {
+    if (!slug || !workflowId || !step || !workflow) return
+
+    // Check if there are later completed/skipped steps that will be reset
+    const laterAffectedSteps = workflow.steps.filter(
+      s => s.step_number > step.step_number && (s.status === 'completed' || s.status === 'skipped' || s.status === 'active')
+    )
+    if (laterAffectedSteps.length > 0) {
+      const result = await Swal.fire({
+        title: 'Reopen step?',
+        text: `This will also reset ${laterAffectedSteps.length} later step${laterAffectedSteps.length > 1 ? 's' : ''} back to pending.`,
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonText: 'Reopen',
+        cancelButtonText: 'Cancel',
+        background: 'var(--color-surface)',
+        color: 'var(--color-text-primary)',
+      })
+      if (!result.isConfirmed) return
+    }
+
+    setActionLoading(true)
+    try {
+      const updated = await reopenWorkflowStep(slug, workflowId, step.id)
+      setWorkflow(updated)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to reopen step')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  const handleLinkDesignDoc = async (designDocPath: string) => {
+    if (!slug || !workflowId || !step) return
+    try {
+      // Update the step config with the design_doc_path
+      await updateWorkflowStep(slug, workflowId, step.id, {
+        design_doc_path: designDocPath,
+      })
+      // Reload the workflow to get updated step config
+      loadWorkflow()
+    } catch (err) {
+      console.error('Failed to link design doc:', err)
+      setError(err instanceof Error ? err.message : 'Failed to link design doc')
     }
   }
 
@@ -182,8 +276,11 @@ export default function StepDetail() {
 
   const isInteractiveStep = step.step_type === 'interactive'
   const isAutonomousStep = step.step_type === 'autonomous'
-  const isRunning = step.has_active_run === true
+  const isRunning = step.has_active_run === true || justStartedRun
   const isCurrentActiveStep = step.step_number === workflow.current_step && step.status === 'active'
+
+  // Determine if this is a design_doc step (interactive steps are typically design_doc steps)
+  const isDesignDocStep = isInteractiveStep || step.config?.loopType === 'design_doc'
 
   // Calculate items count for this step
   const itemsCount = step.items_generated || 0
@@ -280,6 +377,20 @@ export default function StepDetail() {
               </button>
             )}
 
+            {/* Reopen button - show for completed/skipped steps when workflow isn't completed */}
+            {(step.status === 'completed' || step.status === 'skipped') && workflow.status !== 'completed' && (
+              <button
+                onClick={handleReopenStep}
+                disabled={actionLoading}
+                className="flex items-center space-x-2 px-4 py-2 border border-gray-600 text-gray-300 rounded hover:bg-gray-700 transition-colors disabled:opacity-50"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                <span>Reopen</span>
+              </button>
+            )}
+
             {/* Edit button */}
             <button
               onClick={() => navigate(`/projects/${slug}/workflows/${workflowId}/edit`)}
@@ -348,28 +459,41 @@ export default function StepDetail() {
             )}
           </button>
         )}
-        <button
-          onClick={() => setActiveTab('items')}
-          className={`px-4 py-3 text-sm font-medium transition-colors relative flex items-center gap-2
-            ${activeTab === 'items'
-              ? 'text-cyan-400'
-              : 'text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)]'}`}
-        >
-          Items
-          {itemsCount > 0 && (
-            <span className="px-1.5 py-0.5 text-xs rounded-full bg-cyan-500/20 text-cyan-400">
-              {itemsCount}
-            </span>
-          )}
-          {activeTab === 'items' && (
-            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-cyan-500" />
-          )}
-        </button>
+        {/* Hide Items tab for design_doc steps */}
+        {!isDesignDocStep && (
+          <button
+            onClick={() => setActiveTab('items')}
+            className={`px-4 py-3 text-sm font-medium transition-colors relative flex items-center gap-2
+              ${activeTab === 'items'
+                ? 'text-cyan-400'
+                : 'text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)]'}`}
+          >
+            Items
+            {itemsCount > 0 && (
+              <span className="px-1.5 py-0.5 text-xs rounded-full bg-cyan-500/20 text-cyan-400">
+                {itemsCount}
+              </span>
+            )}
+            {activeTab === 'items' && (
+              <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-cyan-500" />
+            )}
+          </button>
+        )}
       </div>
 
       {/* Tab Content */}
       {activeTab === 'overview' && (
         <div className="space-y-6">
+          {/* Design Doc Card - show for design_doc steps */}
+          {isDesignDocStep && (
+            <DesignDocCard
+              projectSlug={slug!}
+              designDocPath={step.config?.design_doc_path}
+              stepStatus={step.status}
+              onLinkFile={handleLinkDesignDoc}
+            />
+          )}
+
           {/* Step Info Card */}
           <div className="card">
             <h2 className="text-lg font-semibold text-white mb-4">Step Configuration</h2>
@@ -408,13 +532,15 @@ export default function StepDetail() {
             )}
           </div>
 
-          {/* Interactive Step: Show Chat if active */}
+          {/* Interactive Step: Show Iteration Panel if active */}
           {isInteractiveStep && isCurrentActiveStep && (
             <div className="card">
-              <h2 className="text-lg font-semibold text-white mb-4">Planning Chat</h2>
-              <PlanningChat
+              <h2 className="text-lg font-semibold text-white mb-4">Design Document</h2>
+              <PlanningIterationPanel
                 projectSlug={slug!}
                 workflowId={workflowId!}
+                stepId={step.id}
+                designDocPath={step.config?.design_doc_path}
                 onComplete={loadWorkflow}
               />
             </div>
@@ -444,6 +570,15 @@ export default function StepDetail() {
                 </>
               )}
             </div>
+          )}
+
+          {/* Planning Session History - show for design_doc steps that are not pending */}
+          {isDesignDocStep && step.status !== 'pending' && (
+            <PlanningSessionHistory
+              projectSlug={slug!}
+              workflowId={workflowId!}
+              stepId={step.id}
+            />
           )}
 
           {/* Autonomous Step: Show preview of logs */}
@@ -503,7 +638,7 @@ export default function StepDetail() {
         </div>
       )}
 
-      {activeTab === 'items' && (
+      {activeTab === 'items' && !isDesignDocStep && (
         <div className="card">
           <WorkflowItemsTab
             projectSlug={slug!}

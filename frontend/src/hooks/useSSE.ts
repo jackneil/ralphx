@@ -76,17 +76,25 @@ export function useSSE({
       }
 
       eventSource.onerror = (e) => {
+        // Close the EventSource immediately to prevent the browser's native
+        // auto-reconnect from firing additional onerror events, which could
+        // cause multiple concurrent reconnection timeouts and leaked EventSources.
+        eventSource.close()
+        eventSourceRef.current = null
         setIsConnected(false)
         onError?.(e)
 
-        // Attempt reconnection
+        // Attempt reconnection (only if no retry is already scheduled)
+        if (retryTimeoutRef.current) return
         if (retriesRef.current < maxRetries) {
           retriesRef.current += 1
           setError(`Connection lost. Retrying (${retriesRef.current}/${maxRetries})...`)
-          retryTimeoutRef.current = setTimeout(connect, retryInterval)
+          retryTimeoutRef.current = setTimeout(() => {
+            retryTimeoutRef.current = null
+            connect()
+          }, retryInterval)
         } else {
           setError('Connection failed after maximum retries')
-          eventSource.close()
         }
       }
 

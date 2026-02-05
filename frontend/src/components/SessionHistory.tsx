@@ -311,6 +311,7 @@ function RunSection({
       case 'paused': return 'status-dot-paused'
       case 'completed': return 'status-dot-completed'
       case 'aborted': return 'status-dot-aborted'
+      case 'error': return 'status-dot-aborted'
       default: return ''
     }
   }
@@ -321,6 +322,7 @@ function RunSection({
       case 'paused': return 'badge-pending'
       case 'completed': return 'badge-completed'
       case 'aborted': return 'badge-aborted'
+      case 'error': return 'badge-aborted'
       default: return 'badge-pending'
     }
   }
@@ -374,6 +376,37 @@ function RunSection({
         className={`overflow-hidden transition-all duration-300 ${isExpanded ? 'max-h-[3000px] opacity-100' : 'max-h-0 opacity-0'}`}
       >
         <div className="ml-4 pl-4 border-l-2 border-[var(--color-border)] space-y-0.5">
+          {/* Error banner for aborted/error runs */}
+          {(run.status === 'aborted' || run.status === 'error') && run.error_message && (
+            <div className={`flex items-start gap-2 px-3 py-2 rounded-lg text-xs font-mono mb-2 ${
+              run.status === 'error'
+                ? 'bg-red-500/10 border border-red-500/20 text-red-400'
+                : 'bg-amber-500/10 border border-amber-500/20 text-amber-400'
+            }`}>
+              <svg className="w-3.5 h-3.5 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+              <span className="break-all max-h-24 overflow-y-auto block">{run.error_message}</span>
+            </div>
+          )}
+
+          {/* Run metadata row */}
+          <div className="flex items-center gap-4 px-3 py-1.5 text-xs font-mono text-[var(--color-text-muted)]">
+            {run.started_at && run.completed_at && (
+              <span title="Duration">
+                {(() => {
+                  const ms = new Date(run.completed_at).getTime() - new Date(run.started_at).getTime()
+                  const secs = Math.floor(ms / 1000)
+                  return secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`
+                })()}
+              </span>
+            )}
+            <span>{run.iterations_completed} iteration{run.iterations_completed !== 1 ? 's' : ''}</span>
+            {run.items_generated > 0 && (
+              <span>{run.items_generated} items</span>
+            )}
+          </div>
+
           {iterationEntries.map(([iteration, data]) => (
             <IterationSection
               key={`${runId}-${iteration}`}

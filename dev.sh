@@ -50,7 +50,7 @@ cleanup() {
 
 trap cleanup SIGINT SIGTERM SIGHUP
 
-uvicorn ralphx.api.main:app --reload --port $BACKEND_PORT &
+uvicorn ralphx.api.main:app --reload --reload-dir=ralphx --port $BACKEND_PORT &
 BACKEND_PID=$!
 
 cd frontend && npm run dev &

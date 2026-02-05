@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
-import type { WorkflowStep, TemplateVariableInfo } from '../../../api'
-import { getDefaultStepPrompt } from '../../../api'
+import type { WorkflowStep, TemplateVariableInfo, DesignDocFile } from '../../../api'
+import { getDefaultStepPrompt, listDesignDocFiles, createDesignDocFile } from '../../../api'
 import { validatePrompt, isPromptModified } from '../../../utils/promptValidation'
 
 // Processing type definitions with their associated settings
@@ -32,7 +32,7 @@ const PROCESSING_TYPES: Record<ProcessingType, ProcessingTypeConfig> = {
     icon: 'chat',
     step_type: 'interactive',
     loopType: 'design_doc',
-    defaultTools: ['WebSearch', 'WebFetch', 'Bash', 'Read', 'Glob', 'Grep'],  // Web research + codebase exploration
+    defaultTools: ['WebSearch', 'WebFetch', 'Bash', 'Read', 'Glob', 'Grep', 'Edit', 'Write'],  // Web research + codebase exploration + file editing
     defaults: {
       model: 'opus',
       timeout: 300,  // Per-response timeout (interactive)
@@ -149,6 +149,11 @@ function getModifiedFields(step: WorkflowStep, currentType: ProcessingType): str
     modified.push('Custom AI Instructions')
   }
 
+  // Check context_from_steps
+  if (config.context_from_steps && config.context_from_steps.length > 0) {
+    modified.push(`Context from Steps (${config.context_from_steps.length} selected)`)
+  }
+
   // Check tools - compare sorted arrays
   // Only consider tools modified if allowedTools was explicitly set (not undefined)
   // An undefined allowedTools means "use defaults" and shouldn't trigger modification warning
@@ -165,16 +170,25 @@ function getModifiedFields(step: WorkflowStep, currentType: ProcessingType): str
 
 interface StepSettingsProps {
   step: WorkflowStep
+  projectSlug: string
+  allSteps: WorkflowStep[]
   onChange: (step: WorkflowStep) => void
 }
 
-export default function StepSettings({ step, onChange }: StepSettingsProps) {
+export default function StepSettings({ step, projectSlug, allSteps, onChange }: StepSettingsProps) {
   const currentProcessingType = getProcessingType(step)
   const currentTypeConfig = PROCESSING_TYPES[currentProcessingType]
 
   // Lock processing type if any iterations have been run
   const hasIterations = (step.iterations_completed || 0) > 0 || (step.items_generated || 0) > 0
   const isProcessingTypeLocked = hasIterations
+
+  // Design doc file state (for design_doc processing type)
+  const [designDocFiles, setDesignDocFiles] = useState<DesignDocFile[]>([])
+  const [loadingDesignDocFiles, setLoadingDesignDocFiles] = useState(false)
+  const [showCreateFileModal, setShowCreateFileModal] = useState(false)
+  const [newFileName, setNewFileName] = useState('')
+  const [creatingFile, setCreatingFile] = useState(false)
 
   // AI Instructions (Advanced) state
   const [promptExpanded, setPromptExpanded] = useState(false)
@@ -228,6 +242,42 @@ export default function StepSettings({ step, onChange }: StepSettingsProps) {
     fetchDefaultPrompt()
   }, [fetchDefaultPrompt])
 
+  // Load design doc files when processing type is design_doc
+  const loadDesignDocFiles = useCallback(async () => {
+    if (currentProcessingType !== 'design_doc') return
+    setLoadingDesignDocFiles(true)
+    try {
+      const files = await listDesignDocFiles(projectSlug)
+      setDesignDocFiles(files)
+    } catch (err) {
+      console.error('Failed to load design doc files:', err)
+    } finally {
+      setLoadingDesignDocFiles(false)
+    }
+  }, [projectSlug, currentProcessingType])
+
+  useEffect(() => {
+    loadDesignDocFiles()
+  }, [loadDesignDocFiles])
+
+  const handleCreateFile = async () => {
+    if (!newFileName.trim() || creatingFile) return
+    setCreatingFile(true)
+    try {
+      const file = await createDesignDocFile(projectSlug, newFileName.trim())
+      // Select the newly created file
+      updateConfig({ design_doc_path: file.name })
+      setShowCreateFileModal(false)
+      setNewFileName('')
+      // Refresh file list
+      await loadDesignDocFiles()
+    } catch (err) {
+      console.error('Failed to create file:', err)
+    } finally {
+      setCreatingFile(false)
+    }
+  }
+
   const updateConfig = useCallback((updates: Partial<NonNullable<WorkflowStep['config']>>) => {
     onChange({
       ...step,
@@ -247,6 +297,9 @@ export default function StepSettings({ step, onChange }: StepSettingsProps) {
 
   const handleProcessingTypeChange = (type: ProcessingType) => {
     const typeConfig = PROCESSING_TYPES[type]
+    // Preserve context_from_steps when switching between generator types that both support it
+    const isGeneratorType = (t: ProcessingType) => t === 'extractgen_requirements' || t === 'webgen_requirements'
+    const preserveContext = isGeneratorType(currentProcessingType) && isGeneratorType(type)
     onChange({
       ...step,
       step_type: typeConfig.step_type,
@@ -264,6 +317,8 @@ export default function StepSettings({ step, onChange }: StepSettingsProps) {
         cooldown_between_iterations: typeConfig.defaults.cooldown_between_iterations,
         max_consecutive_errors: typeConfig.defaults.max_consecutive_errors,
         customPrompt: undefined,  // Always clear custom prompt on type change
+        // Preserve context_from_steps when switching between generator types
+        context_from_steps: preserveContext ? step.config?.context_from_steps : undefined,
       },
     })
   }
@@ -479,6 +534,137 @@ export default function StepSettings({ step, onChange }: StepSettingsProps) {
         </label>
       </div>
 
+      {/* Design Doc File Selector (for design_doc processing type) */}
+      {currentProcessingType === 'design_doc' && (
+        <div className="border-t border-gray-700 pt-6">
+          <label className="block text-sm font-medium text-gray-300 mb-2">
+            Design Document File
+          </label>
+          <p className="text-xs text-gray-500 mb-3">
+            Select an existing design document to edit, or create a new one.
+          </p>
+
+          {loadingDesignDocFiles ? (
+            <div className="text-sm text-gray-400">Loading files...</div>
+          ) : (
+            <>
+              <select
+                value={step.config?.design_doc_path || ''}
+                onChange={(e) => {
+                  if (e.target.value === '__create__') {
+                    setShowCreateFileModal(true)
+                  } else {
+                    updateConfig({ design_doc_path: e.target.value || undefined })
+                  }
+                }}
+                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-primary-500"
+              >
+                <option value="">(Create new during chat)</option>
+                <option value="__create__">+ Create New File...</option>
+                {designDocFiles.map((file) => (
+                  <option key={file.path} value={file.name}>
+                    📄 {file.name} ({(file.size / 1024).toFixed(1)} KB)
+                  </option>
+                ))}
+              </select>
+
+              {step.config?.design_doc_path && (
+                <div className="mt-3 p-3 bg-violet-900/20 border border-violet-700/50 rounded-lg">
+                  <div className="flex items-start gap-2">
+                    <svg className="w-4 h-4 text-violet-400 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <div className="text-xs text-violet-300">
+                      <strong>Editing existing file:</strong> Changes will save directly to{' '}
+                      <code className="bg-violet-900/50 px-1 rounded">.ralphx/resources/design_doc/{step.config.design_doc_path}</code>.
+                      Original content will be backed up automatically.
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {!step.config?.design_doc_path && (
+                <div className="mt-3 p-3 bg-gray-800/50 border border-gray-700 rounded-lg">
+                  <div className="flex items-start gap-2">
+                    <svg className="w-4 h-4 text-gray-400 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                    </svg>
+                    <div className="text-xs text-gray-400">
+                      <strong>Creating new:</strong> A new design document will be created when you complete this step.
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Create File Modal */}
+      {showCreateFileModal && (
+        <div
+          className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShowCreateFileModal(false)
+              setNewFileName('')
+            }
+          }}
+        >
+          <div className="bg-gray-800 rounded-xl border border-gray-600 p-6 w-full max-w-md mx-4">
+            <h3 className="text-lg font-semibold text-white mb-4">Create New Design Document</h3>
+
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                File Name
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={newFileName}
+                  onChange={(e) => setNewFileName(e.target.value)}
+                  placeholder="e.g., API_DESIGN"
+                  className="flex-1 px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-primary-500"
+                  autoFocus
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') handleCreateFile()
+                    if (e.key === 'Escape') {
+                      setShowCreateFileModal(false)
+                      setNewFileName('')
+                    }
+                  }}
+                />
+                <span className="text-gray-400">.md</span>
+              </div>
+              <p className="text-xs text-gray-500 mt-1">
+                Will be saved to .ralphx/resources/design_doc/
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowCreateFileModal(false)
+                  setNewFileName('')
+                }}
+                className="px-4 py-2 bg-gray-700 text-gray-300 rounded-lg hover:bg-gray-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleCreateFile}
+                disabled={!newFileName.trim() || creatingFile}
+                className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-500 disabled:opacity-50"
+              >
+                {creatingFile ? 'Creating...' : 'Create'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Autonomous Step Settings */}
       {step.step_type === 'autonomous' && (
         <div className="border-t border-gray-700 pt-6 space-y-6">
@@ -645,6 +831,62 @@ export default function StepSettings({ step, onChange }: StepSettingsProps) {
               </div>
             </div>
           </div>
+
+          {/* Cross-Step Item Context (for generator steps only) */}
+          {(currentProcessingType === 'extractgen_requirements' || currentProcessingType === 'webgen_requirements') && (() => {
+            const otherSteps = allSteps.filter(s => s.id && s.id !== step.id)
+            const selectedStepIds = step.config?.context_from_steps || []
+            if (otherSteps.length === 0) return null
+            return (
+              <div className="border-t border-gray-700 pt-6">
+                <h4 className="text-sm font-medium text-gray-300 mb-2">Context from Other Steps</h4>
+                <p className="text-xs text-gray-500 mb-3">
+                  Include work items from other steps as context so this step avoids generating duplicates.
+                </p>
+                <div className="bg-gray-800 border border-gray-700 rounded-lg p-3 space-y-2">
+                  {otherSteps.map(s => {
+                    const isChecked = selectedStepIds.includes(s.id)
+                    const stepTemplate = s.config?.template
+                    const typeLabel = stepTemplate === 'extractgen_requirements' ? 'Extract'
+                      : stepTemplate === 'webgen_requirements' ? 'WebGen'
+                      : stepTemplate === 'implementation' ? 'Impl'
+                      : s.step_type === 'interactive' ? 'Design' : 'Step'
+                    return (
+                      <label
+                        key={s.id}
+                        className={`flex items-center gap-3 p-2 rounded cursor-pointer hover:bg-gray-700/50 ${
+                          isChecked ? 'text-white' : 'text-gray-400'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={() => {
+                            const newIds = isChecked
+                              ? selectedStepIds.filter(id => id !== s.id)
+                              : [...selectedStepIds, s.id]
+                            updateConfig({ context_from_steps: newIds.length > 0 ? newIds : undefined })
+                          }}
+                          className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-primary-600 focus:ring-primary-500"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm font-medium flex items-center gap-2">
+                            {s.name}
+                            <span className="text-xs px-1.5 py-0.5 bg-gray-700 text-gray-400 rounded">
+                              {typeLabel}
+                            </span>
+                          </div>
+                          {s.items_generated ? (
+                            <div className="text-xs text-gray-500">{s.items_generated} items</div>
+                          ) : null}
+                        </div>
+                      </label>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })()}
 
           {/* AI Instructions (Advanced) */}
           <div className="border-t border-gray-700 pt-6">
