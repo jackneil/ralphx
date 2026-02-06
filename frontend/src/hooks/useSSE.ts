@@ -105,6 +105,8 @@ export function useSSE({
         'text',
         'tool_call',
         'tool_result',
+        'thinking',
+        'usage',
         'init',
         'complete',
         'error',

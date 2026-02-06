@@ -291,9 +291,9 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
 
     const timeStr = resetDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
 
-    if (isToday) return timeStr
+    if (isToday) return `today ${timeStr}`
     if (isTomorrow) return `tomorrow ${timeStr}`
-    return resetDate.toLocaleDateString([], { month: 'short', day: 'numeric' })
+    return `${resetDate.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })} ${timeStr}`
   }
 
   const getUsageCacheAge = (cachedAt?: number): string => {
@@ -588,11 +588,9 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                             style={{ width: `${Math.min(100, account.usage.five_hour)}%` }}
                           />
                         </div>
-                        {account.usage.five_hour_resets_at && (
-                          <p className="text-gray-500 text-xs mt-1">
-                            Resets {formatResetTime(account.usage.five_hour_resets_at)}
-                          </p>
-                        )}
+                        <p className="text-gray-500 text-xs mt-1">
+                          {account.usage.five_hour_resets_at ? `Resets ${formatResetTime(account.usage.five_hour_resets_at)}` : 'No active window'}
+                        </p>
                       </div>
                       {/* 7-day usage */}
                       <div className="flex-1">
@@ -608,11 +606,9 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                             style={{ width: `${Math.min(100, account.usage.seven_day)}%` }}
                           />
                         </div>
-                        {account.usage.seven_day_resets_at && (
-                          <p className="text-gray-500 text-xs mt-1">
-                            Resets {formatResetTime(account.usage.seven_day_resets_at)}
-                          </p>
-                        )}
+                        <p className="text-gray-500 text-xs mt-1">
+                          {account.usage.seven_day_resets_at ? `Resets ${formatResetTime(account.usage.seven_day_resets_at)}` : 'No active window'}
+                        </p>
                       </div>
                     </div>
                     {account.usage_cached_at && (

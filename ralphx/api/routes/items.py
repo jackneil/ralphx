@@ -139,6 +139,8 @@ async def list_items(
     source_step_id: Optional[int] = Query(None, description="Filter by source step"),
     limit: int = Query(50, ge=1, le=1000, description="Items per page"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
+    sort_by: str = Query("created_at", description="Column to sort by"),
+    sort_order: str = Query("desc", description="Sort order: asc or desc"),
 ):
     """List work items with optional filtering."""
     manager, project, project_db = get_project(slug)
@@ -151,6 +153,8 @@ async def list_items(
         source_step_id=source_step_id,
         limit=limit,
         offset=offset,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
     # Convert to response models

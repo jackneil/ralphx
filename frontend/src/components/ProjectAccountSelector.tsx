@@ -132,9 +132,9 @@ export default function ProjectAccountSelector({
 
     const timeStr = resetDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
 
-    if (isToday) return timeStr
+    if (isToday) return `today ${timeStr}`
     if (isTomorrow) return `tomorrow ${timeStr}`
-    return resetDate.toLocaleDateString([], { month: 'short', day: 'numeric' })
+    return `${resetDate.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })} ${timeStr}`
   }
 
   const renderUsageBadge = (usage?: AccountUsage) => {
@@ -296,11 +296,9 @@ export default function ProjectAccountSelector({
                         style={{ width: `${Math.min(100, effectiveAccount.usage.five_hour)}%` }}
                       />
                     </div>
-                    {effectiveAccount.usage.five_hour_resets_at && (
-                      <p className="text-gray-500 text-xs mt-0.5">
-                        resets {formatResetTime(effectiveAccount.usage.five_hour_resets_at)}
-                      </p>
-                    )}
+                    <p className="text-gray-500 text-xs mt-0.5">
+                      {effectiveAccount.usage.five_hour_resets_at ? `Resets ${formatResetTime(effectiveAccount.usage.five_hour_resets_at)}` : 'No active window'}
+                    </p>
                   </div>
                   {/* 7-day */}
                   <div className="flex-1">
@@ -316,11 +314,9 @@ export default function ProjectAccountSelector({
                         style={{ width: `${Math.min(100, effectiveAccount.usage.seven_day)}%` }}
                       />
                     </div>
-                    {effectiveAccount.usage.seven_day_resets_at && (
-                      <p className="text-gray-500 text-xs mt-0.5">
-                        resets {formatResetTime(effectiveAccount.usage.seven_day_resets_at)}
-                      </p>
-                    )}
+                    <p className="text-gray-500 text-xs mt-0.5">
+                      {effectiveAccount.usage.seven_day_resets_at ? `Resets ${formatResetTime(effectiveAccount.usage.seven_day_resets_at)}` : 'No active window'}
+                    </p>
                   </div>
                 </div>
               )}

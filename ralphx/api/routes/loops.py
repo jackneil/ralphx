@@ -17,6 +17,7 @@ from ralphx.core.project_db import ProjectDatabase
 from ralphx.models.loop import LoopConfig, LoopType, ModeSelectionStrategy, ItemTypes
 from ralphx.models.run import Run, RunStatus
 from ralphx.core.logger import loop_log
+from ralphx.core.checkpoint import kill_orphan_process
 
 router = APIRouter()
 
@@ -53,6 +54,9 @@ def detect_source_cycle(
 
 # Store for running loops
 _running_loops: dict[str, LoopExecutor] = {}
+
+# Prevent concurrent stop attempts
+_stopping_loops: set[str] = set()
 
 # Security: Validate loop names to prevent path traversal
 LOOP_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
@@ -428,34 +432,110 @@ async def start_loop(
 
 @router.post("/{slug}/loops/{loop_name}/stop")
 async def stop_loop(slug: str, loop_name: str):
-    """Stop a running loop."""
-    # Validate project exists first
-    get_managers(slug)
+    """Stop a running loop.
+
+    Attempts to stop via executor if in memory, otherwise falls back
+    to killing via PID from database (for orphaned processes after
+    server restart/hot-reload).
+    """
+    manager, project, project_db = get_managers(slug)
 
     key = f"{slug}:{loop_name}"
-    executor = _running_loops.get(key)
 
-    if not executor:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Loop {loop_name} is not running",
+    # Prevent concurrent stop attempts
+    if key in _stopping_loops:
+        return {"message": f"Stop already in progress for {loop_name}"}
+
+    _stopping_loops.add(key)
+    try:
+        # Try 1: Stop via executor (normal case)
+        executor = _running_loops.get(key)
+        if executor:
+            await executor.stop()
+            return {
+                "message": f"Stop signal sent to {loop_name}",
+                "method": "executor",
+            }
+
+        # Try 2: Kill via PID (orphan case after server restart)
+        runs = project_db.list_runs(loop_name=loop_name, status=["running", "paused"])
+        if not runs:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Loop {loop_name} is not running",
+            )
+
+        # Get most recent running run
+        run = runs[0]
+        pid = run.get("executor_pid")
+
+        if not pid:
+            # No PID recorded - can't kill, just mark as aborted
+            project_db.update_run(
+                run["id"],
+                status="aborted",
+                completed_at=datetime.utcnow().isoformat(),
+                error_message="Stopped by user (no PID available for orphan process)",
+            )
+            return {
+                "message": f"Marked {loop_name} as aborted (no PID available)",
+                "method": "database_only",
+                "warning": "Process may still be running",
+            }
+
+        # Kill the orphan process
+        success, reason = await kill_orphan_process(pid)
+
+        # Update database regardless of kill result
+        if success:
+            error_msg = f"Killed orphan process (PID {pid}) after server restart"
+            if reason == "already_dead":
+                error_msg = f"Orphan process (PID {pid}) already terminated"
+        else:
+            error_msg = f"Could not kill orphan process (PID {pid}): {reason}"
+
+        project_db.update_run(
+            run["id"],
+            status="aborted",
+            completed_at=datetime.utcnow().isoformat(),
+            error_message=error_msg,
         )
 
-    await executor.stop()
-
-    return {"message": f"Stop signal sent to {loop_name}"}
+        if success:
+            return {
+                "message": f"Stopped orphan process for {loop_name}",
+                "method": "pid_kill",
+                "pid": pid,
+                "detail": reason,  # "killed" or "already_dead"
+            }
+        else:
+            return {
+                "message": f"Could not kill process {pid}, marked as aborted",
+                "method": "pid_kill_failed",
+                "pid": pid,
+                "reason": reason,
+                "warning": "Process may not have been our process (PID reuse)" if reason == "not_our_process" else None,
+            }
+    finally:
+        _stopping_loops.discard(key)
 
 
 @router.post("/{slug}/loops/{loop_name}/pause")
 async def pause_loop(slug: str, loop_name: str):
     """Pause a running loop."""
-    # Validate project exists first
-    get_managers(slug)
+    manager, project, project_db = get_managers(slug)
 
     key = f"{slug}:{loop_name}"
     executor = _running_loops.get(key)
 
     if not executor:
+        # Check if there's an orphan process
+        runs = project_db.list_runs(loop_name=loop_name, status=["running", "paused"])
+        if runs:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Loop {loop_name} is running as orphan process (server restarted). Use stop to terminate it.",
+            )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Loop {loop_name} is not running",
@@ -469,13 +549,19 @@ async def pause_loop(slug: str, loop_name: str):
 @router.post("/{slug}/loops/{loop_name}/resume")
 async def resume_loop(slug: str, loop_name: str):
     """Resume a paused loop."""
-    # Validate project exists first
-    get_managers(slug)
+    manager, project, project_db = get_managers(slug)
 
     key = f"{slug}:{loop_name}"
     executor = _running_loops.get(key)
 
     if not executor:
+        # Check if there's an orphan process
+        runs = project_db.list_runs(loop_name=loop_name, status=["running", "paused"])
+        if runs:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Loop {loop_name} is orphaned (server restarted). Use stop to terminate, then start again.",
+            )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Loop {loop_name} is not running",

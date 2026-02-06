@@ -1,13 +1,17 @@
 """Claude CLI adapter for RalphX.
 
-Spawns Claude CLI as a subprocess and captures output via stream-json format.
+Spawns Claude CLI as a subprocess and streams events via JSONL session file tailing.
 """
 
 import asyncio
 import json
+import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 from ralphx.adapters.base import (
     AdapterEvent,
@@ -30,9 +34,10 @@ class ClaudeCLIAdapter(LLMAdapter):
     """Adapter for Claude CLI (claude command).
 
     Features:
-    - Spawns claude -p with stream-json output
-    - Captures session_id from init message
-    - Streams text and tool_use events
+    - Spawns claude -p with json output
+    - Streams events by tailing the JSONL session file Claude writes
+    - Captures session_id from queue-operation event
+    - Streams text, thinking, tool_use, tool_result, and usage events
     - Handles timeouts and signals
     - Supports per-loop Claude Code settings files
     """
@@ -57,6 +62,8 @@ class ClaudeCLIAdapter(LLMAdapter):
         self._session_id: Optional[str] = None
         self._settings_path = settings_path
         self._project_id = project_id
+        self._structured_output: Optional[dict] = None
+        self._final_result_text: str = ""
 
     @property
     def is_running(self) -> bool:
@@ -95,16 +102,13 @@ class ClaudeCLIAdapter(LLMAdapter):
         # Resolve model name
         full_model = MODEL_MAP.get(model, model)
 
-        # When using json_schema, we need --output-format json (not stream-json)
-        # because structured_output is only in the final JSON result
-        output_format = "json" if json_schema else "stream-json"
-
+        # Always use json output format — we stream via JSONL file tailing,
+        # stdout is only used for final metadata (cost, structured_output)
         cmd = [
             "claude",
             "-p",  # Print mode (non-interactive)
-            "--verbose",  # Required when using -p with stream-json
             "--model", full_model,
-            "--output-format", output_format,
+            "--output-format", "json",
         ]
 
         # Add JSON schema for structured output
@@ -118,13 +122,15 @@ class ClaudeCLIAdapter(LLMAdapter):
         # Configure available tools
         # --tools specifies which built-in tools are available
         # --allowedTools is for fine-grained permission patterns like Bash(git:*)
-        if tools:
-            # Enable specific tools
-            cmd.extend(["--tools", ",".join(tools)])
-        else:
-            # Disable all built-in tools to prevent Claude from trying to use them
-            # Without this, Claude may try to use Read/Edit/etc and hit API errors
-            cmd.extend(["--tools", ""])
+        # Three-way semantics:
+        #   tools=None  → omit --tools flag → Claude uses all default tools
+        #   tools=[]    → --tools "" → explicitly disable all tools
+        #   tools=[...] → --tools "Read,Glob" → only listed tools
+        if tools is not None:
+            if tools:
+                cmd.extend(["--tools", ",".join(tools)])
+            else:
+                cmd.extend(["--tools", ""])
 
         return cmd
 
@@ -140,33 +146,19 @@ class ClaudeCLIAdapter(LLMAdapter):
     ) -> ExecutionResult:
         """Execute a prompt and return the result.
 
-        Args:
-            prompt: The prompt to send.
-            model: Model identifier.
-            tools: List of tool names.
-            timeout: Timeout in seconds.
-            json_schema: Optional JSON schema for structured output.
-
-        Returns:
-            ExecutionResult with output and metadata.
+        Streams events via JSONL file tailing for all execution modes.
+        Structured output (json_schema) is extracted from stdout JSON after completion.
         """
-        # When using json_schema, use dedicated non-streaming execution
-        if json_schema:
-            return await self._execute_with_schema(
-                prompt, model, tools, timeout, json_schema,
-                on_session_start=on_session_start, on_event=on_event,
-            )
-
-        # Standard streaming execution
-        import logging
-        _exec_log = logging.getLogger(__name__)
+        # Reset per-execution state
+        self._structured_output = None
+        self._final_result_text = ""
 
         result = ExecutionResult(started_at=datetime.utcnow())
         text_parts = []
         tool_calls = []
 
         try:
-            async for event in self.stream(prompt, model, tools, timeout):
+            async for event in self.stream(prompt, model, tools, timeout, json_schema):
                 if event.type == AdapterEvent.INIT:
                     result.session_id = event.data.get("session_id")
                     if on_session_start and result.session_id:
@@ -174,12 +166,15 @@ class ClaudeCLIAdapter(LLMAdapter):
                 elif event.type == AdapterEvent.TEXT:
                     if event.text:
                         text_parts.append(event.text)
-                        _exec_log.warning(f"[EXEC] Appended text part, total parts: {len(text_parts)}")
                 elif event.type == AdapterEvent.TOOL_USE:
                     tool_calls.append({
                         "name": event.tool_name,
                         "input": event.tool_input,
                     })
+                elif event.type == AdapterEvent.THINKING:
+                    pass  # Don't aggregate thinking into text_output
+                elif event.type == AdapterEvent.USAGE:
+                    pass  # Usage tracked via on_event callback
                 elif event.type == AdapterEvent.ERROR:
                     result.error_message = event.error_message
                     result.success = False
@@ -207,154 +202,10 @@ class ClaudeCLIAdapter(LLMAdapter):
         result.tool_calls = tool_calls
         result.session_id = self._session_id
 
-        _exec_log.warning(f"[EXEC] Final text_output: {len(result.text_output)} chars from {len(text_parts)} parts")
-        if result.text_output:
-            _exec_log.warning(f"[EXEC] text_output preview: {result.text_output[:300]}...")
-
-        return result
-
-    async def _execute_with_schema(
-        self,
-        prompt: str,
-        model: str,
-        tools: Optional[list[str]],
-        timeout: int,
-        json_schema: dict,
-        on_session_start: Optional[Callable[[str], None]] = None,
-        on_event: Optional[Callable[[StreamEvent], None]] = None,
-    ) -> ExecutionResult:
-        """Execute with JSON schema for structured output.
-
-        Uses --output-format json which returns a single JSON result
-        containing structured_output.
-
-        Args:
-            prompt: The prompt to send.
-            model: Model identifier.
-            tools: List of tool names.
-            timeout: Timeout in seconds.
-            json_schema: JSON schema for structured output validation.
-
-        Returns:
-            ExecutionResult with structured_output populated.
-        """
-        result = ExecutionResult(started_at=datetime.utcnow())
-
-        # Validate and refresh token
-        if not await refresh_token_if_needed(self._project_id, validate=True):
-            result.success = False
-            result.error_message = "No valid credentials. Token may be expired."
-            return result
-
-        # Swap credentials for execution
-        with swap_credentials_for_loop(self._project_id) as has_creds:
-            if not has_creds:
-                result.success = False
-                result.error_message = "No credentials available."
-                return result
-
-            cmd = self._build_command(model, tools, json_schema)
-
-            try:
-                # Start process
-                self._process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=str(self.project_path),
-                )
-
-                # Send prompt
-                if self._process.stdin:
-                    self._process.stdin.write(prompt.encode())
-                    await self._process.stdin.drain()
-                    self._process.stdin.close()
-                    await self._process.stdin.wait_closed()
-
-                # Read output with timeout
-                async with asyncio.timeout(timeout):
-                    stdout, stderr = await self._process.communicate()
-
-                result.exit_code = self._process.returncode or 0
-                result.completed_at = datetime.utcnow()
-
-                # Parse JSON result
-                if stdout:
-                    try:
-                        data = json.loads(stdout.decode())
-                        result.session_id = data.get("session_id")
-                        result.structured_output = data.get("structured_output")
-
-                        # Check for errors in result
-                        if data.get("is_error"):
-                            result.success = False
-                            result.error_message = data.get("result", "Unknown error")
-                        elif data.get("subtype") == "error_max_structured_output_retries":
-                            result.success = False
-                            result.error_message = "Could not produce valid structured output"
-                        else:
-                            result.success = True
-
-                        # Extract text from result if available
-                        result.text_output = data.get("result", "")
-
-                        # Fire callbacks for event persistence
-                        if on_session_start and result.session_id:
-                            on_session_start(result.session_id)
-                        if on_event:
-                            # Save metadata about the execution
-                            on_event(StreamEvent(
-                                type=AdapterEvent.INIT,
-                                data={
-                                    "session_id": result.session_id,
-                                    "num_turns": data.get("num_turns"),
-                                    "cost_usd": data.get("cost_usd"),
-                                    "is_error": data.get("is_error"),
-                                },
-                            ))
-                            # Save the result text
-                            if result.text_output:
-                                on_event(StreamEvent(
-                                    type=AdapterEvent.TEXT,
-                                    text=result.text_output,
-                                ))
-                            # Save completion/error
-                            if result.success:
-                                on_event(StreamEvent(type=AdapterEvent.COMPLETE))
-                            elif result.error_message:
-                                on_event(StreamEvent(
-                                    type=AdapterEvent.ERROR,
-                                    error_message=result.error_message,
-                                ))
-
-                    except json.JSONDecodeError as e:
-                        result.success = False
-                        result.error_message = f"Failed to parse JSON output: {e}"
-
-                # Handle stderr
-                if stderr:
-                    stderr_text = stderr.decode(errors="replace").strip()
-                    if stderr_text and not result.error_message:
-                        result.error_message = stderr_text[:500]
-
-                if result.exit_code != 0 and result.success:
-                    result.success = False
-                    if not result.error_message:
-                        result.error_message = f"Exit code {result.exit_code}"
-
-            except asyncio.TimeoutError:
-                result.timeout = True
-                result.success = False
-                result.error_message = f"Execution timed out after {timeout}s"
-                await self.stop()
-
-            except Exception as e:
-                result.success = False
-                result.error_message = str(e)
-
-            finally:
-                self._process = None
+        # Pick up structured output and final result text from stream()'s stdout parsing
+        result.structured_output = self._structured_output
+        if not result.text_output and self._final_result_text:
+            result.text_output = self._final_result_text
 
         return result
 
@@ -366,29 +217,23 @@ class ClaudeCLIAdapter(LLMAdapter):
         timeout: int = 300,
         json_schema: Optional[dict] = None,
     ) -> AsyncIterator[StreamEvent]:
-        """Stream execution events from Claude CLI.
+        """Stream execution events by tailing Claude's JSONL session file.
 
-        Automatically handles credential refresh and swap for the execution.
-
-        Note: When json_schema is provided, streaming is not truly supported.
-        Use execute() instead for structured output.
-
-        Args:
-            prompt: The prompt to send.
-            model: Model identifier.
-            tools: List of tool names.
-            timeout: Timeout in seconds.
-            json_schema: Optional JSON schema (not recommended for streaming).
+        Instead of parsing stdout (stream-json format), we:
+        1. Spawn Claude CLI with --output-format json
+        2. Discover the JSONL session file Claude creates
+        3. Tail that file for real-time events (richer than stdout)
+        4. Read stdout after completion for final metadata
 
         Yields:
             StreamEvent objects as execution progresses.
         """
-        # Reset session_id to prevent stale values from previous executions
-        # leaking into results when the new execution fails before INIT
+        # Reset session state
         self._session_id = None
+        self._structured_output = None
+        self._final_result_text = ""
 
-        # Validate and refresh token if needed (before spawning)
-        # Use validate=True to actually test the token works
+        # Validate and refresh token if needed
         if not await refresh_token_if_needed(self._project_id, validate=True):
             yield StreamEvent(
                 type=AdapterEvent.ERROR,
@@ -407,16 +252,18 @@ class ClaudeCLIAdapter(LLMAdapter):
                 )
                 return
 
-            cmd = self._build_command(model, tools)
+            # Compute session directory for JSONL file discovery
+            normalized = str(self.project_path).replace("/", "-")
+            session_dir = Path.home() / ".claude" / "projects" / normalized
 
-            # Log the exact command for debugging concurrency issues
-            import logging
-            _cli_log = logging.getLogger(__name__)
-            _cli_log.warning(f"[CLAUDE_CLI] Running command: {' '.join(cmd)}")
-            _cli_log.warning(f"[CLAUDE_CLI] Working dir: {self.project_path}")
-            _cli_log.warning(f"[CLAUDE_CLI] Tools: {tools}")
-            _cli_log.warning(f"[CLAUDE_CLI] Prompt length: {len(prompt)} chars")
-            _cli_log.warning(f"[CLAUDE_CLI] Prompt preview: {prompt[:500]}...")
+            # Snapshot existing session files before spawn
+            existing_files: set[str] = set()
+            if session_dir.exists():
+                existing_files = {
+                    f.name for f in session_dir.iterdir() if f.suffix == ".jsonl"
+                }
+
+            cmd = self._build_command(model, tools, json_schema)
 
             # Start the process
             self._process = await asyncio.create_subprocess_exec(
@@ -425,7 +272,7 @@ class ClaudeCLIAdapter(LLMAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self.project_path),
-                limit=4 * 1024 * 1024,  # 4MB buffer for large JSON lines (e.g. Edit tool inputs)
+                limit=4 * 1024 * 1024,  # 4MB buffer
             )
 
             # Send the prompt
@@ -435,253 +282,318 @@ class ClaudeCLIAdapter(LLMAdapter):
                 self._process.stdin.close()
                 await self._process.stdin.wait_closed()
 
-            # Read output with timeout
-            # Note: We read stderr concurrently with stdout to avoid deadlock
-            # if stderr buffer fills before stdout completes
-            stderr_content = []
-            stderr_task = None
+            # Drain stdout/stderr in background to prevent pipe deadlock
+            stdout_task = asyncio.create_task(
+                self._drain_pipe(self._process.stdout)
+            )
+            stderr_task = asyncio.create_task(
+                self._drain_pipe(self._process.stderr)
+            )
 
-            async def drain_stderr():
-                """Read stderr in background to prevent buffer deadlock."""
-                chunks = []
-                if self._process and self._process.stderr:
-                    # Read in chunks with a max total size limit (1MB)
-                    max_size = 1024 * 1024
-                    total = 0
-                    while total < max_size:
-                        chunk = await self._process.stderr.read(8192)
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        total += len(chunk)
-                return b"".join(chunks)
+            # Discover the new JSONL session file
+            session_file = await self._discover_session_file(
+                session_dir, existing_files, max_wait=15
+            )
 
-            try:
-                # Start stderr drain early to prevent buffer deadlock
-                if self._process.stderr:
-                    stderr_task = asyncio.create_task(drain_stderr())
-
-                if self._process.stdout:
-                    import logging
-                    import time
-                    _stream_log = logging.getLogger(__name__)
-                    line_count = 0
-                    text_events = 0
-
-                    # Two timeout strategies:
-                    # 1. line_timeout: Max time to wait for ANY output (prevents deadlock)
-                    # 2. meaningful_timeout: Max time since last meaningful event (TEXT/TOOL_USE/TOOL_RESULT)
-                    line_timeout = 30  # 30s max wait for any line
-                    meaningful_timeout = min(max(timeout - 30, 60), 270)  # Scale with timeout param, min 60s, max 4.5 min
-                    last_meaningful_time = time.time()
-
-                    async def read_line_with_timeout():
-                        """Read a line with timeout."""
-                        return await asyncio.wait_for(
-                            self._process.stdout.readline(),
-                            timeout=line_timeout
-                        )
-
-                    while True:
-                        # Check meaningful event timeout
-                        time_since_meaningful = time.time() - last_meaningful_time
-                        if time_since_meaningful > meaningful_timeout:
-                            _stream_log.warning(f"[STREAM] Meaningful event timeout after {time_since_meaningful:.0f}s")
-                            raise asyncio.TimeoutError(f"No meaningful output for {meaningful_timeout}s")
-
-                        try:
-                            line = await read_line_with_timeout()
-                            if not line:  # EOF
-                                break
-                        except asyncio.TimeoutError:
-                            # Check if it's been too long since meaningful event
-                            time_since_meaningful = time.time() - last_meaningful_time
-                            if time_since_meaningful > meaningful_timeout:
-                                _stream_log.warning(f"[STREAM] Meaningful event timeout after {time_since_meaningful:.0f}s")
-                                raise
-                            # Otherwise keep waiting - Claude might be working on a tool
-                            _stream_log.info(f"[STREAM] No line for {line_timeout}s, but meaningful event was {time_since_meaningful:.0f}s ago, continuing...")
-                            continue
-
-                        line_count += 1
-                        try:
-                            line_text = line.decode(errors="replace").strip()
-                        except Exception:
-                            continue  # Skip lines that can't be decoded
-                        if not line_text:
-                            continue
-
-                        try:
-                            data = json.loads(line_text)
-                            msg_type = data.get("type", "unknown")
-                            # Log full event structure for debugging
-                            _stream_log.warning(f"[STREAM] Line {line_count}: type={msg_type}, keys={list(data.keys())}")
-                            if msg_type not in ("content_block_delta", "text"):
-                                _stream_log.warning(f"[STREAM] Full event: {json.dumps(data)[:500]}")
-
-                            # Parse events (may return multiple for assistant messages with multiple blocks)
-                            for event in self._parse_events(data):
-                                # Reset meaningful timeout on actual content
-                                if event.type in (AdapterEvent.TEXT, AdapterEvent.TOOL_USE, AdapterEvent.TOOL_RESULT, AdapterEvent.INIT):
-                                    last_meaningful_time = time.time()
-
-                                if event.type == AdapterEvent.TEXT:
-                                    text_events += 1
-                                    text_preview = (event.text or "")[:80].replace("\n", "\\n")
-                                    _stream_log.warning(f"[STREAM] TEXT #{text_events}: {len(event.text or '')} chars, preview: {text_preview}")
-                                elif event.type == AdapterEvent.TOOL_USE:
-                                    _stream_log.warning(f"[STREAM] TOOL_USE: {event.tool_name}")
-                                yield event
-                        except json.JSONDecodeError:
-                            # Non-JSON output, treat as plain text
-                            last_meaningful_time = time.time()  # Plain text is meaningful
-                            yield StreamEvent(
-                                type=AdapterEvent.TEXT,
-                                text=line_text,
-                            )
-                    _stream_log.warning(f"[STREAM] Done: {line_count} lines, {text_events} TEXT events")
-
-                # Wait for process to complete
+            if not session_file:
+                # Process may have died before creating session file
                 await self._process.wait()
-
-                # Collect stderr result
-                if stderr_task:
-                    stderr_data = await stderr_task
-                    if stderr_data:
-                        stderr_content.append(stderr_data.decode(errors="replace").strip())
-
-            except asyncio.TimeoutError:
-                # Cancel stderr task if still running
-                if stderr_task and not stderr_task.done():
-                    stderr_task.cancel()
-                    try:
-                        await stderr_task
-                    except asyncio.CancelledError:
-                        pass
+                stdout_task.cancel()
+                stderr_data = await stderr_task
+                stderr_text = stderr_data.decode(errors="replace").strip() if stderr_data else ""
                 yield StreamEvent(
                     type=AdapterEvent.ERROR,
-                    error_message="Stream timed out - no response for too long",
-                    error_code="TIMEOUT",
+                    error_message=f"Could not find session file. stderr: {stderr_text[:500]}",
+                    error_code="NO_SESSION_FILE",
                 )
-                await self.stop()
-                return  # Don't re-raise - we handled it by yielding ERROR
+                yield StreamEvent(
+                    type=AdapterEvent.COMPLETE,
+                    data={"exit_code": self._process.returncode or 1},
+                )
+                self._process = None
+                return
 
-            # Emit error if non-zero exit code or stderr content
+            # Tail the JSONL file for streaming events
+            async for event in self._tail_session_file(session_file, timeout):
+                yield event
+
+            # Wait for process to complete
+            await self._process.wait()
+
+            # Collect stdout/stderr
+            stdout_data = await stdout_task
+            stderr_data = await stderr_task
+
+            # Parse stdout JSON for final metadata
             exit_code = self._process.returncode or 0
-            if exit_code != 0 or stderr_content:
-                stderr_text = "\n".join(stderr_content)
-                # Log full stderr for debugging (before truncation)
-                _cli_log.warning(f"[CLAUDE_CLI] Exit code: {exit_code}")
-                _cli_log.warning(f"[CLAUDE_CLI] Full stderr ({len(stderr_text)} chars): {stderr_text}")
-                error_msg = f"Claude CLI error (exit {exit_code})"
-                if stderr_text:
-                    # Truncate stderr to 500 chars with indicator
-                    truncated = stderr_text[:500]
-                    if len(stderr_text) > 500:
-                        truncated += "... [truncated]"
-                    error_msg = f"{error_msg}: {truncated}"
-                yield StreamEvent(
-                    type=AdapterEvent.ERROR,
-                    error_message=error_msg,
-                    error_code=f"EXIT_{exit_code}",
-                )
+            completion_data: dict = {
+                "exit_code": exit_code,
+                "session_id": self._session_id,
+            }
 
-            # Emit completion event
+            if stdout_data:
+                try:
+                    final = json.loads(stdout_data.decode())
+                    completion_data["cost_usd"] = final.get("cost_usd")
+                    completion_data["num_turns"] = final.get("num_turns")
+                    self._structured_output = final.get("structured_output")
+                    self._final_result_text = final.get("result", "")
+
+                    # Check for errors in final result
+                    if final.get("is_error"):
+                        yield StreamEvent(
+                            type=AdapterEvent.ERROR,
+                            error_message=final.get("result", "Unknown error"),
+                            error_code="CLI_ERROR",
+                        )
+                    elif final.get("subtype") == "error_max_structured_output_retries":
+                        yield StreamEvent(
+                            type=AdapterEvent.ERROR,
+                            error_message="Could not produce valid structured output",
+                            error_code="STRUCTURED_OUTPUT_FAILED",
+                        )
+                except json.JSONDecodeError:
+                    pass
+
+            # Emit error for non-zero exit or stderr
+            if exit_code != 0:
+                stderr_text = stderr_data.decode(errors="replace").strip() if stderr_data else ""
+                if stderr_text:
+                    logger.warning(f"Claude CLI exit code: {exit_code}, stderr: {stderr_text[:500]}")
+                    yield StreamEvent(
+                        type=AdapterEvent.ERROR,
+                        error_message=f"Claude CLI error (exit {exit_code}): {stderr_text[:500]}",
+                        error_code=f"EXIT_{exit_code}",
+                    )
+
+            # Emit completion
             yield StreamEvent(
                 type=AdapterEvent.COMPLETE,
-                data={"exit_code": exit_code, "session_id": self._session_id},
+                data=completion_data,
             )
 
             self._process = None
 
-    def _parse_events(self, data: dict) -> list[StreamEvent]:
-        """Parse a stream-json event into StreamEvent(s).
+    # ========== JSONL File Tailing Helpers ==========
+
+    async def _discover_session_file(
+        self,
+        session_dir: Path,
+        existing_files: set[str],
+        max_wait: float = 15,
+    ) -> Optional[Path]:
+        """Poll directory for a new .jsonl session file created by Claude CLI.
 
         Args:
-            data: Parsed JSON data from stdout.
+            session_dir: Directory where Claude stores session files.
+            existing_files: Set of filenames that existed before process spawn.
+            max_wait: Maximum seconds to wait for file to appear.
 
         Returns:
-            List of StreamEvents (may be empty if not recognized).
+            Path to new session file, or None if not found.
         """
-        events = []
-        msg_type = data.get("type")
+        start = time.time()
+        while time.time() - start < max_wait:
+            if session_dir.exists():
+                try:
+                    current = {
+                        f.name for f in session_dir.iterdir() if f.suffix == ".jsonl"
+                    }
+                    new_files = current - existing_files
+                    if new_files:
+                        # Return the newest file by modification time
+                        newest = max(
+                            new_files,
+                            key=lambda f: (session_dir / f).stat().st_mtime,
+                        )
+                        return session_dir / newest
+                except OSError:
+                    pass  # Directory listing failed, retry
 
-        # Init message with session ID (only for system/init events)
-        if msg_type in ("init", "system"):
-            self._session_id = data.get("session_id")
+            # Check if process already exited before creating a file
+            if self._process and self._process.returncode is not None:
+                return None
+
+            await asyncio.sleep(0.2)
+
+        return None
+
+    async def _tail_session_file(
+        self,
+        session_file: Path,
+        timeout: int,
+    ) -> AsyncIterator[StreamEvent]:
+        """Tail a JSONL session file, yielding StreamEvents.
+
+        Reads new lines as they're written by Claude CLI.
+        Stops when the process exits and all remaining lines are read.
+
+        Args:
+            session_file: Path to the .jsonl file.
+            timeout: Timeout in seconds for the overall execution.
+
+        Yields:
+            StreamEvent objects parsed from JSONL lines.
+        """
+        position = 0
+        last_event_time = time.time()
+        meaningful_timeout = min(max(timeout - 30, 60), 270)
+
+        while True:
+            # Check if process has exited
+            process_done = (
+                self._process is not None
+                and self._process.returncode is not None
+            )
+
+            # Read new content from file
+            try:
+                size = session_file.stat().st_size
+            except FileNotFoundError:
+                break
+
+            if size > position:
+                try:
+                    with open(session_file, "r") as f:
+                        f.seek(position)
+                        new_content = f.read()
+                        position = f.tell()
+                except (IOError, PermissionError):
+                    break
+
+                for line in new_content.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        for event in self._parse_jsonl_event(data):
+                            if event.type in (
+                                AdapterEvent.TEXT,
+                                AdapterEvent.TOOL_USE,
+                                AdapterEvent.TOOL_RESULT,
+                                AdapterEvent.THINKING,
+                                AdapterEvent.INIT,
+                            ):
+                                last_event_time = time.time()
+                            yield event
+                    except json.JSONDecodeError:
+                        continue
+
+            if process_done:
+                # Final read to catch any remaining lines
+                try:
+                    final_size = session_file.stat().st_size
+                    if final_size > position:
+                        with open(session_file, "r") as f:
+                            f.seek(position)
+                            remaining = f.read()
+                        for line in remaining.split("\n"):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                data = json.loads(line)
+                                for event in self._parse_jsonl_event(data):
+                                    yield event
+                            except json.JSONDecodeError:
+                                continue
+                except (FileNotFoundError, IOError):
+                    pass
+                break
+
+            # Check meaningful event timeout
+            if time.time() - last_event_time > meaningful_timeout:
+                yield StreamEvent(
+                    type=AdapterEvent.ERROR,
+                    error_message=f"No meaningful output for {meaningful_timeout}s",
+                    error_code="TIMEOUT",
+                )
+                break
+
+            await asyncio.sleep(0.1)
+
+    def _parse_jsonl_event(self, data: dict) -> list[StreamEvent]:
+        """Parse a session JSONL line into StreamEvent(s).
+
+        Claude's session JSONL format uses full message objects:
+        - queue-operation: Session start (contains sessionId)
+        - assistant: Claude's response (text, thinking, tool_use blocks + usage)
+        - user: User messages and tool results
+
+        Args:
+            data: Parsed JSON data from a JSONL line.
+
+        Returns:
+            List of StreamEvents (may be empty for unrecognized events).
+        """
+        events: list[StreamEvent] = []
+        event_type = data.get("type")
+
+        # Session start — first line of every session file
+        if event_type == "queue-operation":
+            self._session_id = data.get("sessionId")
             events.append(StreamEvent(
                 type=AdapterEvent.INIT,
                 data={"session_id": self._session_id},
             ))
             return events
 
-        # Content block events (streaming API format)
-        if msg_type == "content_block_delta":
-            delta = data.get("delta", {})
-            delta_type = delta.get("type")
-
-            if delta_type == "text_delta":
-                events.append(StreamEvent(
-                    type=AdapterEvent.TEXT,
-                    text=delta.get("text", ""),
-                ))
-
-            return events
-
-        if msg_type == "content_block_start":
-            content_block = data.get("content_block", {})
-            if content_block.get("type") == "tool_use":
-                events.append(StreamEvent(
-                    type=AdapterEvent.TOOL_USE,
-                    tool_name=content_block.get("name"),
-                    tool_input=content_block.get("input", {}),
-                ))
-            return events
-
-        # Tool result (from Claude Code's output)
-        if msg_type == "tool_result":
-            events.append(StreamEvent(
-                type=AdapterEvent.TOOL_RESULT,
-                tool_name=data.get("name"),
-                tool_result=data.get("result"),
-            ))
-            return events
-
-        # Error events
-        if msg_type == "error":
-            events.append(StreamEvent(
-                type=AdapterEvent.ERROR,
-                error_message=data.get("message", "Unknown error"),
-                error_code=data.get("code"),
-            ))
-            return events
-
-        # Assistant message with content
-        # Claude Code stream-json format: {"type": "assistant", "message": {"content": [...]}}
-        # Can contain multiple content blocks (text, tool_use, etc.) - emit ALL of them
-        if msg_type == "assistant":
+        # Assistant message — may contain text, thinking, tool_use blocks
+        if event_type == "assistant":
             message = data.get("message", {})
-            content = message.get("content") or data.get("content")
-            if isinstance(content, list):
-                for block in content:
+            content_blocks = message.get("content", [])
+            usage = message.get("usage")
+            is_error = data.get("isApiErrorMessage", False)
+
+            if is_error:
+                error_text = ""
+                if isinstance(content_blocks, list):
+                    for block in content_blocks:
+                        if block.get("type") == "text":
+                            error_text = block.get("text", "")
+                events.append(StreamEvent(
+                    type=AdapterEvent.ERROR,
+                    error_message=error_text or data.get("error", "API error"),
+                    error_code=data.get("error"),
+                ))
+                return events
+
+            if isinstance(content_blocks, list):
+                for block in content_blocks:
                     block_type = block.get("type")
-                    if block_type == "tool_use":
-                        events.append(StreamEvent(
-                            type=AdapterEvent.TOOL_USE,
-                            tool_name=block.get("name"),
-                            tool_input=block.get("input", {}),
-                        ))
+                    if block_type == "thinking":
+                        thinking_text = block.get("thinking", "")
+                        if thinking_text:
+                            events.append(StreamEvent(
+                                type=AdapterEvent.THINKING,
+                                thinking=thinking_text,
+                            ))
                     elif block_type == "text":
                         text = block.get("text", "")
-                        if text:  # Only emit non-empty text
+                        if text:
                             events.append(StreamEvent(
                                 type=AdapterEvent.TEXT,
                                 text=text,
                             ))
+                    elif block_type == "tool_use":
+                        events.append(StreamEvent(
+                            type=AdapterEvent.TOOL_USE,
+                            tool_name=block.get("name"),
+                            tool_input=block.get("input"),
+                        ))
+
+            # Emit usage data if present
+            if usage:
+                events.append(StreamEvent(
+                    type=AdapterEvent.USAGE,
+                    usage=usage,
+                ))
+
             return events
 
-        # Tool result from Claude CLI (sent as user message with nested tool_result blocks)
-        if msg_type == "user":
+        # User message — may contain tool results
+        if event_type == "user":
             message = data.get("message", {})
             content = message.get("content", [])
             if isinstance(content, list):
@@ -691,50 +603,63 @@ class ClaudeCLIAdapter(LLMAdapter):
                         events.append(StreamEvent(
                             type=AdapterEvent.TOOL_RESULT,
                             tool_name=None,
-                            tool_result=str(result_text)[:500],
+                            tool_result=str(result_text)[:1000],
                         ))
+
             return events
 
-        # Result event contains the complete output (final message)
-        # Don't duplicate - the assistant message already has the text
-        if msg_type == "result":
-            # Only emit if we haven't seen any text yet (edge case)
-            pass
+        return events  # Ignore unrecognized event types
 
-        # Message completion
-        if msg_type == "message_stop":
-            events.append(StreamEvent(
-                type=AdapterEvent.COMPLETE,
-                data={"session_id": self._session_id},
-            ))
-            return events
+    async def _drain_pipe(self, pipe) -> bytes:
+        """Read all data from a subprocess pipe without parsing.
 
-        return events
+        Used to drain stdout/stderr in background to prevent pipe buffer deadlock.
 
-    @staticmethod
-    def is_available() -> bool:
-        """Check if Claude CLI is available.
+        Args:
+            pipe: asyncio subprocess pipe (stdout or stderr).
 
         Returns:
-            True if claude command is found in PATH.
+            All bytes read from the pipe.
         """
-        import shutil
-        return shutil.which("claude") is not None
+        if not pipe:
+            return b""
+        chunks = []
+        max_size = 4 * 1024 * 1024  # 4MB max
+        total = 0
+        while total < max_size:
+            chunk = await pipe.read(8192)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)
 
-    @staticmethod
-    async def check_auth() -> bool:
-        """Check if Claude CLI is authenticated.
+    def build_run_marker(
+        self,
+        run_id: str,
+        project_slug: str,
+        iteration: int,
+        mode: str,
+    ) -> str:
+        """Build the run tracking marker to inject into prompts.
+
+        This marker is placed at the END of prompts to track which
+        session belongs to which run.
+
+        Args:
+            run_id: The run identifier.
+            project_slug: Project slug.
+            iteration: Current iteration number.
+            mode: Current mode name.
 
         Returns:
-            True if authenticated.
+            Marker string to append to prompt.
         """
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "claude", "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.wait()
-            return proc.returncode == 0
-        except Exception:
-            return False
+        now = datetime.utcnow().isoformat()
+        # Sanitize values to prevent HTML comment injection (e.g., --> in mode name)
+        safe_run_id = run_id.replace("--", "").replace('"', "")
+        safe_slug = project_slug.replace("--", "").replace('"', "")
+        safe_mode = mode.replace("--", "").replace('"', "")
+        return f"""
+
+<!-- RALPHX_TRACKING run_id="{safe_run_id}" project="{safe_slug}" iteration={iteration} mode="{safe_mode}" ts="{now}" -->"""

@@ -36,6 +36,9 @@ export default function WorkflowItemsTab({ projectSlug, workflowId, sourceStepId
   const [categoryFilter, setCategoryFilter] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
 
+  // Sort
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
+
   // Pagination
   const [page, setPage] = useState(0)
 
@@ -61,6 +64,8 @@ export default function WorkflowItemsTab({ projectSlug, workflowId, sourceStepId
         category: categoryFilter || undefined,
         limit: ITEMS_PER_PAGE,
         offset: page * ITEMS_PER_PAGE,
+        sort_by: 'created_at',
+        sort_order: sortOrder,
       })
       setItems(result.items)
       setTotal(result.total)
@@ -75,16 +80,16 @@ export default function WorkflowItemsTab({ projectSlug, workflowId, sourceStepId
     } finally {
       setLoading(false)
     }
-  }, [projectSlug, workflowId, sourceStepId, statusFilter, categoryFilter, page])
+  }, [projectSlug, workflowId, sourceStepId, statusFilter, categoryFilter, page, sortOrder])
 
   useEffect(() => {
     loadItems()
   }, [loadItems])
 
-  // Reset to first page when filters change
+  // Reset to first page when filters or sort change
   useEffect(() => {
     setPage(0)
-  }, [statusFilter, categoryFilter])
+  }, [statusFilter, categoryFilter, sortOrder])
 
   // Modal handlers
   const handleAddItem = () => {
@@ -249,6 +254,17 @@ export default function WorkflowItemsTab({ projectSlug, workflowId, sourceStepId
             ))}
           </select>
         )}
+
+        {/* Sort Toggle */}
+        <button
+          onClick={() => setSortOrder(prev => prev === 'desc' ? 'asc' : 'desc')}
+          className="flex items-center gap-1.5 px-3 py-2 text-sm bg-[var(--color-elevated)] border border-[var(--color-border)] rounded-lg
+                   text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-surface)] transition-colors"
+          title={sortOrder === 'desc' ? 'Showing newest first' : 'Showing oldest first'}
+        >
+          <span>{sortOrder === 'desc' ? '\u2193' : '\u2191'}</span>
+          <span>{sortOrder === 'desc' ? 'Newest first' : 'Oldest first'}</span>
+        </button>
 
         {/* Clear Filters */}
         {(statusFilter || categoryFilter || searchQuery) && (

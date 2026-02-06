@@ -27,6 +27,8 @@ class SessionEventType(str, Enum):
     TEXT = "text"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
+    THINKING = "thinking"
+    USAGE = "usage"
     ERROR = "error"
     COMPLETE = "complete"
     UNKNOWN = "unknown"
@@ -42,6 +44,8 @@ class SessionEvent:
     tool_name: Optional[str] = None
     tool_input: Optional[dict] = None
     tool_result: Optional[str] = None
+    thinking: Optional[str] = None
+    usage: Optional[dict] = None
     error_message: Optional[str] = None
     raw_data: dict = field(default_factory=dict)
 
@@ -327,6 +331,9 @@ class SessionTailer:
     def _parse_event(self, data: dict) -> SessionEvent:
         """Parse event data into a SessionEvent.
 
+        Handles both stream-json format (content_block_delta) and
+        session JSONL format (assistant/user message pairs).
+
         Args:
             data: Parsed JSON data.
 
@@ -335,14 +342,21 @@ class SessionTailer:
         """
         msg_type = data.get("type", "")
 
-        # Init event
-        if msg_type == "init" or "session_id" in data:
+        # Session JSONL: queue-operation is the first line with sessionId
+        if msg_type == "queue-operation":
             return SessionEvent(
                 type=SessionEventType.INIT,
                 raw_data=data,
             )
 
-        # Text content
+        # Stream-json: init event
+        if msg_type == "init" or (msg_type == "system" and "session_id" in data):
+            return SessionEvent(
+                type=SessionEventType.INIT,
+                raw_data=data,
+            )
+
+        # Stream-json: text content delta
         if msg_type == "content_block_delta":
             delta = data.get("delta", {})
             if delta.get("type") == "text_delta":
@@ -352,7 +366,7 @@ class SessionTailer:
                     raw_data=data,
                 )
 
-        # Tool call start
+        # Stream-json: tool call start
         if msg_type == "content_block_start":
             content = data.get("content_block", {})
             if content.get("type") == "tool_use":
@@ -363,7 +377,7 @@ class SessionTailer:
                     raw_data=data,
                 )
 
-        # Tool result
+        # Stream-json: tool result
         if msg_type == "tool_result":
             return SessionEvent(
                 type=SessionEventType.TOOL_RESULT,
@@ -380,31 +394,69 @@ class SessionTailer:
                 raw_data=data,
             )
 
-        # Message complete
+        # Stream-json: message complete
         if msg_type == "message_stop":
             return SessionEvent(
                 type=SessionEventType.COMPLETE,
                 raw_data=data,
             )
 
-        # Assistant message with content array
-        # Claude Code session format: content is at data["message"]["content"]
+        # Session JSONL: assistant message with content array
         if msg_type == "assistant":
             message = data.get("message", {})
             content = message.get("content") if message else data.get("content")
+            usage = message.get("usage") if message else None
+            is_error = data.get("isApiErrorMessage", False)
+
+            if is_error:
+                error_text = ""
+                if isinstance(content, list):
+                    for block in content:
+                        if block.get("type") == "text":
+                            error_text = block.get("text", "")
+                return SessionEvent(
+                    type=SessionEventType.ERROR,
+                    error_message=error_text or data.get("error", "API error"),
+                    raw_data=data,
+                )
+
             if isinstance(content, list):
+                # Return the first meaningful event (text > tool_use > thinking)
                 for block in content:
-                    if block.get("type") == "text":
+                    block_type = block.get("type")
+                    if block_type == "text":
                         return SessionEvent(
                             type=SessionEventType.TEXT,
                             text=block.get("text", ""),
+                            usage=usage,
                             raw_data=data,
                         )
-                    if block.get("type") == "tool_use":
+                    if block_type == "tool_use":
                         return SessionEvent(
                             type=SessionEventType.TOOL_CALL,
                             tool_name=block.get("name"),
                             tool_input=block.get("input", {}),
+                            usage=usage,
+                            raw_data=data,
+                        )
+                    if block_type == "thinking":
+                        return SessionEvent(
+                            type=SessionEventType.THINKING,
+                            thinking=block.get("thinking", ""),
+                            usage=usage,
+                            raw_data=data,
+                        )
+
+        # Session JSONL: user message with tool results
+        if msg_type == "user":
+            message = data.get("message", {})
+            content = message.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if block.get("type") == "tool_result":
+                        return SessionEvent(
+                            type=SessionEventType.TOOL_RESULT,
+                            tool_result=str(block.get("content", ""))[:1000],
                             raw_data=data,
                         )
 

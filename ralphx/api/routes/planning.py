@@ -459,7 +459,7 @@ async def stream_planning_response(slug: str, workflow_id: str):
             async for event in service.stream_response(
                 messages,
                 model=model,
-                tools=allowed_tools if allowed_tools else None,
+                tools=allowed_tools,
                 timeout=timeout,
             ):
                 if event.type == AdapterEvent.TEXT:

@@ -412,7 +412,7 @@ Start your response with <design_doc> immediately.
         async for event in adapter.stream(
             prompt=prompt,
             model=model,
-            tools=None,
+            tools=[],  # Explicitly disable tools for artifact generation
             timeout=180,  # Allow more time for artifact generation
         ):
             yield event

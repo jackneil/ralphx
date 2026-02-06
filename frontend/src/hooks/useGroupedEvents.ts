@@ -11,7 +11,9 @@ export interface SessionEvent {
   tool_input?: object
   tool_result?: string
   error_message?: string
-  raw_data?: string
+  raw_data?: unknown
+  thinking?: string
+  usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }
 }
 
 export interface IterationData {
@@ -19,6 +21,7 @@ export interface IterationData {
   mode: string | null
   status: string | null
   is_live: boolean
+  account_email?: string | null
   events: SessionEvent[]
 }
 
@@ -160,10 +163,27 @@ export function useGroupedEvents({
   const handleSSEEvent = useCallback((event: SSEEvent) => {
     const { type, data } = event
 
-    // Skip non-content events (heartbeat, connected, disconnected are control events;
-    // info is a backend status message like "No session found" that should not
+    // Handle status event — update run state but DON'T add as visible event
+    // (prevents spurious "Iteration 0" from appearing in the UI)
+    if (type === 'status') {
+      const eventRunId = data.run_id as string | undefined
+      if (eventRunId) {
+        liveContextRef.current.runId = eventRunId
+        liveContextRef.current.iteration = data.iteration as number || liveContextRef.current.iteration
+        setRuns((prev) => {
+          const updated = { ...prev }
+          if (updated[eventRunId]) {
+            updated[eventRunId].status = data.status as string || updated[eventRunId].status
+          }
+          return updated
+        })
+      }
+      return
+    }
+
+    // Skip non-content events (control/plumbing events that should not
     // be inserted into the run/iteration event tree)
-    if (['heartbeat', 'connected', 'disconnected', 'info'].includes(type)) {
+    if (['heartbeat', 'connected', 'disconnected', 'info', 'session_start'].includes(type)) {
       return
     }
 
@@ -196,6 +216,8 @@ export function useGroupedEvents({
       tool_input: data.input as object | undefined,
       tool_result: data.result as string | undefined,
       error_message: data.message as string | undefined,
+      thinking: type === 'thinking' ? data.content as string | undefined : undefined,
+      usage: type === 'usage' ? data.data as SessionEvent['usage'] : undefined,
     }
 
     setRuns((prev) => {
@@ -233,12 +255,6 @@ export function useGroupedEvents({
 
       // Mark as live
       updated[runId].iterations[iteration].is_live = true
-
-      // Handle status event - might indicate new iteration or run state change
-      if (type === 'status') {
-        updated[runId].status = data.status as string || updated[runId].status
-        liveContextRef.current.iteration = data.iteration as number || iteration
-      }
 
       // Handle complete event
       if (type === 'complete') {

@@ -73,7 +73,7 @@ modes:
     description: "Extract stories from design documents"
     model: sonnet
     timeout: 300
-    tools: []
+    tools: [Read, Glob, Grep]
     prompt_template: prompts/extract.md
 
   research:
@@ -102,6 +102,10 @@ PLANNING_EXTRACT_PROMPT = """# Story Extraction Mode
 
 You are analyzing design documents to extract user stories for implementation.
 
+## Design Document
+
+{{design_doc}}
+
 ## Existing Stories (DO NOT DUPLICATE)
 
 Total stories generated so far: {{total_stories}}
@@ -116,14 +120,15 @@ Use these to assign the next available ID for each category:
 
 ## Input Documents
 
-The following documents are available in the inputs directory:
+The following input files are available. Use the Read tool to read any files you need:
 {{inputs_list}}
 
 ## Your Task
 
-1. Read through the design documents carefully
-2. Generate NEW stories (do not duplicate existing ones above)
-3. For each story, provide:
+1. Read any input documents listed above using the Read tool
+2. Analyze the design document and input files thoroughly
+3. Generate NEW stories (do not duplicate existing ones above)
+4. For each story, provide:
    - **ID**: Use format CATEGORY-NNN (see category stats for next number)
    - A clear title
    - User story format: "As a [user], I want [feature] so that [benefit]"
@@ -345,7 +350,7 @@ modes:
     description: "Analyze all stories for Phase 1 grouping"
     model: sonnet
     timeout: 600
-    tools: []
+    tools: [Read, Glob, Grep]
     prompt_template: prompts/phase1-analyze.md
     phase: phase_1
 
@@ -719,6 +724,7 @@ def generate_simple_planning_config(
     max_iterations: Optional[int] = None,
     cooldown_between_iterations: Optional[int] = None,
     max_consecutive_errors: Optional[int] = None,
+    tools: Optional[list[str]] = None,
 ) -> str:
     """Generate YAML config for a simple planning loop.
 
@@ -729,6 +735,7 @@ def generate_simple_planning_config(
         max_iterations: Override for max iterations (default: 100).
         cooldown_between_iterations: Override for cooldown in seconds (default: 5).
         max_consecutive_errors: Override for max consecutive errors (default: 5).
+        tools: Override for allowed tools (default: [Read, Glob, Grep]).
 
     Returns:
         YAML configuration string.
@@ -739,6 +746,14 @@ def generate_simple_planning_config(
     max_iter = max_iterations if max_iterations is not None else 100
     cooldown = cooldown_between_iterations if cooldown_between_iterations is not None else 5
     max_errors = max_consecutive_errors if max_consecutive_errors is not None else 5
+    tool_list = tools if tools is not None else ["Read", "Glob", "Grep"]
+
+    # Build tools YAML block
+    # Empty list must produce "tools: []" (disable all), not "tools:" (parsed as None/use defaults)
+    if tool_list:
+        tools_yaml = "tools:\n" + "\n".join(f"      - {t}" for t in tool_list)
+    else:
+        tools_yaml = "tools: []"
 
     return f"""name: {name}
 display_name: "{display_name}"
@@ -757,7 +772,7 @@ modes:
     model: sonnet
     timeout: 300
     prompt_template: .ralphx/loops/{name}/prompts/planning.md
-    tools: []
+    {tools_yaml}
 
 mode_selection:
   strategy: fixed
@@ -782,6 +797,7 @@ def generate_simple_implementation_config(
     max_iterations: Optional[int] = None,
     cooldown_between_iterations: Optional[int] = None,
     max_consecutive_errors: Optional[int] = None,
+    tools: Optional[list[str]] = None,
 ) -> str:
     """Generate YAML config for a simple implementation loop.
 
@@ -793,6 +809,7 @@ def generate_simple_implementation_config(
         max_iterations: Override for max iterations (default: 50).
         cooldown_between_iterations: Override for cooldown in seconds (default: 5).
         max_consecutive_errors: Override for max consecutive errors (default: 3).
+        tools: Override for allowed tools (default: [Read, Write, Edit, Bash, Glob, Grep]).
 
     Returns:
         YAML configuration string.
@@ -804,6 +821,14 @@ def generate_simple_implementation_config(
     max_iter = max_iterations if max_iterations is not None else 50
     cooldown = cooldown_between_iterations if cooldown_between_iterations is not None else 5
     max_errors = max_consecutive_errors if max_consecutive_errors is not None else 3
+    tool_list = tools if tools is not None else ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+
+    # Build tools YAML block
+    # Empty list must produce "tools: []" (disable all), not "tools:" (parsed as None/use defaults)
+    if tool_list:
+        tools_yaml = "tools:\n" + "\n".join(f"      - {t}" for t in tool_list)
+    else:
+        tools_yaml = "tools: []"
 
     return f"""name: {name}
 display_name: "{display_name}"
@@ -827,13 +852,7 @@ modes:
     model: sonnet
     timeout: 1800
     prompt_template: .ralphx/loops/{name}/prompts/implement.md
-    tools:
-      - Read
-      - Write
-      - Edit
-      - Bash
-      - Glob
-      - Grep
+    {tools_yaml}
 
 mode_selection:
   strategy: fixed

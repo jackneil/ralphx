@@ -45,7 +45,7 @@ const PROCESSING_TYPES: Record<ProcessingType, ProcessingTypeConfig> = {
     step_type: 'autonomous',
     loopType: 'generator',
     template: 'extractgen_requirements',
-    defaultTools: ['WebSearch', 'WebFetch'],
+    defaultTools: ['Read', 'Glob', 'Grep'],
     defaults: {
       model: 'opus',
       timeout: 600,
@@ -61,7 +61,7 @@ const PROCESSING_TYPES: Record<ProcessingType, ProcessingTypeConfig> = {
     step_type: 'autonomous',
     loopType: 'generator',
     template: 'webgen_requirements',
-    defaultTools: ['WebSearch', 'WebFetch'],
+    defaultTools: ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'],
     defaults: {
       model: 'opus',
       timeout: 900,  // Higher for web research
@@ -944,7 +944,7 @@ export default function StepSettings({ step, projectSlug, allSteps, onChange }: 
                   </div>
                 ) : (
                   <div className="p-3 bg-gray-800/50 border border-gray-700 rounded-lg text-gray-400 text-sm">
-                    This is the recommended prompt for {currentProcessingType === 'extractgen_requirements' ? 'Extract Requirements (Story Extraction)' : 'Implementation'} steps.
+                    This is the recommended prompt for {currentProcessingType === 'extractgen_requirements' ? 'Extract Requirements (Story Extraction)' : currentProcessingType === 'webgen_requirements' ? 'Web Research (Story Discovery)' : 'Implementation'} steps.
                   </div>
                 )}
 

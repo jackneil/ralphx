@@ -1,10 +1,29 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams, useLocation } from 'react-router-dom'
 import { useDashboardStore } from '../stores/dashboard'
 import { listWorkflows, Workflow } from '../api'
 
+const SIDEBAR_POLL_MS = 30_000 // refetch workflows every 30s
+
+function StepStatusIcon({ status }: { status: string }) {
+  switch (status) {
+    case 'completed':
+      return (
+        <svg className="w-3 h-3 text-green-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+        </svg>
+      )
+    case 'active':
+      return <span className="w-2 h-2 rounded-full bg-primary-400 animate-pulse flex-shrink-0" />
+    case 'skipped':
+      return <span className="w-2 h-2 rounded-full bg-yellow-600 flex-shrink-0" />
+    default: // pending or unknown
+      return <span className="w-2 h-2 rounded-full bg-gray-600 flex-shrink-0" />
+  }
+}
+
 export default function Sidebar() {
-  const { slug, workflowId } = useParams()
+  const { slug, workflowId, stepNumber } = useParams()
   const location = useLocation()
   const {
     projects,
@@ -15,6 +34,8 @@ export default function Sidebar() {
 
   const [expandedProject, setExpandedProject] = useState<string | null>(null)
   const [projectWorkflows, setProjectWorkflows] = useState<Record<string, Workflow[]>>({})
+  const [expandedWorkflows, setExpandedWorkflows] = useState<Set<string>>(new Set())
+  const loadedProjectsRef = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     loadProjects()
@@ -27,20 +48,56 @@ export default function Sidebar() {
     }
   }, [slug])
 
-  // Load workflows for expanded project
-  useEffect(() => {
-    if (!expandedProject || projectWorkflows[expandedProject]) return
-
-    listWorkflows(expandedProject)
+  // Fetch workflows for a project (used for initial load + polling)
+  const fetchWorkflows = useCallback((projectSlug: string) => {
+    listWorkflows(projectSlug)
       .then(workflows => {
-        setProjectWorkflows(prev => ({ ...prev, [expandedProject]: workflows }))
+        setProjectWorkflows(prev => ({ ...prev, [projectSlug]: workflows }))
+        // Auto-expand new workflows additively
+        setExpandedWorkflows(prev => {
+          const next = new Set(prev)
+          for (const w of workflows) {
+            if (!prev.has(w.id)) next.add(w.id)
+          }
+          return next
+        })
       })
       .catch(() => {
-        setProjectWorkflows(prev => ({ ...prev, [expandedProject]: [] }))
+        setProjectWorkflows(prev => ({ ...prev, [projectSlug]: [] }))
       })
-  }, [expandedProject, projectWorkflows])
+  }, [])
+
+  // Load workflows on project expand + clear stale state on switch
+  useEffect(() => {
+    if (!expandedProject) return
+
+    // Clear stale expand state when switching projects
+    if (!loadedProjectsRef.current.has(expandedProject)) {
+      setExpandedWorkflows(new Set())
+    }
+
+    // Always fetch (initial or refresh)
+    fetchWorkflows(expandedProject)
+    loadedProjectsRef.current.add(expandedProject)
+  }, [expandedProject, fetchWorkflows])
+
+  // Poll for workflow/step freshness while a project is expanded
+  useEffect(() => {
+    if (!expandedProject) return
+    const interval = setInterval(() => fetchWorkflows(expandedProject), SIDEBAR_POLL_MS)
+    return () => clearInterval(interval)
+  }, [expandedProject, fetchWorkflows])
 
   const isSettingsPage = location.pathname.endsWith('/settings')
+
+  const toggleWorkflow = (wfId: string) => {
+    setExpandedWorkflows(prev => {
+      const next = new Set(prev)
+      if (next.has(wfId)) next.delete(wfId)
+      else next.add(wfId)
+      return next
+    })
+  }
 
   return (
     <aside className="w-64 bg-gray-800 border-r border-gray-700 flex flex-col">
@@ -79,6 +136,18 @@ export default function Sidebar() {
             const workflows = projectWorkflows[project.slug] || []
             const activeWorkflows = workflows.filter(w => w.status === 'active' || w.status === 'draft' || w.status === 'paused')
 
+            // Always include the currently-viewed workflow even if beyond top 5
+            const MAX_SIDEBAR_WORKFLOWS = 5
+            let visibleWorkflows = activeWorkflows.slice(0, MAX_SIDEBAR_WORKFLOWS)
+            const currentWfInList = workflowId && visibleWorkflows.some(w => w.id === workflowId)
+            if (workflowId && !currentWfInList && isActive) {
+              const currentWf = activeWorkflows.find(w => w.id === workflowId)
+                || workflows.find(w => w.id === workflowId) // might be completed/failed
+              if (currentWf) {
+                visibleWorkflows = [currentWf, ...visibleWorkflows.slice(0, MAX_SIDEBAR_WORKFLOWS - 1)]
+              }
+            }
+
             return (
               <li key={project.slug}>
                 <div className="flex items-center">
@@ -111,34 +180,80 @@ export default function Sidebar() {
                   </Link>
                 </div>
 
-                {/* Expanded content - workflows */}
+                {/* Expanded content - workflows & steps */}
                 {isExpanded && (
-                  <div className="ml-6 mt-1 space-y-1">
-                    {activeWorkflows.length > 0 ? (
-                      activeWorkflows.slice(0, 5).map(workflow => {
-                        const currentStep = workflow.steps.find(s => s.step_number === workflow.current_step)
+                  <div className="ml-6 mt-1 space-y-0.5">
+                    {visibleWorkflows.length > 0 ? (
+                      visibleWorkflows.map(workflow => {
+                        const isWfExpanded = expandedWorkflows.has(workflow.id)
+                        const steps = [...(workflow.steps || [])]
+                          .filter(s => !s.archived_at)
+                          .sort((a, b) => a.step_number - b.step_number)
+
                         return (
-                          <Link
-                            key={workflow.id}
-                            to={`/projects/${project.slug}/workflows/${workflow.id}`}
-                            className={`block px-2 py-1.5 rounded text-xs transition-colors ${
-                              workflowId === workflow.id
-                                ? 'bg-gray-700 text-white'
-                                : 'text-gray-400 hover:bg-gray-700 hover:text-white'
-                            }`}
-                          >
-                            <div className="flex items-center space-x-2">
-                              <span className={`w-1.5 h-1.5 rounded-full ${
-                                workflow.status === 'active' ? 'bg-green-400 animate-pulse' : 'bg-gray-500'
-                              }`} />
-                              <span className="truncate">{workflow.name}</span>
+                          <div key={workflow.id}>
+                            {/* Workflow row: chevron + link */}
+                            <div className="flex items-center">
+                              {steps.length > 0 ? (
+                                <button
+                                  onClick={() => toggleWorkflow(workflow.id)}
+                                  className="p-0.5 text-gray-500 hover:text-white"
+                                  aria-label={isWfExpanded ? 'Collapse steps' : 'Expand steps'}
+                                >
+                                  <svg
+                                    className={`w-3 h-3 transition-transform ${isWfExpanded ? 'rotate-90' : ''}`}
+                                    fill="none"
+                                    stroke="currentColor"
+                                    viewBox="0 0 24 24"
+                                  >
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                  </svg>
+                                </button>
+                              ) : (
+                                <span className="w-4" />
+                              )}
+                              <Link
+                                to={`/projects/${project.slug}/workflows/${workflow.id}`}
+                                className={`flex-1 flex items-center space-x-2 px-2 py-1.5 rounded text-xs transition-colors ${
+                                  workflowId === workflow.id && !stepNumber
+                                    ? 'bg-gray-700 text-white'
+                                    : 'text-gray-400 hover:bg-gray-700 hover:text-white'
+                                }`}
+                              >
+                                <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                                  workflow.status === 'active' ? 'bg-green-400 animate-pulse' : 'bg-gray-500'
+                                }`} />
+                                <span className="truncate">{workflow.name}</span>
+                              </Link>
                             </div>
-                            {currentStep && workflow.status === 'active' && (
-                              <div className="ml-4 mt-0.5 text-[10px] text-gray-500 truncate">
-                                Step {workflow.current_step}: {currentStep.name}
+
+                            {/* Steps (expanded by default) */}
+                            {isWfExpanded && steps.length > 0 && (
+                              <div className="ml-5 space-y-0.5">
+                                {steps.map(step => {
+                                  const isActiveStep = workflowId === workflow.id && stepNumber === String(step.step_number)
+                                  return (
+                                    <Link
+                                      key={step.id}
+                                      to={`/projects/${project.slug}/workflows/${workflow.id}/steps/${step.step_number}`}
+                                      className={`block px-2 py-1 rounded text-[11px] transition-colors ${
+                                        isActiveStep
+                                          ? 'bg-gray-700 text-white'
+                                          : 'text-gray-500 hover:text-gray-300 hover:bg-gray-700/50'
+                                      }`}
+                                    >
+                                      <div className="flex items-center space-x-1.5">
+                                        <StepStatusIcon status={step.status} />
+                                        <span className={`truncate ${step.status === 'skipped' ? 'line-through' : ''}`}>
+                                          {step.name}
+                                        </span>
+                                      </div>
+                                    </Link>
+                                  )
+                                })}
                               </div>
                             )}
-                          </Link>
+                          </div>
                         )
                       })
                     ) : (
@@ -147,12 +262,12 @@ export default function Sidebar() {
                       </div>
                     )}
 
-                    {activeWorkflows.length > 5 && (
+                    {activeWorkflows.length > MAX_SIDEBAR_WORKFLOWS && (
                       <Link
                         to={`/projects/${project.slug}`}
                         className="block px-2 py-1 text-xs text-gray-500 hover:text-gray-400"
                       >
-                        +{activeWorkflows.length - 5} more
+                        +{activeWorkflows.length - MAX_SIDEBAR_WORKFLOWS} more
                       </Link>
                     )}
 

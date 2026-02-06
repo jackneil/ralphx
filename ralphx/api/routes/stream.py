@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
 from ralphx.core.project import ProjectManager
-from ralphx.core.session import SessionEventType, SessionManager, SessionTailer
+from ralphx.core.session import SessionManager
 from ralphx.models.run import RunStatus
 
 router = APIRouter()
@@ -179,13 +179,18 @@ async def _tail_session(
     run_id: Optional[str] = None,
     iteration: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
-    """Tail a specific session file, storing events to DB for history.
+    """Stream session events from DB via polling.
+
+    Events are persisted to the session_events table by the executor's
+    persist_event callback. This function polls that table and yields
+    SSE events as they appear — same pattern as planning.py's
+    stream_iteration_progress().
 
     Args:
         session_manager: Session manager instance.
         session_id: Session UUID.
-        project_path: Project directory path.
-        project_db: ProjectDatabase for storing events.
+        project_path: Project directory path (used for optional file metadata).
+        project_db: ProjectDatabase for reading events.
         from_beginning: Start from file beginning.
         run_id: Run ID for this session.
         iteration: Iteration number for this session.
@@ -195,16 +200,12 @@ async def _tail_session(
     """
     from pathlib import Path
 
+    # Session file is optional metadata — streaming uses DB polling, not file tailing
     session_file = session_manager.find_session_file(
         session_id=session_id,
         project_path=Path(project_path),
     )
-
-    if not session_file:
-        yield await format_sse("error", {
-            "message": f"Session file not found: {session_id}"
-        })
-        return
+    # Don't abort if file not found — we stream from DB
 
     # Get session info if not provided
     if run_id is None or iteration is None:
@@ -250,6 +251,16 @@ async def _tail_session(
                 "message": db_event.get("error_message"),
                 **event_meta,
             })
+        elif event_type == "thinking":
+            yield await format_sse("thinking", {
+                "content": db_event.get("content", ""),
+                **event_meta,
+            })
+        elif event_type == "usage":
+            yield await format_sse("usage", {
+                "data": db_event.get("raw_data"),
+                **event_meta,
+            })
         elif event_type == "init":
             yield await format_sse("init", {
                 "data": db_event.get("raw_data"),
@@ -261,64 +272,95 @@ async def _tail_session(
 
     yield await format_sse("session_start", {
         "session_id": session_id,
-        "file": str(session_file),
+        "file": str(session_file) if session_file else None,
         "history_events": len(existing_events),
         "run_id": run_id,
         "iteration": iteration,
     })
 
-    # Now tail the file for new events, starting from where DB left off
-    # If we have history, start from end of file to avoid duplicates
-    tailer = SessionTailer(
-        session_path=session_file,
-        from_beginning=from_beginning and len(existing_events) == 0,
-    )
-
+    # Poll DB for new events (same pattern as planning.py stream_iteration_progress)
+    # This replaces the SessionTailer file-tailing approach to unify streaming
     try:
-        async for event in tailer.tail():
-            # Skip UNKNOWN events (like queue-operation, user messages)
-            if event.type == SessionEventType.UNKNOWN:
-                continue
+        while True:
+            # Fetch new events since last seen
+            new_events = project_db.get_session_events(session_id, after_id=last_db_event_id)
 
-            # Stream events to client (persistence handled by executor)
-            if event.type == SessionEventType.TEXT:
-                yield await format_sse("text", {
-                    "content": event.text,
-                    **event_meta,
-                })
+            for db_event in new_events:
+                last_db_event_id = db_event.get("id", 0)
+                event_type = db_event.get("event_type", "unknown")
 
-            elif event.type == SessionEventType.TOOL_CALL:
-                yield await format_sse("tool_call", {
-                    "name": event.tool_name,
-                    "input": event.tool_input,
-                    **event_meta,
-                })
+                if event_type == "text":
+                    yield await format_sse("text", {
+                        "content": db_event.get("content", ""),
+                        **event_meta,
+                    })
+                elif event_type == "tool_call":
+                    yield await format_sse("tool_call", {
+                        "name": db_event.get("tool_name"),
+                        "input": db_event.get("tool_input"),
+                        **event_meta,
+                    })
+                elif event_type == "tool_result":
+                    yield await format_sse("tool_result", {
+                        "name": db_event.get("tool_name"),
+                        "result": db_event.get("tool_result"),
+                        **event_meta,
+                    })
+                elif event_type == "error":
+                    yield await format_sse("error", {
+                        "message": db_event.get("error_message"),
+                        **event_meta,
+                    })
+                elif event_type == "thinking":
+                    yield await format_sse("thinking", {
+                        "content": db_event.get("content", ""),
+                        **event_meta,
+                    })
+                elif event_type == "usage":
+                    yield await format_sse("usage", {
+                        "data": db_event.get("raw_data"),
+                        **event_meta,
+                    })
+                elif event_type == "complete":
+                    yield await format_sse("complete", event_meta)
+                    return  # Session complete
+                elif event_type == "init":
+                    yield await format_sse("init", {
+                        "data": db_event.get("raw_data"),
+                        **event_meta,
+                    })
 
-            elif event.type == SessionEventType.TOOL_RESULT:
-                yield await format_sse("tool_result", {
-                    "name": event.tool_name,
-                    "result": event.tool_result[:1000] if event.tool_result else None,
-                    **event_meta,
-                })
-
-            elif event.type == SessionEventType.ERROR:
-                yield await format_sse("error", {
-                    "message": event.error_message,
-                    **event_meta,
-                })
-
-            elif event.type == SessionEventType.COMPLETE:
-                yield await format_sse("complete", event_meta)
+            # Check if session is done (status updated by executor)
+            session_info = project_db.get_session(session_id)
+            if session_info and session_info.get("status") in ("completed", "error"):
+                # Drain any remaining events
+                final_events = project_db.get_session_events(session_id, after_id=last_db_event_id)
+                for db_event in final_events:
+                    last_db_event_id = db_event.get("id", 0)
+                    event_type = db_event.get("event_type", "unknown")
+                    if event_type == "text":
+                        yield await format_sse("text", {"content": db_event.get("content", ""), **event_meta})
+                    elif event_type == "tool_call":
+                        yield await format_sse("tool_call", {"name": db_event.get("tool_name"), "input": db_event.get("tool_input"), **event_meta})
+                    elif event_type == "tool_result":
+                        yield await format_sse("tool_result", {"name": db_event.get("tool_name"), "result": db_event.get("tool_result"), **event_meta})
+                    elif event_type == "error":
+                        yield await format_sse("error", {"message": db_event.get("error_message"), **event_meta})
+                    elif event_type == "complete":
+                        yield await format_sse("complete", event_meta)
+                    elif event_type == "thinking":
+                        yield await format_sse("thinking", {"content": db_event.get("content", ""), **event_meta})
+                    elif event_type == "usage":
+                        yield await format_sse("usage", {"data": db_event.get("raw_data"), **event_meta})
+                    elif event_type == "init":
+                        yield await format_sse("init", {"data": db_event.get("raw_data"), **event_meta})
                 break
 
-            elif event.type == SessionEventType.INIT:
-                yield await format_sse("init", {
-                    "data": event.raw_data,
-                    **event_meta,
-                })
+            # Heartbeat + poll interval (same as planning.py)
+            yield await format_sse("heartbeat", {})
+            await asyncio.sleep(0.5)
 
     except asyncio.CancelledError:
-        tailer.stop()
         yield await format_sse("disconnected", {})
 
 
@@ -452,6 +494,7 @@ async def list_sessions(
             "status": s.status,
             "started_at": s.started_at.isoformat() if s.started_at else None,
             "duration_seconds": s.duration_seconds,
+            "account_email": s.account_email,
         }
         for s in sessions
     ]
@@ -484,6 +527,7 @@ async def get_session(
         "started_at": session.started_at.isoformat() if session.started_at else None,
         "duration_seconds": session.duration_seconds,
         "items_added": session.items_added,
+        "account_email": session.account_email,
     }
 
 
@@ -527,7 +571,7 @@ async def get_session_events(
 async def get_grouped_events(
     slug: str,
     loop_name: str,
-    limit_runs: int = Query(5, ge=1, le=50, description="Max runs to return"),
+    limit_runs: int = Query(20, ge=1, le=50, description="Max runs to return"),
     limit_sessions: int = Query(20, ge=1, le=100, description="Max sessions per run"),
     limit_events: int = Query(200, ge=1, le=1000, description="Max events per session"),
 ):
@@ -579,6 +623,7 @@ async def get_grouped_events(
                 "mode": session.mode,
                 "status": session.status,
                 "is_live": is_live,
+                "account_email": session.account_email,
                 "events": events,
                 "events_truncated": len(events) >= limit_events,
             }

@@ -218,7 +218,7 @@ export default function SessionHistory({
       <div
         ref={containerRef}
         onScroll={handleScroll}
-        className="max-h-[500px] overflow-y-auto custom-scrollbar"
+        className="max-h-[calc(100vh-300px)] min-h-[400px] overflow-y-auto custom-scrollbar"
       >
         {loading ? (
           <div className="flex items-center justify-center py-12 text-[var(--color-text-muted)]">
@@ -373,7 +373,7 @@ function RunSection({
 
       {/* Run Content */}
       <div
-        className={`overflow-hidden transition-all duration-300 ${isExpanded ? 'max-h-[3000px] opacity-100' : 'max-h-0 opacity-0'}`}
+        className={`transition-all duration-300 ${isExpanded ? 'max-h-none opacity-100' : 'max-h-0 opacity-0 overflow-hidden'}`}
       >
         <div className="ml-4 pl-4 border-l-2 border-[var(--color-border)] space-y-0.5">
           {/* Error banner for aborted/error runs */}
@@ -477,6 +477,12 @@ function IterationSection({
           <span className="text-xs text-[var(--color-text-muted)]">({data.mode})</span>
         )}
 
+        {data.account_email && (
+          <span className="text-xs font-mono text-[var(--color-text-muted)] opacity-60 truncate max-w-[140px]" title={data.account_email}>
+            {data.account_email}
+          </span>
+        )}
+
         <span className="ml-auto font-mono text-xs text-[var(--color-text-muted)]">
           {data.events.length} events
         </span>
@@ -484,7 +490,7 @@ function IterationSection({
 
       {/* Iteration Events */}
       <div
-        className={`overflow-hidden transition-all duration-200 ${isExpanded ? 'max-h-[2000px] opacity-100' : 'max-h-0 opacity-0'}`}
+        className={`transition-all duration-200 ${isExpanded ? 'max-h-none opacity-100' : 'max-h-0 opacity-0 overflow-hidden'}`}
       >
         <div className="ml-4 pl-4 border-l border-[var(--color-border)]/50 space-y-0.5 py-1">
           {data.events.map((event, idx) => {
@@ -510,6 +516,8 @@ const EVENT_STYLES: Record<string, { icon: string; color: string; bg: string }> 
   text: { icon: '💬', color: 'text-[var(--color-text-secondary)]', bg: 'bg-[var(--color-elevated)]' },
   tool_call: { icon: '🔧', color: 'text-[var(--color-cyan)]', bg: 'bg-[var(--color-cyan)]/10' },
   tool_result: { icon: '✓', color: 'text-[var(--color-emerald)]', bg: 'bg-[var(--color-emerald)]/10' },
+  thinking: { icon: '💭', color: 'text-[var(--color-text-muted)]', bg: 'bg-[var(--color-elevated)]' },
+  usage: { icon: '📊', color: 'text-[var(--color-amber)]', bg: 'bg-[var(--color-amber)]/10' },
   error: { icon: '✕', color: 'text-[var(--color-rose)]', bg: 'bg-[var(--color-rose)]/10' },
   init: { icon: '⚡', color: 'text-[var(--color-violet)]', bg: 'bg-[var(--color-violet)]/10' },
   complete: { icon: '✓', color: 'text-[var(--color-emerald)]', bg: 'bg-[var(--color-emerald)]/10' },
@@ -579,7 +587,7 @@ function EventItem({ event, isExpanded, isLive, onToggle }: EventItemProps) {
       {hasContent && (
         <div
           ref={contentRef}
-          className={`overflow-hidden transition-all duration-200 ${isExpanded ? 'max-h-96 opacity-100' : 'max-h-0 opacity-0'}`}
+          className={`transition-all duration-200 ${isExpanded ? 'max-h-none opacity-100' : 'max-h-0 opacity-0 overflow-hidden'}`}
         >
           <div className="ml-8 mr-2 mb-2 p-3 bg-[var(--color-deep)] rounded-lg border border-[var(--color-border)]">
             <EventContent event={event} />
@@ -619,13 +627,13 @@ function TextContent({ content }: { content: string }) {
           <StoriesDisplay stories={(parsed as { stories: Array<{ id?: string; title?: string; content?: string }> }).stories} />
         ) : parsed ? (
           <div className="p-3 bg-[var(--color-void)] rounded-lg border border-[var(--color-border)]">
-            <pre className="text-xs font-mono text-[var(--color-text-secondary)] overflow-auto max-h-48 custom-scrollbar">
+            <pre className="text-xs font-mono text-[var(--color-text-secondary)] overflow-auto max-h-96 custom-scrollbar">
               {JSON.stringify(parsed, null, 2)}
             </pre>
           </div>
         ) : (
           <div className="p-3 bg-[var(--color-void)] rounded-lg border border-[var(--color-border)]">
-            <pre className="text-xs font-mono text-[var(--color-text-secondary)] overflow-auto max-h-48 custom-scrollbar whitespace-pre-wrap">
+            <pre className="text-xs font-mono text-[var(--color-text-secondary)] overflow-auto max-h-96 custom-scrollbar whitespace-pre-wrap">
               {jsonStr}
             </pre>
           </div>
@@ -666,7 +674,7 @@ function StoriesDisplay({ stories }: { stories: Array<{ id?: string; title?: str
           </button>
         )}
       </div>
-      <div className="space-y-2 max-h-64 overflow-y-auto custom-scrollbar">
+      <div className="space-y-2 max-h-96 overflow-y-auto custom-scrollbar">
         {displayStories.map((story, idx) => (
           <div
             key={story.id || idx}
@@ -685,7 +693,7 @@ function StoriesDisplay({ stories }: { stories: Array<{ id?: string; title?: str
                   </div>
                 )}
                 {story.content && (
-                  <p className="text-xs text-[var(--color-text-secondary)] line-clamp-2">
+                  <p className="text-xs text-[var(--color-text-secondary)]">
                     {story.content}
                   </p>
                 )}
@@ -730,7 +738,7 @@ function EventContent({ event }: { event: SessionEvent }) {
                 {showJson ? 'Hide' : 'Show'} Input
               </button>
               {showJson && (
-                <pre className="mt-2 p-2 bg-[var(--color-void)] rounded text-xs font-mono overflow-auto max-h-48 text-[var(--color-text-secondary)] custom-scrollbar">
+                <pre className="mt-2 p-2 bg-[var(--color-void)] rounded text-xs font-mono overflow-auto max-h-96 text-[var(--color-text-secondary)] custom-scrollbar">
                   {JSON.stringify(event.tool_input, null, 2)}
                 </pre>
               )}
@@ -743,13 +751,48 @@ function EventContent({ event }: { event: SessionEvent }) {
       return (
         <div className="space-y-2">
           <div className="font-mono text-sm font-semibold text-[var(--color-emerald)]">
-            {event.tool_name} → result
+            {event.tool_name ? `${event.tool_name} → result` : 'Tool result'}
           </div>
-          <pre className="p-2 bg-[var(--color-void)] rounded text-xs font-mono overflow-auto max-h-48 text-[var(--color-text-secondary)] custom-scrollbar whitespace-pre-wrap">
-            {truncate(event.tool_result || '', 1000)}
+          <pre className="p-2 bg-[var(--color-void)] rounded text-xs font-mono overflow-auto max-h-80 text-[var(--color-text-secondary)] custom-scrollbar whitespace-pre-wrap">
+            {event.tool_result || ''}
           </pre>
         </div>
       )
+
+    case 'thinking':
+      return (
+        <div className="space-y-1">
+          <span className="text-xs font-mono text-[var(--color-text-muted)] uppercase tracking-wider">Thinking</span>
+          <p className="text-sm text-[var(--color-text-muted)] italic whitespace-pre-wrap opacity-75">
+            {truncate(event.content || event.thinking || '', 2000)}
+          </p>
+        </div>
+      )
+
+    case 'usage': {
+      // usage comes from SSE as event.usage, or from DB API as event.raw_data (already parsed)
+      const usage = event.usage || (typeof event.raw_data === 'string' ? JSON.parse(event.raw_data) : event.raw_data) || null
+      if (!usage) return null
+      return (
+        <div className="flex items-center gap-4 text-xs font-mono">
+          {usage.input_tokens != null && (
+            <span className="text-[var(--color-text-muted)]">
+              In: <span className="text-[var(--color-amber)]">{usage.input_tokens.toLocaleString()}</span>
+            </span>
+          )}
+          {usage.output_tokens != null && (
+            <span className="text-[var(--color-text-muted)]">
+              Out: <span className="text-[var(--color-amber)]">{usage.output_tokens.toLocaleString()}</span>
+            </span>
+          )}
+          {usage.cache_read_input_tokens != null && usage.cache_read_input_tokens > 0 && (
+            <span className="text-[var(--color-text-muted)]">
+              Cache: <span className="text-[var(--color-emerald)]">{usage.cache_read_input_tokens.toLocaleString()}</span>
+            </span>
+          )}
+        </div>
+      )
+    }
 
     case 'error':
       return (
@@ -760,7 +803,7 @@ function EventContent({ event }: { event: SessionEvent }) {
 
     default:
       return (
-        <pre className="text-xs font-mono text-[var(--color-text-muted)] overflow-auto max-h-48 custom-scrollbar">
+        <pre className="text-xs font-mono text-[var(--color-text-muted)] overflow-auto max-h-96 custom-scrollbar">
           {JSON.stringify(event, null, 2)}
         </pre>
       )
@@ -771,6 +814,20 @@ function EventContent({ event }: { event: SessionEvent }) {
 function getEventPreview(event: SessionEvent, maxLen: number): string {
   if (event.tool_name) {
     return event.tool_name
+  }
+  if (event.event_type === 'thinking') {
+    const text = event.thinking || event.content || ''
+    return truncate(text.replace(/\n/g, ' '), maxLen)
+  }
+  if (event.event_type === 'usage') {
+    const usage = event.usage || (typeof event.raw_data === 'object' ? event.raw_data as SessionEvent['usage'] : null)
+    if (usage) {
+      const parts: string[] = []
+      if (usage.input_tokens != null) parts.push(`in:${usage.input_tokens}`)
+      if (usage.output_tokens != null) parts.push(`out:${usage.output_tokens}`)
+      return parts.join(' ') || 'usage'
+    }
+    return 'usage'
   }
   if (event.content) {
     return truncate(event.content.replace(/\n/g, ' '), maxLen)
@@ -795,6 +852,12 @@ function hasExpandableContent(event: SessionEvent): boolean {
     return true
   }
   if (event.event_type === 'tool_result' && event.tool_result) {
+    return true
+  }
+  if (event.event_type === 'thinking' && (event.thinking || event.content)) {
+    return true
+  }
+  if (event.event_type === 'usage') {
     return true
   }
   if (event.event_type === 'error' && event.error_message) {

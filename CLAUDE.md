@@ -32,9 +32,12 @@ conda create -n ralphx python=3.11 && conda activate ralphx && pip install ralph
 
 - **Use `./dev.sh` to start the server**: Do not manually run uvicorn commands. Use the dev script which handles both backend and frontend:
   ```bash
-  ./dev.sh
+  ./dev.sh          # Start (kills any existing processes on ports first)
+  ./dev.sh          # Restart — just run it again, it auto-clears ports 16767/16768
+  # Ctrl+C to stop
   ```
-- The server hot-reloads on file changes, so no need to restart manually.
+- The script auto-kills any existing processes on its ports before starting, so running `./dev.sh` again is effectively a restart.
+- Hot-reload works for most changes, but run `./dev.sh` again when in doubt (e.g., DB migrations, new dependencies).
 
 ## Testing & Debugging
 
@@ -59,6 +62,10 @@ Publishing is automated via GitHub Actions. To release a new version:
 4. **GitHub Actions auto-publishes** to PyPI via trusted publishing (OIDC)
 
 The workflow is defined in `.github/workflows/publish.yml` and triggers on `release: types: [published]`.
+
+## Lessons Learned
+
+See `lessons.md` in the project root for session-specific lessons and gotchas. Read it at the start of each session.
 
 ## Test Workflow Notes
 

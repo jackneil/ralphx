@@ -7,9 +7,12 @@ Implements:
 - Recovery flow for resuming interrupted runs
 """
 
+import asyncio
 import fcntl
 import json
 import os
+import signal
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -195,6 +198,121 @@ def is_pid_running(pid: int) -> bool:
             return True
         except OSError:
             return False
+
+
+def is_our_claude_process(pid: int) -> bool:
+    """Verify PID is actually our Claude process, not a reused PID.
+
+    This prevents PID reuse attacks where we might accidentally kill
+    an unrelated process that was assigned the same PID after our
+    Claude process terminated.
+
+    Returns False if:
+    - Process doesn't exist
+    - Can't read cmdline (permissions, etc.)
+    - Process is not a Claude CLI or Python/RalphX process
+
+    Note: There is still a small TOCTOU (time-of-check-to-time-of-use) race
+    between this check and the actual kill. This is an accepted risk that
+    is mitigated by:
+    1. The check significantly reduces the window vs. no check at all
+    2. We only use PIDs from our own database, not user input
+    3. The target must match expected process names
+    """
+    if pid <= 0:
+        return False
+
+    if sys.platform == "win32":
+        # Windows: Use tasklist to verify process name
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5
+            )
+            output = result.stdout.lower()
+            # Check for claude or python (for multiprocessing spawn)
+            return "claude" in output or "python" in output
+        except Exception:
+            return False
+
+    elif sys.platform == "darwin":
+        # macOS: Use ps command (no /proc filesystem)
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=5
+            )
+            output = result.stdout.lower()
+            return "claude" in output or "python" in output or "ralphx" in output
+        except Exception:
+            return False
+
+    else:
+        # Linux: Check /proc/{pid}/cmdline (most reliable)
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="replace").lower()
+                # cmdline uses null bytes as separators
+                return "claude" in cmdline or "python" in cmdline or "ralphx" in cmdline
+        except (OSError, IOError):
+            return False
+
+
+async def kill_orphan_process(pid: int, timeout: float = 5.0) -> tuple[bool, str]:
+    """Kill an orphan Claude/RalphX process by PID.
+
+    Returns tuple of (success, reason):
+    - (True, "killed") - Process was terminated by us
+    - (True, "already_dead") - Process was already dead
+    - (False, "not_our_process") - PID exists but isn't our process
+    - (False, "permission_denied") - Can't kill (permissions)
+    - (False, "unknown_error") - Other failure
+
+    Cross-platform notes:
+    - Linux/macOS: SIGTERM for graceful, SIGKILL for force
+    - Windows: os.kill() with any signal calls TerminateProcess (immediate)
+    """
+    # Check if process is already dead
+    if not is_pid_running(pid):
+        return (True, "already_dead")
+
+    # Validate this is our process
+    if not is_our_claude_process(pid):
+        return (False, "not_our_process")
+
+    try:
+        if sys.platform == "win32":
+            # Windows: TerminateProcess is immediate, no graceful option
+            os.kill(pid, signal.SIGTERM)  # Actually calls TerminateProcess
+            await asyncio.sleep(0.1)
+            if not is_pid_running(pid):
+                return (True, "killed")
+            return (False, "unknown_error")
+        else:
+            # Unix: Send SIGTERM for graceful shutdown
+            os.kill(pid, signal.SIGTERM)
+
+            # Wait for process to die
+            for _ in range(int(timeout * 10)):
+                await asyncio.sleep(0.1)
+                if not is_pid_running(pid):
+                    return (True, "killed")
+
+            # Process didn't die, force kill
+            os.kill(pid, signal.SIGKILL)
+            await asyncio.sleep(0.1)
+            if not is_pid_running(pid):
+                return (True, "killed")
+            return (False, "unknown_error")
+
+    except ProcessLookupError:
+        # Process already dead - success
+        return (True, "already_dead")
+    except PermissionError:
+        # Can't kill - likely not our process
+        return (False, "permission_denied")
+    except OSError:
+        return (False, "unknown_error")
 
 
 class ProjectLock:

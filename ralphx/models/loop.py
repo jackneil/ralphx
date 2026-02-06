@@ -66,7 +66,7 @@ class Mode(BaseModel):
     description: Optional[str] = None
     timeout: int = Field(300, ge=1, le=7200, description="Timeout in seconds")
     model: str = Field("sonnet", description="Model to use (sonnet, opus, haiku, etc.)")
-    tools: list[str] = Field(default_factory=list, description="Allowed tools")
+    tools: Optional[list[str]] = Field(None, description="Allowed tools (None=use defaults, []=disable all)")
     prompt_template: str = Field(..., description="Path to prompt template file")
     guardrails: Optional[ModeGuardrails] = None
     phase: Optional[str] = Field(

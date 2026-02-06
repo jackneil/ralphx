@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 # Schema version for project DB
-PROJECT_SCHEMA_VERSION = 20
+PROJECT_SCHEMA_VERSION = 21
 
 # Project database schema - all project-specific data
 PROJECT_SCHEMA_SQL = """
@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at TIMESTAMP,
     duration_seconds REAL,
     status TEXT,
-    items_added TEXT
+    items_added TEXT,
+    account_email TEXT
 );
 
 -- Session events table (stores parsed events for history and streaming)
@@ -630,8 +631,25 @@ class ProjectDatabase:
                 # Run migrations (for future versions > 6)
                 self._run_migrations(conn, current_version)
 
+            # Self-heal: verify critical columns exist even if migrations
+            # partially applied (e.g., version bumped but ALTER TABLE lost)
+            self._verify_schema_columns(conn)
+
             # Create indexes AFTER migrations so all columns exist
             conn.executescript(PROJECT_INDEXES_SQL)
+
+    def _verify_schema_columns(self, conn: sqlite3.Connection) -> None:
+        """Verify expected columns exist and repair if missing.
+
+        Handles edge cases where migrations bumped the schema version
+        but the ALTER TABLE didn't persist (e.g., due to executescript()
+        transaction semantics).
+        """
+        cursor = conn.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "account_email" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN account_email TEXT")
+            logger.warning("Repaired missing account_email column in sessions table")
 
     def _backup_before_migration(self, from_version: int) -> None:
         """Create a backup of the database before running migrations.
@@ -733,6 +751,11 @@ class ProjectDatabase:
         # Migration from v19 to v20: Add doc_before/doc_after columns
         if from_version == 19:
             self._migrate_v19_to_v20(conn)
+            from_version = 20  # Continue to next migration
+
+        # Migration from v20 to v21: Add account_email to sessions
+        if from_version == 20:
+            self._migrate_v20_to_v21(conn)
 
         # Seed workflow templates for fresh databases
         self._seed_workflow_templates(conn)
@@ -1198,6 +1221,20 @@ class ProjectDatabase:
             "ALTER TABLE planning_iterations ADD COLUMN doc_after TEXT"
         )
 
+    def _migrate_v20_to_v21(self, conn: sqlite3.Connection) -> None:
+        """Migrate from schema v20 to v21.
+
+        Adds:
+        - account_email column to sessions for tracking which Claude account was used
+        """
+        # Idempotent: check if column already exists before adding
+        cursor = conn.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "account_email" not in columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN account_email TEXT"
+            )
+
     # ========== Loops ==========
 
     def create_loop(
@@ -1406,6 +1443,7 @@ class ProjectDatabase:
         iteration: int,
         mode: Optional[str] = None,
         status: str = "running",
+        account_email: Optional[str] = None,
     ) -> dict:
         """Create a new session.
 
@@ -1415,15 +1453,16 @@ class ProjectDatabase:
             iteration: Iteration number.
             mode: Mode name for this session.
             status: Session status (running, completed, error).
+            account_email: Email of the Claude account used for this session.
         """
         with self._writer() as conn:
             now = datetime.utcnow().isoformat()
             conn.execute(
                 """
-                INSERT INTO sessions (session_id, run_id, iteration, mode, started_at, status)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO sessions (session_id, run_id, iteration, mode, started_at, status, account_email)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, run_id, iteration, mode, now, status),
+                (session_id, run_id, iteration, mode, now, status, account_email),
             )
         return self.get_session(session_id)
 
@@ -1483,7 +1522,7 @@ class ProjectDatabase:
             return [dict(row) for row in cursor.fetchall()]
 
     _SESSION_UPDATE_COLS = frozenset({
-        "duration_seconds", "status", "items_added"
+        "duration_seconds", "status", "items_added", "account_email"
     })
 
     def update_session(self, session_id: str, **kwargs) -> bool:
@@ -1705,6 +1744,11 @@ class ProjectDatabase:
                 return item
             return None
 
+    # Whitelist of columns allowed for sorting (prevents SQL injection)
+    _WORK_ITEM_SORT_COLUMNS = frozenset({
+        "created_at", "updated_at", "priority", "title", "status", "category", "id"
+    })
+
     def list_work_items(
         self,
         status: Optional[str] = None,
@@ -1715,6 +1759,8 @@ class ProjectDatabase:
         unclaimed_only: bool = False,
         limit: int = 100,
         offset: int = 0,
+        sort_by: str = "priority",
+        sort_order: str = "desc",
     ) -> tuple[list[dict], int]:
         """List work items with optional filters.
 
@@ -1727,6 +1773,8 @@ class ProjectDatabase:
             unclaimed_only: If True, only return items not claimed by any loop.
             limit: Maximum items to return.
             offset: Pagination offset.
+            sort_by: Column to sort by (default: priority).
+            sort_order: Sort order, "asc" or "desc" (default: desc).
 
         Returns:
             Tuple of (items list, total count).
@@ -1763,10 +1811,21 @@ class ProjectDatabase:
             )
             total = cursor.fetchone()[0]
 
+            # Validate and build ORDER BY clause
+            if sort_by not in self._WORK_ITEM_SORT_COLUMNS:
+                sort_by = "priority"
+            order_dir = "ASC" if (sort_order or "desc").lower() == "asc" else "DESC"
+
+            # Build ORDER BY: primary sort + secondary sort by priority
+            if sort_by == "priority":
+                order_clause = f"ORDER BY priority {order_dir} NULLS LAST"
+            else:
+                order_clause = f"ORDER BY {sort_by} {order_dir}, priority ASC NULLS LAST"
+
             # Get items
             query = f"""
                 SELECT * FROM work_items WHERE {where_clause}
-                ORDER BY priority ASC NULLS LAST, created_at DESC
+                {order_clause}
                 LIMIT ? OFFSET ?
             """
             cursor = conn.execute(query, params + [limit, offset])

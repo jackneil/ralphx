@@ -297,6 +297,7 @@ class WorkflowExecutor:
         max_iterations = step_config.get("max_iterations")
         cooldown = step_config.get("cooldown_between_iterations")
         max_errors = step_config.get("max_consecutive_errors")
+        tools = step_config.get("allowedTools")
 
         # Generate YAML config based on loop type
         if loop_type == "generator":
@@ -307,6 +308,7 @@ class WorkflowExecutor:
                 max_iterations=max_iterations,
                 cooldown_between_iterations=cooldown,
                 max_consecutive_errors=max_errors,
+                tools=tools,
             )
         else:
             config_yaml = generate_simple_implementation_config(
@@ -316,6 +318,7 @@ class WorkflowExecutor:
                 max_iterations=max_iterations,
                 cooldown_between_iterations=cooldown,
                 max_consecutive_errors=max_errors,
+                tools=tools,
             )
 
         # Save to database

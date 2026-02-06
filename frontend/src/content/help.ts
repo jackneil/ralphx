@@ -135,12 +135,8 @@ export const TEMPLATE_HELP: Record<string, HelpContent> = {
     title: 'Implementation Loop',
     body: 'Consumes stories from a research loop and implements them with test verification.',
   },
-  simpleGenerator: {
-    title: 'Simple Generator',
-    body: 'A basic loop for generating content items. Good starting point for custom generators.',
-  },
-  reviewer: {
-    title: 'Review Loop',
-    body: 'Processes existing items for review, validation, or transformation. Consumes from another loop.',
+  designDoc: {
+    title: 'Design Document',
+    body: 'Interactive planning chat to build a comprehensive design document with web research.',
   },
 }

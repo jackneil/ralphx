@@ -42,6 +42,7 @@ class TemplateListItem(BaseModel):
     description: str
     type: str
     category: str
+    default_tools: Optional[list[str]] = None
 
 
 class TemplateDetail(BaseModel):

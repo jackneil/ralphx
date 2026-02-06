@@ -288,6 +288,8 @@ export async function listItems(
     source_step_id?: number
     limit?: number
     offset?: number
+    sort_by?: string
+    sort_order?: 'asc' | 'desc'
   }
 ) {
   const searchParams = new URLSearchParams()
@@ -297,6 +299,8 @@ export async function listItems(
   if (params?.source_step_id) searchParams.set('source_step_id', params.source_step_id.toString())
   if (params?.limit) searchParams.set('limit', params.limit.toString())
   if (params?.offset) searchParams.set('offset', params.offset.toString())
+  if (params?.sort_by) searchParams.set('sort_by', params.sort_by)
+  if (params?.sort_order) searchParams.set('sort_order', params.sort_order)
 
   const query = searchParams.toString()
   return request<{

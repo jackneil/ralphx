@@ -11,6 +11,7 @@ Implements the main loop execution with:
 """
 
 import asyncio
+import json
 import os
 import random
 import re
@@ -33,6 +34,7 @@ from ralphx.core.workspace import get_loop_settings_path
 from ralphx.models.loop import LoopConfig, Mode, ModeSelectionStrategy
 from ralphx.models.project import Project
 from ralphx.models.run import Run, RunStatus
+from ralphx.core.auth import get_effective_account_for_project
 from ralphx.core.logger import run_log, iteration_log
 
 
@@ -555,8 +557,8 @@ class LoopExecutor:
 
         Priority order:
         1. Loop-level LOOP_TEMPLATE resource with position=template_body (from loop_resources table)
-        2. Project-level LOOP_TEMPLATE resource with position=TEMPLATE_BODY (from resources table)
-        3. Mode's prompt_template file path
+        2. Mode's prompt_template file path (step-specific prompt)
+        3. Project-level LOOP_TEMPLATE resource with position=TEMPLATE_BODY (from resources table)
         4. Default template from ralphx/templates/loop_templates/{loop_type}.md
 
         Args:
@@ -576,21 +578,21 @@ class LoopExecutor:
                 if content:
                     return content
 
-        # Priority 2: Check for project-level LOOP_TEMPLATE resource with TEMPLATE_BODY position
+        # Priority 2: Mode's prompt_template file (step-specific prompt)
+        template_path = self.project.path / mode.prompt_template
+        if template_path.exists():
+            return template_path.read_text()
+
+        # Priority 3: Check for project-level LOOP_TEMPLATE resource with TEMPLATE_BODY position
         resource_manager = ResourceManager(self.project.path, db=self.db)
         resource_set = resource_manager.load_for_loop(self.config)
         template_resources = resource_set.by_position(InjectionPosition.TEMPLATE_BODY)
 
         if template_resources:
-            # Use the first LOOP_TEMPLATE resource as the base template
             resource = template_resources[0]
             if resource.content:
+                run_log.debug(f"Using project-level template resource: {resource.name}")
                 return resource.content
-
-        # Priority 3: Mode's prompt_template file
-        template_path = self.project.path / mode.prompt_template
-        if template_path.exists():
-            return template_path.read_text()
 
         # Priority 4: Default template for loop type
         default_template_path = (
@@ -698,35 +700,50 @@ class LoopExecutor:
                 else:
                     template = after_design_doc + "\n\n" + template
 
-        # Get design doc content for direct substitution (hank-rcm {DESIGN_DOC} style)
-        # This finds the first design_doc type resource and uses its content
+        # Get design doc for substitution - prefer file reference over inline content
+        # to avoid bloating the prompt with large documents.
+        # Claude can read files directly from the project directory.
+        design_doc_path: Optional[str] = None
         design_doc_content = ""
         for resource in loop_resources:
             if resource.get("resource_type") == "design_doc":
+                # Prefer file path if available (keeps prompt small)
+                if resource.get("source_type") == "project_file" and resource.get("source_path"):
+                    design_doc_path = resource.get("source_path")
                 design_doc_content = resource.get("_resolved_content", "")
                 break
-        if not design_doc_content:
+        if not design_doc_content and not design_doc_path:
             # Fallback to project-level resources
             for resource in resource_set.resources:
                 if resource.resource_type.value == "design_doc":
+                    if resource.file_path:
+                        design_doc_path = resource.file_path
                     design_doc_content = resource.content or ""
                     break
 
-        # Substitute {DESIGN_DOC} (hank-rcm style) - escape content to prevent injection
-        if "{DESIGN_DOC}" in template and design_doc_content:
-            escaped_design_doc = self._escape_template_vars(design_doc_content)
-            template = template.replace("{DESIGN_DOC}", escaped_design_doc)
+        # Build design doc substitution - use file reference for large docs
+        # Threshold: 50KB (inline) vs file reference (keeps prompt manageable)
+        DESIGN_DOC_INLINE_THRESHOLD = 50_000
+        if design_doc_path and len(design_doc_content) > DESIGN_DOC_INLINE_THRESHOLD:
+            # Use file reference - Claude will read the file directly
+            design_doc_ref = (
+                f"[Design document is in file: {design_doc_path}]\n"
+                f"Read this file to understand the project requirements and architecture."
+            )
+        elif design_doc_content:
+            design_doc_ref = self._escape_template_vars(design_doc_content)
+        else:
+            design_doc_ref = ""
 
-        # Substitute {{design_doc}} (RalphX style) with actual design doc content
+        # Substitute {DESIGN_DOC} (hank-rcm style)
+        if "{DESIGN_DOC}" in template:
+            template = template.replace("{DESIGN_DOC}", design_doc_ref)
+
+        # Substitute {{design_doc}} (RalphX style)
         # Note: {{design_doc}} may have already been used as a position marker for
         # after_design_doc resources above, but the marker text itself remains.
-        # Replace it with the actual design doc content (or empty string if none).
         if "{{design_doc}}" in template:
-            if design_doc_content:
-                escaped_design_doc = self._escape_template_vars(design_doc_content)
-                template = template.replace("{{design_doc}}", escaped_design_doc)
-            else:
-                template = template.replace("{{design_doc}}", "")
+            template = template.replace("{{design_doc}}", design_doc_ref)
 
         # BEFORE_TASK: Insert before the main task instruction
         # Look for {{task}} marker or insert near the end
@@ -1002,17 +1019,33 @@ class LoopExecutor:
             })
 
         # 4. Handle inputs_list (input files for this loop)
-        inputs_dir = Path(self.project.path) / self.config.name / "inputs"
+        from ralphx.core.workspace import get_loop_inputs_path
+        inputs_dir = get_loop_inputs_path(self.project.path, self.config.name)
         if inputs_dir.exists():
-            input_files = [f.name for f in inputs_dir.iterdir() if f.is_file()]
-            inputs_list = "\n".join(f"- {f}" for f in sorted(input_files))
+            input_files = [f for f in inputs_dir.iterdir() if f.is_file()]
+            inputs_list = "\n".join(f"- {f.name} ({f})" for f in sorted(input_files))
         else:
             inputs_list = "(No input files found)"
 
-        # 5. Substitute template variables (escape values first)
-        existing_stories_json = self._escape_template_vars(
-            json.dumps(stories_summary, indent=2)
-        )
+        # 5. Substitute template variables
+        # For large story lists (>50 items), write to file and reference it
+        # to avoid bloating the prompt
+        STORIES_INLINE_THRESHOLD = 50
+
+        if len(stories_summary) > STORIES_INLINE_THRESHOLD:
+            # Write stories to a temp file in .ralphx directory
+            stories_file = Path(self.project.path) / ".ralphx" / "temp" / "existing_stories.json"
+            stories_file.parent.mkdir(parents=True, exist_ok=True)
+            stories_file.write_text(json.dumps(stories_summary, indent=2))
+            existing_stories_ref = (
+                f"[{len(stories_summary)} existing stories - see .ralphx/temp/existing_stories.json]\n"
+                f"Read this file to see all existing story IDs and avoid duplicates."
+            )
+        else:
+            existing_stories_ref = self._escape_template_vars(
+                json.dumps(stories_summary, indent=2)
+            )
+
         category_stats_json = self._escape_template_vars(
             json.dumps(category_stats, indent=2)
         )
@@ -1020,7 +1053,7 @@ class LoopExecutor:
         # Escape inputs_list to prevent template injection from filenames
         inputs_list_escaped = self._escape_template_vars(inputs_list)
 
-        template = template.replace("{{existing_stories}}", existing_stories_json)
+        template = template.replace("{{existing_stories}}", existing_stories_ref)
         template = template.replace("{{category_stats}}", category_stats_json)
         template = template.replace("{{total_stories}}", str(len(existing_items)))
         template = template.replace("{{inputs_list}}", inputs_list_escaped)
@@ -1541,7 +1574,7 @@ class LoopExecutor:
                     # Extract known fields explicitly
                     known_fields = {
                         'id', 'content', 'story', 'title', 'priority', 'category',
-                        'tags', 'dependencies', 'acceptance_criteria', 'complexity'
+                        'tags', 'dependencies',
                     }
                     extracted.append({
                         'id': str(item['id']),
@@ -1556,31 +1589,40 @@ class LoopExecutor:
                     })
             return extracted
 
+        def _try_parse_json_items(parsed) -> list[dict]:
+            """Extract items from a parsed JSON value (dict or list)."""
+            if isinstance(parsed, dict):
+                stories_list = parsed.get('stories') or parsed.get('items') or []
+                if isinstance(stories_list, list):
+                    return extract_items_from_list(stories_list)
+            elif isinstance(parsed, list):
+                return extract_items_from_list(parsed)
+            return []
+
         try:
-            # Try 1: Look for JSON object with stories/items array
-            # Pattern: {"stories": [...]} or {"items": [...]}
-            obj_match = re.search(r'\{[\s\S]*"(?:stories|items)"\s*:\s*\[[\s\S]*\][\s\S]*\}', output)
-            if obj_match:
+            # Try 1: Extract JSON from markdown code fences (```json ... ``` or ``` ... ```)
+            fence_match = re.search(r'```(?:json)?\s*\n([\s\S]*?)\n```', output)
+            if fence_match:
+                fenced = fence_match.group(1).strip()
                 try:
-                    parsed = json.loads(obj_match.group())
-                    if isinstance(parsed, dict):
-                        stories_list = parsed.get('stories') or parsed.get('items') or []
-                        if isinstance(stories_list, list):
-                            items = extract_items_from_list(stories_list)
-                            if items:
-                                return items
+                    parsed = json.loads(fenced)
+                    items = _try_parse_json_items(parsed)
+                    if items:
+                        return items
                 except json.JSONDecodeError:
                     pass
 
-            # Try 2: Look for JSON array directly (greedy to get outer array)
-            # Use greedy matching to find the largest array
-            json_match = re.search(r'\[[\s\S]*\]', output)
-            if json_match:
-                parsed = json.loads(json_match.group())
-                if isinstance(parsed, list):
-                    items = extract_items_from_list(parsed)
-                    if items:
-                        return items
+            # Try 2: raw_decode from first { or [ (handles JSON embedded in prose)
+            decoder = json.JSONDecoder()
+            for i, ch in enumerate(output):
+                if ch in ('{', '['):
+                    try:
+                        parsed, _ = decoder.raw_decode(output, i)
+                        items = _try_parse_json_items(parsed)
+                        if items:
+                            return items
+                    except json.JSONDecodeError:
+                        continue
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -1740,18 +1782,36 @@ class LoopExecutor:
             # Mutable holder for session_id (set by INIT event before other events)
             session_id_holder: list[Optional[str]] = [None]
 
+            # Get effective account for logging and session tracking
+            account = get_effective_account_for_project(self.project.id)
+            account_email = account.get("email") if account else None
+            if account_email:
+                run_log.info(
+                    "account_selected",
+                    f"Using Claude account: {account_email}",
+                    email=account_email,
+                    iteration=self._iteration,
+                )
+
             # Callback to register session immediately when it starts
             # This enables live streaming in the UI before execution completes
             def register_session_early(session_id: str) -> None:
                 session_id_holder[0] = session_id
                 if self._run:
-                    self.db.create_session(
-                        session_id=session_id,
-                        run_id=self._run.id,
-                        iteration=self._iteration,
-                        mode=mode_name,
-                        status="running",
-                    )
+                    try:
+                        self.db.create_session(
+                            session_id=session_id,
+                            run_id=self._run.id,
+                            iteration=self._iteration,
+                            mode=mode_name,
+                            status="running",
+                            account_email=account_email,
+                        )
+                    except Exception as e:
+                        run_log.warning(
+                            "session_register_failed",
+                            f"Failed to register session {session_id}: {e}",
+                        )
 
             # Callback to persist events to DB for history/debugging
             def persist_event(event: StreamEvent) -> None:
@@ -1785,6 +1845,18 @@ class LoopExecutor:
                             tool_name=event.tool_name,
                             tool_result=event.tool_result[:1000] if event.tool_result else None,
                         )
+                    elif event.type == AdapterEvent.THINKING:
+                        self.db.add_session_event(
+                            session_id=sid,
+                            event_type="thinking",
+                            content=event.thinking[:2000] if event.thinking else None,
+                        )
+                    elif event.type == AdapterEvent.USAGE:
+                        self.db.add_session_event(
+                            session_id=sid,
+                            event_type="usage",
+                            raw_data=event.usage,
+                        )
                     elif event.type == AdapterEvent.ERROR:
                         self.db.add_session_event(
                             session_id=sid,
@@ -1796,16 +1868,13 @@ class LoopExecutor:
                             session_id=sid,
                             event_type="complete",
                         )
-                except Exception as exc:
-                    import logging
-                    logging.getLogger(__name__).debug(
-                        f"[PERSIST] Failed to persist {event.type} event for session {sid}: {exc}"
-                    )
+                except Exception:
+                    pass  # Don't let event persistence failures break execution
 
             exec_result = await self.adapter.execute(
                 prompt=prompt,
                 model=mode.model,
-                tools=mode.tools if mode.tools else None,
+                tools=mode.tools,
                 timeout=mode.timeout,
                 json_schema=json_schema,
                 on_session_start=register_session_early,
@@ -1820,36 +1889,20 @@ class LoopExecutor:
                 result.error_message = exec_result.error_message
 
             # Extract work items from output
-            import logging
-            _log = logging.getLogger(__name__)
-            _log.warning(f"[EXTRACT] text_output len={len(exec_result.text_output) if exec_result.text_output else 0}")
             if exec_result.text_output:
-                _log.warning(f"[EXTRACT] text_output[:200]={exec_result.text_output[:200]}")
-                # Check if JSON with stories is present
-                has_stories = '"stories"' in exec_result.text_output
-                has_json_start = '```json' in exec_result.text_output or '{"stories"' in exec_result.text_output
-                _log.warning(f"[EXTRACT] has_stories={has_stories}, has_json_start={has_json_start}")
-                if has_stories:
-                    # Find and log the stories section
-                    idx = exec_result.text_output.find('"stories"')
-                    _log.warning(f"[EXTRACT] stories found at idx={idx}, context: {exec_result.text_output[max(0,idx-50):idx+200]}")
                 items = self.extract_work_items(exec_result.text_output)
-                _log.warning(f"[EXTRACT] extracted {len(items)} items")
                 if items:
                     saved = self._save_work_items(items)
                     result.items_added = items
                     self._items_generated += saved
                     self._no_items_streak = 0  # Reset streak when items are generated
-                    _log.warning(f"[EXTRACT] saved {saved} items")
                 else:
                     # No items generated this iteration - track for completion detection
                     self._no_items_streak += 1
-                    _log.warning(f"[EXTRACT] no items extracted, streak={self._no_items_streak}")
 
                 # Check for explicit completion signal from Claude
                 if "[GENERATION_COMPLETE]" in exec_result.text_output:
                     result.generator_complete = True  # type: ignore
-                    _log.warning("[EXTRACT] found [GENERATION_COMPLETE] signal")
 
             # Update session status (session was registered early via callback)
             if exec_result.session_id and self._run:

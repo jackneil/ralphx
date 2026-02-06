@@ -15,6 +15,8 @@ class AdapterEvent(str, Enum):
     TEXT = "text"           # Text output from model
     TOOL_USE = "tool_use"   # Model is using a tool
     TOOL_RESULT = "tool_result"  # Tool returned a result
+    THINKING = "thinking"   # Model's reasoning/thinking
+    USAGE = "usage"         # Token usage data
     ERROR = "error"         # Error occurred
     COMPLETE = "complete"   # Execution completed
 
@@ -36,6 +38,12 @@ class StreamEvent:
 
     # Tool result for TOOL_RESULT events
     tool_result: Optional[str] = None
+
+    # Thinking content for THINKING events
+    thinking: Optional[str] = None
+
+    # Token usage data for USAGE events
+    usage: Optional[dict] = None
 
     # Error details for ERROR events
     error_message: Optional[str] = None

@@ -20,6 +20,9 @@ class Session(BaseModel):
     items_added: Optional[list[str]] = Field(
         None, description="IDs of work items added during this session"
     )
+    account_email: Optional[str] = Field(
+        None, description="Email of Claude account used for this session"
+    )
 
     model_config = {"from_attributes": True}
 
@@ -35,6 +38,7 @@ class Session(BaseModel):
             "duration_seconds": self.duration_seconds,
             "status": self.status,
             "items_added": self.items_added,
+            "account_email": self.account_email,
         }
 
     @classmethod
@@ -60,4 +64,5 @@ class Session(BaseModel):
             duration_seconds=data.get("duration_seconds"),
             status=data.get("status"),
             items_added=items_added,
+            account_email=data.get("account_email"),
         )

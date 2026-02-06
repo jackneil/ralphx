@@ -28,7 +28,7 @@ PROCESSING_TYPES = {
         "config": {
             "loopType": "generator",
             "template": "extractgen_requirements",
-            "allowedTools": ["WebSearch", "WebFetch"],
+            "allowedTools": ["Read", "Glob", "Grep"],
             "model": "opus",
             "timeout": 600,
             "max_iterations": 100,
@@ -41,7 +41,7 @@ PROCESSING_TYPES = {
         "config": {
             "loopType": "generator",
             "template": "webgen_requirements",
-            "allowedTools": ["WebSearch", "WebFetch"],
+            "allowedTools": ["Read", "Glob", "Grep", "WebSearch", "WebFetch"],
             "model": "opus",
             "timeout": 900,
             "max_iterations": 15,

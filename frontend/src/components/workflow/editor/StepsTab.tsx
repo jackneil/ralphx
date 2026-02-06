@@ -46,7 +46,7 @@ export default function StepsTab({
   }, [loadArchivedSteps])
 
   const handleAddStep = () => {
-    // Default to Implementation (consumer) type with its standard tools
+    // Default to Implementation (consumer) type matching PROCESSING_TYPES.implementation
     const newStep: WorkflowStep = {
       id: 0, // Will be assigned by server on save
       workflow_id: workflowId,
@@ -58,9 +58,12 @@ export default function StepsTab({
         description: '',
         skippable: false,
         loopType: 'consumer',
+        template: 'implementation',
         model: 'opus',
-        timeout: 600,
-        // Default tools for implementation/consumer steps
+        timeout: 1800,
+        max_iterations: 50,
+        cooldown_between_iterations: 5,
+        max_consecutive_errors: 3,
         allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
       },
     }
