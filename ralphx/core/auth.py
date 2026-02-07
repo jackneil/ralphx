@@ -725,6 +725,42 @@ async def refresh_token_if_needed(
         return await _do_token_refresh(fresh_account, project_id)
 
 
+async def refresh_account_token(account_id: int) -> Optional[str]:
+    """Ensure a specific account has a fresh access token, refreshing if needed.
+
+    Used by the adapter to get a valid access token for the CLAUDE_CODE_OAUTH_TOKEN
+    env var before spawning a subprocess.
+
+    Args:
+        account_id: The account ID to refresh
+
+    Returns:
+        The access_token string if valid, None if refresh failed or account unavailable.
+    """
+    db = Database()
+    account = db.get_account(account_id)
+    if not account or not account.get("is_active"):
+        return None
+
+    now = int(time.time())
+    # Token still fresh (5 minute buffer)
+    if now < account.get("expires_at", 0) - 300:
+        return account.get("access_token")
+
+    # Token expired or about to expire — refresh it
+    async with _token_refresh_lock():
+        # Re-read inside lock in case another process already refreshed
+        fresh = db.get_account(account_id)
+        if not fresh:
+            return None
+        if int(time.time()) < fresh.get("expires_at", 0) - 300:
+            return fresh.get("access_token")  # Another process refreshed while we waited
+        if await _do_token_refresh(fresh):
+            updated = db.get_account(account_id)
+            return updated.get("access_token") if updated else None
+        return None
+
+
 async def force_refresh_token(project_id: Optional[str] = None) -> dict:
     """Force refresh a token regardless of expiry time.
 

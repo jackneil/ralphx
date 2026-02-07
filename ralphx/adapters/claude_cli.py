@@ -6,6 +6,7 @@ Spawns Claude CLI as a subprocess and streams events via JSONL session file tail
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,11 @@ from ralphx.adapters.base import (
     LLMAdapter,
     StreamEvent,
 )
-from ralphx.core.auth import refresh_token_if_needed, swap_credentials_for_loop
+from ralphx.core.auth import refresh_account_token
+from ralphx.core.database import Database
+
+# Rate limit detection patterns for 429 errors
+RATE_LIMIT_PATTERNS = ["429", "rate limit", "overloaded", "rate_limit_error", "too many requests"]
 
 
 # Model name mappings
@@ -64,6 +69,7 @@ class ClaudeCLIAdapter(LLMAdapter):
         self._project_id = project_id
         self._structured_output: Optional[dict] = None
         self._final_result_text: str = ""
+        self._is_rate_limited: bool = False
 
     @property
     def is_running(self) -> bool:
@@ -143,6 +149,7 @@ class ClaudeCLIAdapter(LLMAdapter):
         json_schema: Optional[dict] = None,
         on_session_start: Optional[Callable[[str], None]] = None,
         on_event: Optional[Callable[[StreamEvent], None]] = None,
+        account_id: Optional[int] = None,
     ) -> ExecutionResult:
         """Execute a prompt and return the result.
 
@@ -152,13 +159,14 @@ class ClaudeCLIAdapter(LLMAdapter):
         # Reset per-execution state
         self._structured_output = None
         self._final_result_text = ""
+        self._is_rate_limited = False
 
         result = ExecutionResult(started_at=datetime.utcnow())
         text_parts = []
         tool_calls = []
 
         try:
-            async for event in self.stream(prompt, model, tools, timeout, json_schema):
+            async for event in self.stream(prompt, model, tools, timeout, json_schema, account_id=account_id):
                 if event.type == AdapterEvent.INIT:
                     result.session_id = event.data.get("session_id")
                     if on_session_start and result.session_id:
@@ -207,6 +215,9 @@ class ClaudeCLIAdapter(LLMAdapter):
         if not result.text_output and self._final_result_text:
             result.text_output = self._final_result_text
 
+        # Propagate rate limit detection from stream
+        result.is_rate_limited = self._is_rate_limited
+
         return result
 
     async def stream(
@@ -216,14 +227,16 @@ class ClaudeCLIAdapter(LLMAdapter):
         tools: Optional[list[str]] = None,
         timeout: int = 300,
         json_schema: Optional[dict] = None,
+        account_id: Optional[int] = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream execution events by tailing Claude's JSONL session file.
 
         Instead of parsing stdout (stream-json format), we:
-        1. Spawn Claude CLI with --output-format json
-        2. Discover the JSONL session file Claude creates
-        3. Tail that file for real-time events (richer than stdout)
-        4. Read stdout after completion for final metadata
+        1. Resolve account and get fresh access token
+        2. Spawn Claude CLI with CLAUDE_CODE_OAUTH_TOKEN env var
+        3. Discover the JSONL session file Claude creates
+        4. Tail that file for real-time events (richer than stdout)
+        5. Read stdout after completion for final metadata
 
         Yields:
             StreamEvent objects as execution progresses.
@@ -232,147 +245,167 @@ class ClaudeCLIAdapter(LLMAdapter):
         self._session_id = None
         self._structured_output = None
         self._final_result_text = ""
+        self._is_rate_limited = False
 
-        # Validate and refresh token if needed
-        if not await refresh_token_if_needed(self._project_id, validate=True):
+        # Resolve account — explicit account_id overrides project default
+        db = Database()
+        if account_id:
+            account = db.get_account(account_id)
+        else:
+            account = db.get_effective_account(self._project_id)
+
+        if not account:
             yield StreamEvent(
                 type=AdapterEvent.ERROR,
-                error_message="No valid credentials. Token may be expired - please re-login via Settings.",
+                error_message="No account available. Please login via Settings.",
                 error_code="AUTH_REQUIRED",
             )
             return
 
-        # Swap credentials for this execution
-        with swap_credentials_for_loop(self._project_id) as has_creds:
-            if not has_creds:
-                yield StreamEvent(
-                    type=AdapterEvent.ERROR,
-                    error_message="No credentials available. Please login via Settings.",
-                    error_code="AUTH_REQUIRED",
-                )
-                return
-
-            # Compute session directory for JSONL file discovery
-            normalized = str(self.project_path).replace("/", "-")
-            session_dir = Path.home() / ".claude" / "projects" / normalized
-
-            # Snapshot existing session files before spawn
-            existing_files: set[str] = set()
-            if session_dir.exists():
-                existing_files = {
-                    f.name for f in session_dir.iterdir() if f.suffix == ".jsonl"
-                }
-
-            cmd = self._build_command(model, tools, json_schema)
-
-            # Start the process
-            self._process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(self.project_path),
-                limit=4 * 1024 * 1024,  # 4MB buffer
+        # Get fresh access token, refreshing via OAuth if expired
+        access_token = await refresh_account_token(account["id"])
+        if not access_token:
+            yield StreamEvent(
+                type=AdapterEvent.ERROR,
+                error_message=f"Token expired for {account.get('email', 'unknown')}. Please re-login via Settings.",
+                error_code="AUTH_REQUIRED",
             )
+            return
 
-            # Send the prompt
-            if self._process.stdin:
-                self._process.stdin.write(prompt.encode())
-                await self._process.stdin.drain()
-                self._process.stdin.close()
-                await self._process.stdin.wait_closed()
+        # Build subprocess env — CLAUDE_CODE_OAUTH_TOKEN completely overrides creds file
+        # No file swapping, no locking — each subprocess has its own isolated environment
+        proc_env = {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": access_token}
 
-            # Drain stdout/stderr in background to prevent pipe deadlock
-            stdout_task = asyncio.create_task(
-                self._drain_pipe(self._process.stdout)
-            )
-            stderr_task = asyncio.create_task(
-                self._drain_pipe(self._process.stderr)
-            )
+        # Compute session directory for JSONL file discovery
+        normalized = str(self.project_path).replace("/", "-")
+        session_dir = Path.home() / ".claude" / "projects" / normalized
 
-            # Discover the new JSONL session file
-            session_file = await self._discover_session_file(
-                session_dir, existing_files, max_wait=15
-            )
-
-            if not session_file:
-                # Process may have died before creating session file
-                await self._process.wait()
-                stdout_task.cancel()
-                stderr_data = await stderr_task
-                stderr_text = stderr_data.decode(errors="replace").strip() if stderr_data else ""
-                yield StreamEvent(
-                    type=AdapterEvent.ERROR,
-                    error_message=f"Could not find session file. stderr: {stderr_text[:500]}",
-                    error_code="NO_SESSION_FILE",
-                )
-                yield StreamEvent(
-                    type=AdapterEvent.COMPLETE,
-                    data={"exit_code": self._process.returncode or 1},
-                )
-                self._process = None
-                return
-
-            # Tail the JSONL file for streaming events
-            async for event in self._tail_session_file(session_file, timeout):
-                yield event
-
-            # Wait for process to complete
-            await self._process.wait()
-
-            # Collect stdout/stderr
-            stdout_data = await stdout_task
-            stderr_data = await stderr_task
-
-            # Parse stdout JSON for final metadata
-            exit_code = self._process.returncode or 0
-            completion_data: dict = {
-                "exit_code": exit_code,
-                "session_id": self._session_id,
+        # Snapshot existing session files before spawn
+        existing_files: set[str] = set()
+        if session_dir.exists():
+            existing_files = {
+                f.name for f in session_dir.iterdir() if f.suffix == ".jsonl"
             }
 
-            if stdout_data:
-                try:
-                    final = json.loads(stdout_data.decode())
-                    completion_data["cost_usd"] = final.get("cost_usd")
-                    completion_data["num_turns"] = final.get("num_turns")
-                    self._structured_output = final.get("structured_output")
-                    self._final_result_text = final.get("result", "")
+        cmd = self._build_command(model, tools, json_schema)
 
-                    # Check for errors in final result
-                    if final.get("is_error"):
-                        yield StreamEvent(
-                            type=AdapterEvent.ERROR,
-                            error_message=final.get("result", "Unknown error"),
-                            error_code="CLI_ERROR",
-                        )
-                    elif final.get("subtype") == "error_max_structured_output_retries":
-                        yield StreamEvent(
-                            type=AdapterEvent.ERROR,
-                            error_message="Could not produce valid structured output",
-                            error_code="STRUCTURED_OUTPUT_FAILED",
-                        )
-                except json.JSONDecodeError:
-                    pass
+        # Start the process with account token via env var
+        self._process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self.project_path),
+            limit=4 * 1024 * 1024,  # 4MB buffer
+            env=proc_env,
+        )
 
-            # Emit error for non-zero exit or stderr
-            if exit_code != 0:
-                stderr_text = stderr_data.decode(errors="replace").strip() if stderr_data else ""
-                if stderr_text:
-                    logger.warning(f"Claude CLI exit code: {exit_code}, stderr: {stderr_text[:500]}")
-                    yield StreamEvent(
-                        type=AdapterEvent.ERROR,
-                        error_message=f"Claude CLI error (exit {exit_code}): {stderr_text[:500]}",
-                        error_code=f"EXIT_{exit_code}",
-                    )
+        # Send the prompt
+        if self._process.stdin:
+            self._process.stdin.write(prompt.encode())
+            await self._process.stdin.drain()
+            self._process.stdin.close()
+            await self._process.stdin.wait_closed()
 
-            # Emit completion
+        # Drain stdout/stderr in background to prevent pipe deadlock
+        stdout_task = asyncio.create_task(
+            self._drain_pipe(self._process.stdout)
+        )
+        stderr_task = asyncio.create_task(
+            self._drain_pipe(self._process.stderr)
+        )
+
+        # Discover the new JSONL session file
+        session_file = await self._discover_session_file(
+            session_dir, existing_files, max_wait=15
+        )
+
+        if not session_file:
+            # Process may have died before creating session file
+            await self._process.wait()
+            stdout_task.cancel()
+            stderr_data = await stderr_task
+            stderr_text = stderr_data.decode(errors="replace").strip() if stderr_data else ""
+            # Check if this was a rate limit error before session file creation
+            if any(p in stderr_text.lower() for p in RATE_LIMIT_PATTERNS):
+                self._is_rate_limited = True
+            yield StreamEvent(
+                type=AdapterEvent.ERROR,
+                error_message=f"Could not find session file. stderr: {stderr_text[:500]}",
+                error_code="RATE_LIMITED" if self._is_rate_limited else "NO_SESSION_FILE",
+            )
             yield StreamEvent(
                 type=AdapterEvent.COMPLETE,
-                data=completion_data,
+                data={"exit_code": self._process.returncode or 1},
             )
-
             self._process = None
+            return
+
+        # Tail the JSONL file for streaming events
+        async for event in self._tail_session_file(session_file, timeout):
+            yield event
+
+        # Wait for process to complete
+        await self._process.wait()
+
+        # Collect stdout/stderr
+        stdout_data = await stdout_task
+        stderr_data = await stderr_task
+
+        # Parse stdout JSON for final metadata
+        exit_code = self._process.returncode or 0
+        completion_data: dict = {
+            "exit_code": exit_code,
+            "session_id": self._session_id,
+        }
+
+        if stdout_data:
+            try:
+                final = json.loads(stdout_data.decode())
+                completion_data["cost_usd"] = final.get("cost_usd")
+                completion_data["num_turns"] = final.get("num_turns")
+                self._structured_output = final.get("structured_output")
+                self._final_result_text = final.get("result", "")
+
+                # Check for errors in final result (Layer 3: stdout JSON)
+                if final.get("is_error"):
+                    result_text = final.get("result", "")
+                    if any(p in result_text.lower() for p in RATE_LIMIT_PATTERNS):
+                        self._is_rate_limited = True
+                    yield StreamEvent(
+                        type=AdapterEvent.ERROR,
+                        error_message=result_text or "Unknown error",
+                        error_code="RATE_LIMITED" if self._is_rate_limited else "CLI_ERROR",
+                    )
+                elif final.get("subtype") == "error_max_structured_output_retries":
+                    yield StreamEvent(
+                        type=AdapterEvent.ERROR,
+                        error_message="Could not produce valid structured output",
+                        error_code="STRUCTURED_OUTPUT_FAILED",
+                    )
+            except json.JSONDecodeError:
+                pass
+
+        # Emit error for non-zero exit or stderr (Layer 2: stderr)
+        if exit_code != 0:
+            stderr_text = stderr_data.decode(errors="replace").strip() if stderr_data else ""
+            if stderr_text:
+                if any(p in stderr_text.lower() for p in RATE_LIMIT_PATTERNS):
+                    self._is_rate_limited = True
+                logger.warning(f"Claude CLI exit code: {exit_code}, stderr: {stderr_text[:500]}")
+                yield StreamEvent(
+                    type=AdapterEvent.ERROR,
+                    error_message=f"Claude CLI error (exit {exit_code}): {stderr_text[:500]}",
+                    error_code="RATE_LIMITED" if self._is_rate_limited else f"EXIT_{exit_code}",
+                )
+
+        # Emit completion
+        yield StreamEvent(
+            type=AdapterEvent.COMPLETE,
+            data=completion_data,
+        )
+
+        self._process = None
 
     # ========== JSONL File Tailing Helpers ==========
 
@@ -552,10 +585,13 @@ class ClaudeCLIAdapter(LLMAdapter):
                     for block in content_blocks:
                         if block.get("type") == "text":
                             error_text = block.get("text", "")
+                # Layer 1: Detect rate limiting from JSONL API error messages
+                if any(p in (error_text or "").lower() for p in RATE_LIMIT_PATTERNS):
+                    self._is_rate_limited = True
                 events.append(StreamEvent(
                     type=AdapterEvent.ERROR,
                     error_message=error_text or data.get("error", "API error"),
-                    error_code=data.get("error"),
+                    error_code="RATE_LIMITED" if self._is_rate_limited else data.get("error"),
                 ))
                 return events
 

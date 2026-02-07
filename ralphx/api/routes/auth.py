@@ -45,6 +45,7 @@ class AccountResponse(BaseModel):
     rate_limit_tier: Optional[str] = None
     is_default: bool
     is_active: bool
+    priority: int = 0
     expires_at: Optional[int] = None
     expires_in_seconds: Optional[int] = None
     is_expired: bool
@@ -65,6 +66,7 @@ class AccountUpdateRequest(BaseModel):
 
     display_name: Optional[str] = None
     is_active: Optional[bool] = None
+    priority: Optional[int] = Field(None, ge=0)
 
 
 class ProjectAccountAssignment(BaseModel):
@@ -191,8 +193,9 @@ def _build_account_response(account: dict, db: Database) -> AccountResponse:
         display_name=account.get("display_name"),
         subscription_type=account.get("subscription_type"),
         rate_limit_tier=account.get("rate_limit_tier"),
-        is_default=bool(account.get("is_default")),
+        is_default=((account.get("priority", 0) or 0) == 0),
         is_active=bool(account.get("is_active")),
+        priority=account.get("priority", 0) or 0,
         expires_at=expires_at,
         expires_in_seconds=max(0, expires_at - now) if expires_at else None,
         is_expired=is_expired,
@@ -447,6 +450,21 @@ async def list_accounts(
     return [_build_account_response(acc, db) for acc in accounts]
 
 
+@router.post("/accounts/reorder")
+async def reorder_accounts(body: dict):
+    """Reorder accounts by priority for fallback chain.
+
+    Expects {"account_ids": [3, 1, 2]} where position = priority (0 = highest).
+    """
+    account_ids = body.get("account_ids", [])
+    if not account_ids or not isinstance(account_ids, list):
+        raise HTTPException(status_code=400, detail="account_ids must be a non-empty list")
+
+    db = Database()
+    db.reorder_accounts([int(aid) for aid in account_ids])
+    return {"ok": True}
+
+
 @router.post("/accounts/add")
 async def add_account(expected_email: Optional[str] = None):
     """Start OAuth flow to add a new account.
@@ -552,6 +570,8 @@ async def update_account(account_id: int, request: AccountUpdateRequest):
         updates["display_name"] = request.display_name
     if request.is_active is not None:
         updates["is_active"] = request.is_active
+    if request.priority is not None:
+        updates["priority"] = request.priority
 
     if updates:
         db.update_account(account_id, **updates)
@@ -581,13 +601,14 @@ async def delete_account(account_id: int):
             detail=f"Cannot delete account: assigned to {projects_using} project(s). Unassign first.",
         )
 
-    # Check if this is the default and there are other accounts
-    if account.get("is_default"):
+    # Check if this is the primary account and there are others
+    default = db.get_default_account()
+    if default and default["id"] == account_id:
         other_accounts = [a for a in db.list_accounts() if a["id"] != account_id]
         if other_accounts:
             raise HTTPException(
                 status_code=400,
-                detail="Cannot delete default account. Set another account as default first.",
+                detail="Cannot delete primary account. Drag another account to the top first.",
             )
 
     db.delete_account(account_id)
@@ -815,7 +836,7 @@ async def get_project_account(project_id: str):
         account_display_name=account.get("display_name"),
         subscription_type=account.get("subscription_type"),
         is_active=bool(account.get("is_active")),
-        is_default=bool(account.get("is_default")),
+        is_default=((account.get("priority", 0) or 0) == 0),
         allow_fallback=bool(assignment.get("allow_fallback", True)),
         usage=_build_usage_from_account(account),
     )
@@ -849,7 +870,7 @@ async def assign_project_account(project_id: str, request: AssignAccountRequest)
         account_display_name=account.get("display_name"),
         subscription_type=account.get("subscription_type"),
         is_active=bool(account.get("is_active")),
-        is_default=bool(account.get("is_default")),
+        is_default=((account.get("priority", 0) or 0) == 0),
         allow_fallback=request.allow_fallback,
         usage=_build_usage_from_account(account),
     )

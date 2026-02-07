@@ -1274,6 +1274,7 @@ export interface Account {
   rate_limit_tier?: string
   is_default: boolean
   is_active: boolean
+  priority: number
   expires_at?: number
   expires_in_seconds?: number
   is_expired: boolean
@@ -1367,10 +1368,6 @@ export async function removeAccount(accountId: number): Promise<{ success: boole
 }
 
 // Set an account as default
-export async function setDefaultAccount(accountId: number): Promise<Account> {
-  return request<Account>(`/auth/accounts/${accountId}/set-default`, { method: 'POST' })
-}
-
 // Force refresh account token
 export async function refreshAccountToken(accountId: number): Promise<{ success: boolean; message?: string }> {
   return request(`/auth/accounts/${accountId}/refresh`, { method: 'POST' })
@@ -1393,6 +1390,14 @@ export async function validateAccount(accountId: number): Promise<{
 // Refresh usage cache for all accounts
 export async function refreshAllAccountsUsage(): Promise<{ updated: number; failed: number }> {
   return request('/auth/accounts/refresh-all-usage', { method: 'POST' })
+}
+
+// Reorder accounts by priority for fallback chain
+export async function reorderAccounts(accountIds: number[]): Promise<{ ok: boolean }> {
+  return request('/auth/accounts/reorder', {
+    method: 'POST',
+    body: JSON.stringify({ account_ids: accountIds }),
+  })
 }
 
 // Get account assigned to a project
