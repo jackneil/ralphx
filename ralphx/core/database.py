@@ -1393,18 +1393,25 @@ class Database:
         now = datetime.utcnow().isoformat()
 
         with self._writer() as conn:
-            # Check if this is the first account (make it default)
+            # Determine priority for new account (append to end of list)
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM accounts WHERE is_deleted = 0"
             )
             count = cursor.fetchone()[0]
-            is_default = count == 0
+            if count == 0:
+                priority = 0
+            else:
+                cursor = conn.execute(
+                    "SELECT MAX(COALESCE(priority, 0)) FROM accounts WHERE is_deleted = 0"
+                )
+                max_pri = cursor.fetchone()[0] or 0
+                priority = max_pri + 1
 
             # Use INSERT OR REPLACE to handle existing accounts
             cursor = conn.execute(
                 """INSERT INTO accounts (
                     email, access_token, refresh_token, expires_at, display_name,
-                    scopes, subscription_type, rate_limit_tier, is_default,
+                    scopes, subscription_type, rate_limit_tier, priority,
                     is_active, is_deleted, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
                 ON CONFLICT(email) DO UPDATE SET
@@ -1416,6 +1423,9 @@ class Database:
                     rate_limit_tier = excluded.rate_limit_tier,
                     is_active = 1,
                     is_deleted = 0,
+                    priority = (SELECT COALESCE(MAX(priority), 0) + 1
+                                FROM accounts WHERE is_deleted = 0
+                                AND email != excluded.email),
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1427,7 +1437,7 @@ class Database:
                     scopes,
                     subscription_type,
                     rate_limit_tier,
-                    is_default,
+                    priority,
                     now,
                     now,
                 ),
@@ -1496,7 +1506,7 @@ class Database:
 
         with self._reader() as conn:
             cursor = conn.execute(
-                f"SELECT * FROM accounts {where} ORDER BY is_default DESC, created_at ASC"
+                f"SELECT * FROM accounts {where} ORDER BY COALESCE(priority, 0) ASC, created_at ASC"
             )
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
@@ -1508,7 +1518,7 @@ class Database:
         "last_used_at", "cached_usage_5h", "cached_usage_7d",
         "cached_5h_resets_at", "cached_7d_resets_at", "usage_cached_at",
         "last_error", "last_error_at", "consecutive_failures",
-        "last_validated_at", "validation_status",
+        "last_validated_at", "validation_status", "priority",
     })
 
     def update_account(self, account_id: int, **kwargs) -> bool:
@@ -1572,17 +1582,19 @@ class Database:
             else:
                 cursor = conn.execute(
                     """UPDATE accounts
-                       SET is_deleted = 1, is_default = 0, updated_at = ?
+                       SET is_deleted = 1, updated_at = ?
                        WHERE id = ?""",
                     (datetime.utcnow().isoformat(), account_id),
                 )
             return cursor.rowcount > 0
 
     def set_default_account(self, account_id: int) -> bool:
-        """Set an account as the default.
+        """Set an account as the primary (priority 0).
+
+        Shifts other accounts' priorities to make room.
 
         Args:
-            account_id: Account ID to set as default
+            account_id: Account ID to set as primary
 
         Returns:
             True if updated, False otherwise
@@ -1592,35 +1604,58 @@ class Database:
         with self._writer() as conn:
             # Check account exists and is active
             cursor = conn.execute(
-                "SELECT is_active FROM accounts WHERE id = ? AND is_deleted = 0",
+                "SELECT is_active, priority FROM accounts WHERE id = ? AND is_deleted = 0",
                 (account_id,),
             )
             row = cursor.fetchone()
             if not row or not row["is_active"]:
                 return False
 
-            # Clear existing default
+            old_priority = row["priority"] or 0
+            if old_priority == 0:
+                return True  # Already primary
+
+            # Shift accounts that had priority < old_priority up by 1 to make room
+            # (i.e., everything currently above the target moves down one slot)
             conn.execute(
-                "UPDATE accounts SET is_default = 0, updated_at = ? WHERE is_default = 1",
-                (now,),
+                """UPDATE accounts SET priority = priority + 1, updated_at = ?
+                   WHERE priority < ? AND is_deleted = 0""",
+                (now, old_priority),
             )
 
-            # Set new default
+            # Set target to priority 0
             cursor = conn.execute(
-                "UPDATE accounts SET is_default = 1, updated_at = ? WHERE id = ?",
+                "UPDATE accounts SET priority = 0, updated_at = ? WHERE id = ?",
                 (now, account_id),
             )
             return cursor.rowcount > 0
 
+    def reorder_accounts(self, account_ids: list[int]) -> None:
+        """Reorder accounts by priority in a single transaction.
+
+        Args:
+            account_ids: Account IDs in desired order (index = priority)
+        """
+        now = datetime.utcnow().isoformat()
+        with self._writer() as conn:
+            for i, aid in enumerate(account_ids):
+                conn.execute(
+                    "UPDATE accounts SET priority = ?, updated_at = ? WHERE id = ?",
+                    (i, now, aid),
+                )
+
     def get_default_account(self) -> Optional[dict]:
-        """Get the default account.
+        """Get the default (primary) account — the one with lowest priority.
 
         Returns:
             Account dict or None
         """
         with self._reader() as conn:
             cursor = conn.execute(
-                "SELECT * FROM accounts WHERE is_default = 1 AND is_active = 1 AND is_deleted = 0"
+                """SELECT * FROM accounts
+                   WHERE is_active = 1 AND is_deleted = 0
+                   ORDER BY COALESCE(priority, 0) ASC, created_at ASC
+                   LIMIT 1"""
             )
             row = cursor.fetchone()
             return dict(row) if row else None
@@ -1797,14 +1832,15 @@ class Database:
             placeholders = ",".join("?" for _ in exclude_ids) if exclude_ids else ""
             exclude_clause = f"AND id NOT IN ({placeholders})" if exclude_ids else ""
 
-            # Order by lowest usage (5h usage takes priority)
+            # Order by priority first, then lowest usage within same priority tier
             order_clause = """
                 ORDER BY
+                    COALESCE(priority, 0) ASC,
                     COALESCE(cached_usage_5h, 0) ASC,
                     COALESCE(cached_usage_7d, 0) ASC,
                     consecutive_failures ASC,
                     created_at ASC
-            """ if prefer_lowest_usage else "ORDER BY created_at ASC"
+            """ if prefer_lowest_usage else "ORDER BY COALESCE(priority, 0) ASC, created_at ASC"
 
             cursor = conn.execute(
                 f"""SELECT * FROM accounts
@@ -2348,6 +2384,13 @@ class Database:
                 ALTER TABLE accounts ADD COLUMN last_validated_at INTEGER;
                 ALTER TABLE accounts ADD COLUMN validation_status TEXT DEFAULT 'unknown';
             """),
+            # Migration to v11: Add priority column for account fallback ordering
+            (11, """
+                ALTER TABLE accounts ADD COLUMN priority INTEGER DEFAULT 0;
+            """),
+            # Migration to v12: Align priority with is_default, make priority authoritative
+            # (Python-based migration runs after SQL loop)
+            (12, """SELECT 1;"""),
         ]
 
         with self._writer() as conn:
@@ -2358,3 +2401,43 @@ class Database:
                         "INSERT INTO schema_version (version) VALUES (?)",
                         (version,),
                     )
+
+        # Run Python-based migrations
+        if current_version < 12:
+            self._migrate_v12_align_priority()
+
+    def _migrate_v12_align_priority(self):
+        """One-time: seed priority from is_default for users who haven't reordered."""
+        with self._writer() as conn:
+            accounts = conn.execute(
+                "SELECT id, is_default, priority, created_at FROM accounts WHERE is_deleted = 0 ORDER BY created_at ASC"
+            ).fetchall()
+            if not accounts:
+                return
+
+            # Detect if user already reordered (differentiated priorities)
+            priorities = [a["priority"] or 0 for a in accounts]
+            already_reordered = len(set(priorities)) > 1
+
+            if not already_reordered:
+                # Seed from is_default: default account gets 0, rest get 1, 2, ...
+                default_ids = [a["id"] for a in accounts if a["is_default"]]
+                non_default = [a["id"] for a in accounts if not a["is_default"]]
+
+                if default_ids:
+                    conn.execute(
+                        "UPDATE accounts SET priority = 0 WHERE id = ?",
+                        (default_ids[0],),
+                    )
+                    for i, aid in enumerate(non_default):
+                        conn.execute(
+                            "UPDATE accounts SET priority = ? WHERE id = ?",
+                            (i + 1, aid),
+                        )
+                # else: no default set — leave all at 0, first by created_at wins
+
+            # Clear is_default everywhere (priority is now authoritative)
+            conn.execute("UPDATE accounts SET is_default = 0")
+
+            # Drop the unique index that enforced singleton is_default
+            conn.execute("DROP INDEX IF EXISTS idx_single_default")

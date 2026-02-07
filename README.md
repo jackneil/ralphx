@@ -12,6 +12,18 @@ RalphX is a **Ralph wrapper** for managing Ralph loops across your entire produc
 
 ---
 
+## What's New in v0.4
+
+- **Sidebar step navigation** — Jump directly to any workflow step from the sidebar tree
+- **Multi-account with auto-fallback** — Connect multiple Claude accounts, auto-switch on rate limits
+- **Usage tracking** — Real-time 5h/7d progress bars with time position markers
+- **Event persistence** — Full session history saved to DB, no browser tab required
+- **Planning iterations** — Autonomous design doc refinement with streaming
+- **Reliable stop button** — Checkpoint-based process tracking survives server hot-reload
+- **62 bug fixes + security hardening** — See [CHANGELOG.md](CHANGELOG.md)
+
+---
+
 ## The Full Lifecycle
 
 ```
@@ -188,9 +200,6 @@ Ask Claude: *"Set up a new-product workflow starting from my idea for a task man
 - Webhook triggers from CI/CD
 - Git push/PR triggers
 
-**Subscription Management:**
-- Auto-switch to backup subscription when usage limits hit
-
 **Mobile Access:**
 - Mobile-friendly dashboard for monitoring on the go
 - Remote access setup instructions in the wiki
@@ -227,12 +236,13 @@ ralphx serve
 
 ---
 
-## Per-Project Subscriptions
+## Multi-Account Management
 
-Configure different Claude subscriptions per project. Great for:
-- Separating personal vs work usage
-- Managing team billing
-- Tracking costs per project
+Connect multiple Claude accounts and assign them per project:
+- **Per-project accounts** — Each project can use a different Claude account
+- **Usage tracking** — Real-time 5-hour and 7-day usage progress bars per account
+- **Auto-fallback** — When one account hits rate limits, automatically retry with another that has capacity
+- **Time markers** — Visual indicator showing where you are in each usage window
 
 ---
 

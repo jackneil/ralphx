@@ -115,6 +115,16 @@ export default function ProjectAccountSelector({
     return 'bg-green-500'
   }
 
+  const getElapsedPct = (resetsAt: string | undefined, windowHours: number): number | null => {
+    if (!resetsAt) return null
+    const reset = new Date(resetsAt).getTime()
+    const now = Date.now()
+    const durationMs = windowHours * 60 * 60 * 1000
+    const start = reset - durationMs
+    if (now < start || now > reset) return null
+    return Math.min(100, Math.max(0, ((now - start) / durationMs) * 100))
+  }
+
   const getUsageTextColor = (percentage: number): string => {
     if (percentage >= 90) return 'text-red-400'
     if (percentage >= 71) return 'text-yellow-400'
@@ -221,13 +231,13 @@ export default function ProjectAccountSelector({
             className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white disabled:opacity-50"
           >
             <option value="default">
-              Use default account
+              Use primary account
               {defaultAccount && ` (${defaultAccount.email})`}
             </option>
             {accounts.map((account) => (
               <option key={account.id} value={account.id} disabled={!account.is_active}>
                 {account.display_name || account.email}
-                {account.is_default && ' ⭐'}
+                {account.is_default && ' (primary)'}
                 {!account.is_active && ' (disabled)'}
                 {account.usage && ` — 5h: ${Math.round(account.usage.five_hour)}%`}
               </option>
@@ -290,14 +300,20 @@ export default function ProjectAccountSelector({
                         {Math.round(effectiveAccount.usage.five_hour)}%
                       </span>
                     </div>
-                    <div className="h-1.5 bg-gray-600 rounded-full overflow-hidden">
+                    <div className="h-1.5 bg-gray-600 rounded-full overflow-hidden relative">
                       <div
                         className={`h-full rounded-full ${getUsageBarColor(effectiveAccount.usage.five_hour)}`}
                         style={{ width: `${Math.min(100, effectiveAccount.usage.five_hour)}%` }}
                       />
+                      {(() => {
+                        const pct = getElapsedPct(effectiveAccount.usage.five_hour_resets_at, 5)
+                        return pct != null ? <div className="absolute top-0 bottom-0 w-0.5 bg-white/70 pointer-events-none" style={{ left: `${pct}%` }} /> : null
+                      })()}
                     </div>
                     <p className="text-gray-500 text-xs mt-0.5">
-                      {effectiveAccount.usage.five_hour_resets_at ? `Resets ${formatResetTime(effectiveAccount.usage.five_hour_resets_at)}` : 'No active window'}
+                      {effectiveAccount.usage.five_hour_resets_at && new Date(effectiveAccount.usage.five_hour_resets_at) > new Date()
+                      ? `Resets ${formatResetTime(effectiveAccount.usage.five_hour_resets_at)}`
+                      : 'No active window'}
                     </p>
                   </div>
                   {/* 7-day */}
@@ -308,14 +324,20 @@ export default function ProjectAccountSelector({
                         {Math.round(effectiveAccount.usage.seven_day)}%
                       </span>
                     </div>
-                    <div className="h-1.5 bg-gray-600 rounded-full overflow-hidden">
+                    <div className="h-1.5 bg-gray-600 rounded-full overflow-hidden relative">
                       <div
                         className={`h-full rounded-full ${getUsageBarColor(effectiveAccount.usage.seven_day)}`}
                         style={{ width: `${Math.min(100, effectiveAccount.usage.seven_day)}%` }}
                       />
+                      {(() => {
+                        const pct = getElapsedPct(effectiveAccount.usage.seven_day_resets_at, 168)
+                        return pct != null ? <div className="absolute top-0 bottom-0 w-0.5 bg-white/70 pointer-events-none" style={{ left: `${pct}%` }} /> : null
+                      })()}
                     </div>
                     <p className="text-gray-500 text-xs mt-0.5">
-                      {effectiveAccount.usage.seven_day_resets_at ? `Resets ${formatResetTime(effectiveAccount.usage.seven_day_resets_at)}` : 'No active window'}
+                      {effectiveAccount.usage.seven_day_resets_at && new Date(effectiveAccount.usage.seven_day_resets_at) > new Date()
+                      ? `Resets ${formatResetTime(effectiveAccount.usage.seven_day_resets_at)}`
+                      : 'No active window'}
                     </p>
                   </div>
                 </div>

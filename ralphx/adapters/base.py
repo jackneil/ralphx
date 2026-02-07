@@ -83,6 +83,7 @@ class ExecutionResult:
     error_message: Optional[str] = None
     timeout: bool = False
     permission_blocked: bool = False
+    is_rate_limited: bool = False
 
 
 class LLMAdapter(ABC):
@@ -110,6 +111,7 @@ class LLMAdapter(ABC):
         json_schema: Optional[dict] = None,
         on_session_start: Optional[Callable[[str], None]] = None,
         on_event: Optional[Callable[["StreamEvent"], None]] = None,
+        account_id: Optional[int] = None,
     ) -> ExecutionResult:
         """Execute a prompt and return the result.
 
@@ -122,6 +124,7 @@ class LLMAdapter(ABC):
                         When provided, the result will include structured_output.
             on_session_start: Optional callback fired when session ID is available.
             on_event: Optional callback fired for each streaming event (for persistence).
+            account_id: Optional account ID to use for credentials (overrides project default).
 
         Returns:
             ExecutionResult with session info and output.
@@ -136,6 +139,7 @@ class LLMAdapter(ABC):
         tools: Optional[list[str]] = None,
         timeout: int = 300,
         json_schema: Optional[dict] = None,
+        account_id: Optional[int] = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream execution events.
 
@@ -147,6 +151,7 @@ class LLMAdapter(ABC):
             json_schema: Optional JSON schema for structured output.
                         Note: streaming with json_schema uses non-streaming
                         internally and emits result at end.
+            account_id: Optional account ID to use for credentials.
 
         Yields:
             StreamEvent objects as execution progresses.

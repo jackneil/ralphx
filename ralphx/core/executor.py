@@ -26,6 +26,7 @@ from typing import Any, AsyncIterator, Callable, Optional
 
 from ralphx.adapters.base import AdapterEvent, ExecutionResult, LLMAdapter, StreamEvent
 from ralphx.adapters.claude_cli import ClaudeCLIAdapter
+from ralphx.core.database import Database as AuthDatabase
 from ralphx.core.dependencies import DependencyGraph, order_items_by_dependency
 from ralphx.core.project_db import ProjectDatabase
 from ralphx.core.resources import InjectionPosition, ResourceManager
@@ -1871,6 +1872,13 @@ class LoopExecutor:
                 except Exception:
                     pass  # Don't let event persistence failures break execution
 
+            # Resolve account and fallback settings for this execution
+            auth_db = AuthDatabase()
+            effective_account = auth_db.get_effective_account(self.project.id)
+            account_id = effective_account["id"] if effective_account else None
+            assignment = auth_db.get_project_account_assignment(self.project.id) if self.project.id else None
+            allow_fallback = assignment.get("allow_fallback", True) if assignment else True
+
             exec_result = await self.adapter.execute(
                 prompt=prompt,
                 model=mode.model,
@@ -1879,7 +1887,39 @@ class LoopExecutor:
                 json_schema=json_schema,
                 on_session_start=register_session_early,
                 on_event=persist_event,
+                account_id=account_id,
             )
+
+            # Fallback retry on rate limit — try up to 2 other accounts
+            if exec_result.is_rate_limited and allow_fallback:
+                failed_ids = [account_id] if account_id else []
+                for _retry in range(2):
+                    fallback = auth_db.get_fallback_account(exclude_ids=failed_ids)
+                    if not fallback:
+                        self._emit_event(
+                            ExecutorEvent.WARNING,
+                            "Rate limited, no fallback accounts available",
+                        )
+                        break
+                    self._emit_event(
+                        ExecutorEvent.INFO,
+                        f"Rate limited on {effective_account.get('email', '?')}, "
+                        f"falling back to {fallback.get('email', '?')}",
+                    )
+                    await asyncio.sleep(2)  # cooldown between retries
+                    exec_result = await self.adapter.execute(
+                        prompt=prompt,
+                        model=mode.model,
+                        tools=mode.tools,
+                        timeout=mode.timeout,
+                        json_schema=json_schema,
+                        on_session_start=register_session_early,
+                        on_event=persist_event,
+                        account_id=fallback["id"],
+                    )
+                    if not exec_result.is_rate_limited:
+                        break
+                    failed_ids.append(fallback["id"])
 
             result.session_id = exec_result.session_id
             result.success = exec_result.success

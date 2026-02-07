@@ -5,10 +5,8 @@ import {
   addAccount,
   getFlowStatus,
   removeAccount,
-  setDefaultAccount,
-  refreshAccountToken,
-  refreshAccountUsage,
   refreshAllAccountsUsage,
+  reorderAccounts,
   updateAccount,
   validateAccount,
 } from '../api'
@@ -24,8 +22,14 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
   const [addingAccount, setAddingAccount] = useState(false)
   const [actionInProgress, setActionInProgress] = useState<number | null>(null)
   const [validatingAccounts, setValidatingAccounts] = useState<Set<number>>(new Set())
+  const [refreshingAll, setRefreshingAll] = useState(false)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const [draggedId, setDraggedId] = useState<number | null>(null)
+  const [dragOverId, setDragOverId] = useState<number | null>(null)
+  const [now, setNow] = useState(Date.now())
   const pollRef = useRef<number | null>(null)
   const timeoutRef = useRef<number | null>(null)
+  const confirmTimeoutRef = useRef<number | null>(null)
   const validatedAccountsRef = useRef<Set<number>>(new Set())  // Track which accounts we've validated this session
   const mountedRef = useRef(true)  // Track if component is mounted
 
@@ -57,13 +61,14 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
   useEffect(() => {
     mountedRef.current = true
     loadAccounts(true) // Refresh usage on initial load if stale
-    // Refresh accounts list periodically
-    const interval = setInterval(() => loadAccounts(false), 30000)
+    // Refresh accounts list periodically + tick the "last updated" timer
+    const interval = setInterval(() => { loadAccounts(false); setNow(Date.now()) }, 30000)
     return () => {
       mountedRef.current = false
       clearInterval(interval)
       if (pollRef.current) clearInterval(pollRef.current)
       if (timeoutRef.current) clearTimeout(timeoutRef.current)
+      if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current)
     }
   }, [])
 
@@ -187,20 +192,27 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
     }
   }
 
-  const handleRemoveAccount = async (account: Account) => {
+  const handleRequestDelete = (account: Account) => {
     const hasOtherAccounts = accounts.filter(a => a.id !== account.id).length > 0
 
-    if (account.is_default && hasOtherAccounts) {
-      setError('Cannot delete default account. Set another account as default first.')
+    if (sortedAccounts[0]?.id === account.id && hasOtherAccounts) {
+      setError('Cannot remove the primary account while other accounts exist. Drag another account to the top first.')
       return
     }
 
-    const message = account.projects_using > 0
-      ? `Remove ${account.email}? ${account.projects_using} project(s) will need to use default.`
-      : `Remove ${account.email}?`
+    // Show inline confirmation
+    setConfirmDeleteId(account.id)
 
-    if (!window.confirm(message)) return
+    // Auto-cancel after 5 seconds
+    if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current)
+    confirmTimeoutRef.current = window.setTimeout(() => {
+      setConfirmDeleteId(null)
+    }, 5000)
+  }
 
+  const handleConfirmDelete = async (account: Account) => {
+    if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current)
+    setConfirmDeleteId(null)
     setActionInProgress(account.id)
     try {
       await removeAccount(account.id)
@@ -214,44 +226,21 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
     }
   }
 
-  const handleSetDefault = async (accountId: number) => {
-    setActionInProgress(accountId)
-    try {
-      await setDefaultAccount(accountId)
-      await loadAccounts()
-      onAccountChange?.()
-    } catch (e) {
-      setError('Failed to set default account')
-    } finally {
-      setActionInProgress(null)
-    }
+  const handleCancelDelete = () => {
+    if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current)
+    setConfirmDeleteId(null)
   }
 
-  const handleRefreshToken = async (accountId: number) => {
-    setActionInProgress(accountId)
+  const handleRefreshAllUsage = async () => {
+    setRefreshingAll(true)
     try {
-      const result = await refreshAccountToken(accountId)
-      if (result.success) {
-        await loadAccounts()
-      } else {
-        setError(result.message || 'Failed to refresh token')
-      }
-    } catch (e) {
-      setError('Failed to refresh token')
-    } finally {
-      setActionInProgress(null)
-    }
-  }
-
-  const handleRefreshUsage = async (accountId: number) => {
-    setActionInProgress(accountId)
-    try {
-      await refreshAccountUsage(accountId)
-      await loadAccounts()
+      await refreshAllAccountsUsage()
+      await loadAccounts(false)
+      setNow(Date.now())
     } catch {
-      // Usage refresh failure is not critical
+      setError('Failed to refresh usage')
     } finally {
-      setActionInProgress(null)
+      setRefreshingAll(false)
     }
   }
 
@@ -272,6 +261,16 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
     if (percentage >= 90) return 'bg-red-500'
     if (percentage >= 71) return 'bg-yellow-500'
     return 'bg-green-500'
+  }
+
+  const getElapsedPct = (resetsAt: string | undefined, windowHours: number): number | null => {
+    if (!resetsAt) return null
+    const reset = new Date(resetsAt).getTime()
+    const now = Date.now()
+    const durationMs = windowHours * 60 * 60 * 1000
+    const start = reset - durationMs
+    if (now < start || now > reset) return null
+    return Math.min(100, Math.max(0, ((now - start) / durationMs) * 100))
   }
 
   const getUsageTextColor = (percentage: number): string => {
@@ -296,14 +295,85 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
     return `${resetDate.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })} ${timeStr}`
   }
 
-  const getUsageCacheAge = (cachedAt?: number): string => {
+  const getUsageCacheAge = (cachedAt?: number, currentTime: number = now): string => {
     if (!cachedAt) return 'never'
-    const ageMs = Date.now() - cachedAt * 1000
+    const ageMs = currentTime - cachedAt * 1000
     const minutes = Math.floor(ageMs / 60000)
     if (minutes < 1) return 'just now'
     if (minutes < 60) return `${minutes}m ago`
-    const hours = Math.floor(minutes / 60)
+    const hours = Math.round((minutes / 60) * 10) / 10
     return `${hours}h ago`
+  }
+
+  // Sort accounts by priority for display
+  const sortedAccounts = [...accounts].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0))
+
+  // Most recent usage cache timestamp across all accounts
+  const latestCacheAge = (() => {
+    const timestamps = accounts.map(a => a.usage_cached_at).filter(Boolean) as number[]
+    if (timestamps.length === 0) return null
+    return Math.max(...timestamps)
+  })()
+
+  const getPriorityLabel = (index: number): string => {
+    if (index === 0) return 'Primary'
+    return `Fallback ${index}`
+  }
+
+  const handleDragStart = (e: React.DragEvent, accountId: number) => {
+    setDraggedId(accountId)
+    e.dataTransfer.effectAllowed = 'move'
+  }
+
+  const handleDragOver = (e: React.DragEvent, accountId: number) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    if (accountId !== draggedId) {
+      setDragOverId(accountId)
+    }
+  }
+
+  const handleDragLeave = () => {
+    setDragOverId(null)
+  }
+
+  const handleDrop = async (e: React.DragEvent, targetId: number) => {
+    e.preventDefault()
+    setDragOverId(null)
+    if (draggedId === null || draggedId === targetId) {
+      setDraggedId(null)
+      return
+    }
+
+    // Reorder: move dragged item to target position
+    const newOrder = sortedAccounts.map(a => a.id)
+    const fromIndex = newOrder.indexOf(draggedId)
+    const toIndex = newOrder.indexOf(targetId)
+    newOrder.splice(fromIndex, 1)
+    newOrder.splice(toIndex, 0, draggedId)
+
+    setDraggedId(null)
+
+    // Optimistic update
+    const updatedAccounts = accounts.map(acc => ({
+      ...acc,
+      priority: newOrder.indexOf(acc.id),
+      is_default: newOrder.indexOf(acc.id) === 0,
+    }))
+    setAccounts(updatedAccounts)
+
+    // Persist to backend
+    try {
+      await reorderAccounts(newOrder)
+    } catch {
+      // Revert on error
+      await loadAccounts()
+    }
+  }
+
+  const handleDragEnd = () => {
+    setDraggedId(null)
+    setDragOverId(null)
   }
 
   if (loading) {
@@ -352,17 +422,35 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
   return (
     <div className="card">
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold text-white">Claude Accounts</h2>
-        <button
-          onClick={() => handleAddAccount()}
-          disabled={addingAccount}
-          className="flex items-center space-x-1 px-3 py-1.5 bg-primary-600 text-white text-sm rounded hover:bg-primary-500 disabled:opacity-50"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-          </svg>
-          <span>{addingAccount ? 'Waiting...' : 'Add Account'}</span>
-        </button>
+        <div>
+          <h2 className="text-lg font-semibold text-white">Claude Accounts</h2>
+          {latestCacheAge && (
+            <p className="text-xs text-gray-500 mt-0.5">Last updated: {getUsageCacheAge(latestCacheAge)}</p>
+          )}
+        </div>
+        <div className="flex items-center space-x-2">
+          <button
+            onClick={handleRefreshAllUsage}
+            disabled={refreshingAll}
+            className="flex items-center space-x-1.5 px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-600/50 text-sm rounded transition-colors disabled:opacity-50"
+            title="Refresh usage for all accounts"
+          >
+            <svg className={`w-3.5 h-3.5 ${refreshingAll ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+            <span>{refreshingAll ? 'Refreshing...' : 'Refresh Usage'}</span>
+          </button>
+          <button
+            onClick={() => handleAddAccount()}
+            disabled={addingAccount}
+            className="flex items-center space-x-1.5 px-3 py-1.5 bg-primary-600 text-white text-sm rounded hover:bg-primary-500 transition-colors disabled:opacity-50"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+            <span>{addingAccount ? 'Waiting...' : 'Add Account'}</span>
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -386,11 +474,21 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
       )}
 
       <div className="space-y-3">
-        {accounts.map((account) => (
+        {sortedAccounts.map((account, index) => (
           <div
             key={account.id}
-            className={`p-4 rounded-lg border ${
-              account.is_expired
+            draggable={sortedAccounts.length > 1}
+            onDragStart={(e) => handleDragStart(e, account.id)}
+            onDragOver={(e) => handleDragOver(e, account.id)}
+            onDragLeave={handleDragLeave}
+            onDrop={(e) => handleDrop(e, account.id)}
+            onDragEnd={handleDragEnd}
+            className={`p-4 rounded-lg border transition-all ${
+              draggedId === account.id
+                ? 'opacity-50'
+                : dragOverId === account.id
+                ? 'border-primary-500 bg-primary-900/20'
+                : account.is_expired
                 ? 'bg-yellow-900/10 border-yellow-800/50'
                 : account.validation_status === 'invalid'
                 ? 'bg-orange-900/10 border-orange-800/50'
@@ -402,6 +500,12 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
             {/* Header row */}
             <div className="flex items-start justify-between">
               <div className="flex items-center space-x-3">
+                {/* Drag handle — only show when there are multiple accounts */}
+                {sortedAccounts.length > 1 && (
+                  <div className="cursor-grab active:cursor-grabbing text-gray-500 hover:text-gray-300 select-none text-lg leading-none" title="Drag to reorder">
+                    &#x2807;
+                  </div>
+                )}
                 <div
                   className={`w-2.5 h-2.5 rounded-full ${
                     validatingAccounts.has(account.id)
@@ -418,11 +522,13 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                     <span className="text-white font-medium text-base">
                       {account.email}
                     </span>
-                    {account.is_default && (
-                      <span className="px-1.5 py-0.5 bg-primary-600/30 text-primary-400 text-xs rounded font-medium">
-                        DEFAULT
-                      </span>
-                    )}
+                    <span className={`px-1.5 py-0.5 text-xs rounded font-medium ${
+                      index === 0
+                        ? 'bg-green-600/20 text-green-400'
+                        : 'bg-gray-600/30 text-gray-400'
+                    }`}>
+                      {getPriorityLabel(index)}
+                    </span>
                     {validatingAccounts.has(account.id) && (
                       <span className="px-1.5 py-0.5 bg-blue-600/30 text-blue-400 text-xs rounded font-medium">
                         CHECKING...
@@ -469,45 +575,49 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
 
               {/* Actions */}
               <div className="flex items-center space-x-1">
-                {account.is_expired || (account.validation_status === 'invalid' && !validatingAccounts.has(account.id)) ? (
-                  <button
-                    onClick={() => handleAddAccount(account.email)}
-                    disabled={addingAccount}
-                    className={`px-2 py-1 text-sm text-white rounded disabled:opacity-50 ${
-                      account.is_expired
-                        ? 'bg-yellow-600 hover:bg-yellow-500'
-                        : 'bg-orange-600 hover:bg-orange-500'
-                    }`}
-                  >
-                    Re-auth
-                  </button>
-                ) : (
-                  <>
-                    {!account.is_default && account.is_active && (
-                      <button
-                        onClick={() => handleSetDefault(account.id)}
-                        disabled={actionInProgress === account.id}
-                        className="px-2 py-1 text-xs text-gray-400 hover:text-white hover:bg-gray-600 rounded"
-                        title="Set as default"
-                      >
-                        Set Default
-                      </button>
-                    )}
+                {confirmDeleteId === account.id ? (
+                  /* Inline delete confirmation */
+                  <div className="flex items-center space-x-2">
+                    <span className="text-red-400 text-xs">Remove?</span>
                     <button
-                      onClick={() => handleRefreshToken(account.id)}
+                      onClick={() => handleConfirmDelete(account)}
+                      className="px-2 py-0.5 text-xs text-white bg-red-600 hover:bg-red-500 rounded"
+                    >
+                      Yes
+                    </button>
+                    <button
+                      onClick={handleCancelDelete}
+                      className="px-2 py-0.5 text-xs text-gray-400 hover:text-white hover:bg-gray-600 rounded"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : account.is_expired || (account.validation_status === 'invalid' && !validatingAccounts.has(account.id)) ? (
+                  <>
+                    <button
+                      onClick={() => handleAddAccount(account.email)}
+                      disabled={addingAccount}
+                      className={`px-2 py-1 text-sm text-white rounded disabled:opacity-50 ${
+                        account.is_expired
+                          ? 'bg-yellow-600 hover:bg-yellow-500'
+                          : 'bg-orange-600 hover:bg-orange-500'
+                      }`}
+                    >
+                      Re-auth
+                    </button>
+                    <button
+                      onClick={() => handleRequestDelete(account)}
                       disabled={actionInProgress === account.id}
-                      className="p-1 text-gray-400 hover:text-white hover:bg-gray-600 rounded"
-                      title="Refresh token"
+                      className="p-1 text-gray-400 hover:text-red-400 hover:bg-red-900/30 rounded"
+                      title="Remove account"
                     >
                       <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth={2}
-                          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-                        />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                       </svg>
                     </button>
+                  </>
+                ) : (
+                  <>
                     <button
                       onClick={() => handleAddAccount(account.email)}
                       disabled={addingAccount}
@@ -519,52 +629,23 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                     <button
                       onClick={() => handleToggleActive(account)}
                       disabled={actionInProgress === account.id}
-                      className="p-1 text-gray-400 hover:text-white hover:bg-gray-600 rounded"
+                      className="px-2 py-1 text-xs text-gray-400 hover:text-white hover:bg-gray-600 rounded"
                       title={account.is_active ? 'Disable account' : 'Enable account'}
                     >
-                      {account.is_active ? (
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={2}
-                            d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"
-                          />
-                        </svg>
-                      ) : (
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={2}
-                            d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"
-                          />
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={2}
-                            d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                          />
-                        </svg>
-                      )}
+                      {account.is_active ? 'Disable' : 'Enable'}
+                    </button>
+                    <button
+                      onClick={() => handleRequestDelete(account)}
+                      disabled={actionInProgress === account.id}
+                      className="p-1 text-gray-400 hover:text-red-400 hover:bg-red-900/30 rounded"
+                      title="Remove account"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
                     </button>
                   </>
                 )}
-                <button
-                  onClick={() => handleRemoveAccount(account)}
-                  disabled={actionInProgress === account.id}
-                  className="p-1 text-gray-400 hover:text-red-400 hover:bg-red-900/30 rounded"
-                  title="Remove account"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
-                    />
-                  </svg>
-                </button>
               </div>
             </div>
 
@@ -582,14 +663,20 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                             {Math.round(account.usage.five_hour)}% used
                           </span>
                         </div>
-                        <div className="h-2 bg-gray-600 rounded-full overflow-hidden">
+                        <div className="h-2 bg-gray-600 rounded-full overflow-hidden relative">
                           <div
                             className={`h-full rounded-full transition-all ${getUsageBarColor(account.usage.five_hour)}`}
                             style={{ width: `${Math.min(100, account.usage.five_hour)}%` }}
                           />
+                          {(() => {
+                            const pct = getElapsedPct(account.usage.five_hour_resets_at, 5)
+                            return pct != null ? <div className="absolute top-0 bottom-0 w-0.5 bg-white/70 pointer-events-none" style={{ left: `${pct}%` }} /> : null
+                          })()}
                         </div>
                         <p className="text-gray-500 text-xs mt-1">
-                          {account.usage.five_hour_resets_at ? `Resets ${formatResetTime(account.usage.five_hour_resets_at)}` : 'No active window'}
+                          {account.usage.five_hour_resets_at && new Date(account.usage.five_hour_resets_at) > new Date()
+                          ? `Resets ${formatResetTime(account.usage.five_hour_resets_at)}`
+                          : 'No active window'}
                         </p>
                       </div>
                       {/* 7-day usage */}
@@ -600,44 +687,26 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                             {Math.round(account.usage.seven_day)}% used
                           </span>
                         </div>
-                        <div className="h-2 bg-gray-600 rounded-full overflow-hidden">
+                        <div className="h-2 bg-gray-600 rounded-full overflow-hidden relative">
                           <div
                             className={`h-full rounded-full transition-all ${getUsageBarColor(account.usage.seven_day)}`}
                             style={{ width: `${Math.min(100, account.usage.seven_day)}%` }}
                           />
+                          {(() => {
+                            const pct = getElapsedPct(account.usage.seven_day_resets_at, 168)
+                            return pct != null ? <div className="absolute top-0 bottom-0 w-0.5 bg-white/70 pointer-events-none" style={{ left: `${pct}%` }} /> : null
+                          })()}
                         </div>
                         <p className="text-gray-500 text-xs mt-1">
-                          {account.usage.seven_day_resets_at ? `Resets ${formatResetTime(account.usage.seven_day_resets_at)}` : 'No active window'}
+                          {account.usage.seven_day_resets_at && new Date(account.usage.seven_day_resets_at) > new Date()
+                          ? `Resets ${formatResetTime(account.usage.seven_day_resets_at)}`
+                          : 'No active window'}
                         </p>
                       </div>
                     </div>
-                    {account.usage_cached_at && (
-                      <button
-                        onClick={() => handleRefreshUsage(account.id)}
-                        disabled={actionInProgress === account.id}
-                        className="text-gray-500 text-xs mt-2 hover:text-gray-400 flex items-center gap-1"
-                      >
-                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                        </svg>
-                        Updated {getUsageCacheAge(account.usage_cached_at)}
-                      </button>
-                    )}
                   </>
                 ) : (
-                  <div className="flex items-center justify-between">
-                    <span className="text-gray-500 text-sm">Usage data not available</span>
-                    <button
-                      onClick={() => handleRefreshUsage(account.id)}
-                      disabled={actionInProgress === account.id}
-                      className="text-xs text-primary-400 hover:text-primary-300 disabled:opacity-50 flex items-center gap-1"
-                    >
-                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                      </svg>
-                      Fetch usage
-                    </button>
-                  </div>
+                  <span className="text-gray-500 text-xs">Usage data not available</span>
                 )}
               </div>
             )}
@@ -685,8 +754,8 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
             />
           </svg>
           <p className="text-gray-400 text-xs">
-            The default account is used for all projects without an explicit account assignment.
-            When a project hits its usage limit, RalphX can automatically fall back to other accounts.
+            The top account is used by default for all projects. Drag to reorder priority.
+            When rate limited, RalphX automatically retries with the next account.
           </p>
         </div>
       </div>
