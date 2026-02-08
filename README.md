@@ -12,14 +12,15 @@ RalphX is a **Ralph wrapper** for managing Ralph loops across your entire produc
 
 ---
 
-## What's New in v0.4
+## What's New in v0.4.2
 
 - **Sidebar step navigation** — Jump directly to any workflow step from the sidebar tree
-- **Multi-account with auto-fallback** — Connect multiple Claude accounts, auto-switch on rate limits
+- **Multi-account with auto-fallback** — Connect multiple Claude accounts, auto-switch on 429 rate limits with drag-to-reorder priority and per-project account assignment
 - **Usage tracking** — Real-time 5h/7d progress bars with time position markers
 - **Event persistence** — Full session history saved to DB, no browser tab required
 - **Planning iterations** — Autonomous design doc refinement with streaming
 - **Reliable stop button** — Checkpoint-based process tracking survives server hot-reload
+- **Multi-account unified UX** — Streamlined account management with re-auth scope fixes
 - **62 bug fixes + security hardening** — See [CHANGELOG.md](CHANGELOG.md)
 
 ---
@@ -96,7 +97,7 @@ Or if you have a design doc:
 
 > "Register this project and create a planning workflow from my README"
 
-Open `http://localhost:16768` to monitor progress.
+Open `http://localhost:8765` to monitor progress.
 
 ![Dashboard](https://raw.githubusercontent.com/jackneil/ralphx/main/docs/images/dashboard-overview.png)
 
@@ -105,7 +106,7 @@ Open `http://localhost:16768` to monitor progress.
 **Already technical?** Here's the quick setup:
 
 ```bash
-# Create and activate a Python 3.11+ environment:
+# Create and activate a Python 3.10+ environment (3.11 recommended):
 conda create -n ralphx python=3.11 -y && conda activate ralphx
 
 # Install RalphX:
@@ -166,19 +167,20 @@ Each iteration of the implementation Ralph loop:
 
 ---
 
-## Workflow Templates
+## Workflow Step Types
 
-Pre-built workflows that chain Ralph loops together:
+Each workflow is built by combining steps. Each step uses one of these processing types:
 
-| Template | Ralph Loops |
-|----------|-------------|
-| **New Product** | Research → Design Doc → Stories → Implement → Test |
-| **From PRD** | Stories → Implement → Test |
-| **Feature Add** | Impact Analysis → Tasks → Implement → Test |
-| **Bug Fix** | Import Issues → Triage → Root Cause → Fix → Verify |
-| **Security Audit** | Scan → Prioritize → Remediate → Verify |
+| Step Type | What It Does |
+|-----------|-------------|
+| **Design Doc** | Interactive planning chat with web research to build a comprehensive design document |
+| **Extract Requirements** | Extract user stories from your design doc (turbo mode for speed, deep mode for web-enhanced thoroughness) |
+| **Web-Gen Requirements** | Discover requirements you missed by researching domain best practices on the web |
+| **Implementation** | Implement user stories one at a time with code changes, tests, and git commits |
 
-Ask Claude: *"Set up a new-product workflow starting from my idea for a task management app"*
+Build any workflow by combining these steps. For example, a full product workflow would be: Design Doc → Extract Requirements → Implementation.
+
+Ask Claude: *"Create a workflow for my project starting from my idea for a task management app"*
 
 ---
 
@@ -206,42 +208,13 @@ Ask Claude: *"Set up a new-product workflow starting from my idea for a task man
 
 ---
 
-## Manual Installation
-
-For those who prefer to do it themselves:
-
-```bash
-# Create a virtual environment (use conda, venv, or your preferred tool)
-# Example with conda:
-conda create -n ralphx python=3.11 -y
-conda activate ralphx
-
-# Or with venv:
-# python3 -m venv ~/.venvs/ralphx && source ~/.venvs/ralphx/bin/activate
-
-# Install RalphX
-pip install ralphx
-
-# Set up MCP so Claude can control RalphX (uses full path so it works outside the env)
-# Linux/Mac:
-claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- "$(which ralphx)" mcp
-# Mac (zsh): if "which" fails, run: conda init zsh && source ~/.zshrc
-# Windows: find path with "where.exe ralphx" (CMD) or "(Get-Command ralphx).Source" (PowerShell)
-#          then: claude mcp add ralphx -e PYTHONDONTWRITEBYTECODE=1 -- C:\Users\YOU\...\ralphx.exe mcp
-
-# Start the dashboard
-ralphx serve
-# Open http://localhost:16768
-```
-
----
-
 ## Multi-Account Management
 
 Connect multiple Claude accounts and assign them per project:
 - **Per-project accounts** — Each project can use a different Claude account
+- **Priority ordering** — Drag-to-reorder accounts to set fallback priority
+- **Auto-fallback on 429** — When one account hits rate limits (HTTP 429), automatically retry with the next account that has capacity
 - **Usage tracking** — Real-time 5-hour and 7-day usage progress bars per account
-- **Auto-fallback** — When one account hits rate limits, automatically retry with another that has capacity
 - **Time markers** — Visual indicator showing where you are in each usage window
 
 ---
@@ -261,11 +234,54 @@ Connect multiple Claude accounts and assign them per project:
 
 ## CLI Reference
 
+**Core Commands:**
 ```bash
-ralphx add <path>           # Register a project
-ralphx serve                # Start dashboard
-ralphx doctor               # Check prerequisites
-ralphx why <workflow>       # Explain why something stopped
+ralphx add <path>                          # Register a project
+ralphx remove <slug>                       # Unregister a project
+ralphx serve                               # Start dashboard (default port 8765)
+ralphx run <loop> --project <slug>         # Run a loop from the CLI
+ralphx doctor                              # Check system prerequisites
+ralphx diagnose --project <slug>           # Run project-specific diagnostics
+ralphx why --project <slug>                # Explain why the last run stopped
+ralphx validate <loop.yaml>                # Validate a loop configuration file
+ralphx mcp                                 # Start MCP server for Claude Code
+```
+
+**Project Management:**
+```bash
+ralphx projects list                       # List all registered projects
+ralphx projects show <slug>                # Show project details and stats
+```
+
+**Loop Management:**
+```bash
+ralphx loops list --project <slug>         # List all loops for a project
+ralphx loops show <name> --project <slug>  # Show loop config details
+ralphx loops sync --project <slug>         # Sync loop configs from files to DB
+```
+
+**Guardrails:**
+```bash
+ralphx guardrails list --project <slug>              # List all guardrail files
+ralphx guardrails validate --project <slug>          # Validate guardrail config
+ralphx guardrails preview <loop> --project <slug>    # Preview assembled guardrails
+ralphx guardrails detect --project <slug>            # Detect AI instruction files
+ralphx guardrails templates                          # List guardrail templates
+```
+
+**Permissions:**
+```bash
+ralphx permissions check --project <slug>                     # Check current permissions
+ralphx permissions setup --project <slug> --loop <name>       # Auto-configure for a loop
+ralphx permissions preset --project <slug> --preset <name>    # Apply preset (research/implementation/full)
+```
+
+**Import:**
+```bash
+ralphx import markdown <file> --project <slug> --loop <name>  # Import markdown file
+ralphx import jsonl <file> --project <slug> --loop <name>     # Import JSONL work items
+ralphx import paste --project <slug> --loop <name> -f <name>  # Import from stdin
+ralphx import list --project <slug> --loop <name>             # List input files
 ```
 
 ---
