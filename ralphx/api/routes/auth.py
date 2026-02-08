@@ -1,6 +1,7 @@
 """Authentication routes for Claude accounts."""
 
 import asyncio
+import json
 import logging
 import secrets
 import time
@@ -26,6 +27,22 @@ _active_flows: dict[str, asyncio.Task] = {}
 # ============================================================================
 
 
+class ModelUsage(BaseModel):
+    """Per-model usage breakdown (e.g., Sonnet 7-day, Opus 7-day)."""
+
+    utilization: float = Field(description="Utilization percentage (0-100)")
+    resets_at: Optional[str] = Field(None, description="ISO timestamp when limit resets")
+
+
+class ExtraUsage(BaseModel):
+    """Extra usage credits information."""
+
+    is_enabled: bool = Field(default=False, description="Whether extra usage is enabled")
+    monthly_limit: Optional[float] = Field(None, description="Monthly credit limit")
+    used_credits: Optional[float] = Field(None, description="Credits used this month")
+    utilization: Optional[float] = Field(None, description="Utilization percentage (0-100)")
+
+
 class AccountUsage(BaseModel):
     """Usage statistics for an account."""
 
@@ -33,6 +50,8 @@ class AccountUsage(BaseModel):
     seven_day: float = Field(description="7-day utilization percentage (0-100)")
     five_hour_resets_at: Optional[str] = Field(None, description="ISO timestamp when 5h limit resets")
     seven_day_resets_at: Optional[str] = Field(None, description="ISO timestamp when 7d limit resets")
+    per_model: Optional[dict[str, ModelUsage]] = Field(None, description="Per-model 7-day breakdowns")
+    extra_usage: Optional[ExtraUsage] = Field(None, description="Extra usage credits info")
 
 
 class AccountResponse(BaseModel):
@@ -167,9 +186,62 @@ async def _fetch_account_usage(access_token: str) -> Optional[dict]:
                 "seven_day": seven_day.get("utilization", 0),
                 "five_hour_resets_at": five_hour.get("resets_at"),
                 "seven_day_resets_at": seven_day.get("resets_at"),
+                "raw": data,
             }
     except Exception:
         return None
+
+
+def _parse_usage_details(
+    raw_json: Optional[str],
+) -> tuple[Optional[dict[str, ModelUsage]], Optional[ExtraUsage]]:
+    """Parse cached_usage_raw into per_model dict and ExtraUsage."""
+    if not raw_json:
+        return None, None
+    try:
+        data = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        return None, None
+
+    # Per-model: extract seven_day_* keys
+    per_model: dict[str, ModelUsage] = {}
+    for key in ("seven_day_sonnet", "seven_day_opus", "seven_day_oauth_apps", "seven_day_cowork"):
+        val = data.get(key)
+        if val is not None and isinstance(val, dict):
+            per_model[key.removeprefix("seven_day_")] = ModelUsage(
+                utilization=val.get("utilization", 0),
+                resets_at=val.get("resets_at"),
+            )
+        elif val is not None and isinstance(val, (int, float)):
+            per_model[key.removeprefix("seven_day_")] = ModelUsage(utilization=val)
+
+    # Extra usage
+    extra_raw = data.get("extra_usage")
+    extra = None
+    if isinstance(extra_raw, dict):
+        extra = ExtraUsage(
+            is_enabled=extra_raw.get("is_enabled", False),
+            monthly_limit=extra_raw.get("monthly_limit"),
+            used_credits=extra_raw.get("used_credits"),
+            utilization=extra_raw.get("utilization"),
+        )
+
+    return (per_model or None), extra
+
+
+def _build_account_usage(account: dict) -> Optional[AccountUsage]:
+    """Build AccountUsage from account dict if usage data exists."""
+    if account.get("cached_usage_5h") is None and account.get("cached_usage_7d") is None:
+        return None
+    per_model, extra_usage = _parse_usage_details(account.get("cached_usage_raw"))
+    return AccountUsage(
+        five_hour=account.get("cached_usage_5h", 0) or 0,
+        seven_day=account.get("cached_usage_7d", 0) or 0,
+        five_hour_resets_at=account.get("cached_5h_resets_at"),
+        seven_day_resets_at=account.get("cached_7d_resets_at"),
+        per_model=per_model,
+        extra_usage=extra_usage,
+    )
 
 
 def _build_account_response(account: dict, db: Database) -> AccountResponse:
@@ -177,15 +249,6 @@ def _build_account_response(account: dict, db: Database) -> AccountResponse:
     now = int(time.time())
     expires_at = account.get("expires_at", 0)
     is_expired = now >= expires_at if expires_at else True
-
-    usage = None
-    if account.get("cached_usage_5h") is not None or account.get("cached_usage_7d") is not None:
-        usage = AccountUsage(
-            five_hour=account.get("cached_usage_5h", 0) or 0,
-            seven_day=account.get("cached_usage_7d", 0) or 0,
-            five_hour_resets_at=account.get("cached_5h_resets_at"),
-            seven_day_resets_at=account.get("cached_7d_resets_at"),
-        )
 
     return AccountResponse(
         id=account["id"],
@@ -199,7 +262,7 @@ def _build_account_response(account: dict, db: Database) -> AccountResponse:
         expires_at=expires_at,
         expires_in_seconds=max(0, expires_at - now) if expires_at else None,
         is_expired=is_expired,
-        usage=usage,
+        usage=_build_account_usage(account),
         usage_cached_at=account.get("usage_cached_at"),
         projects_using=db.count_projects_using_account(account["id"]),
         last_error=account.get("last_error"),
@@ -213,14 +276,7 @@ def _build_account_response(account: dict, db: Database) -> AccountResponse:
 
 def _build_usage_from_account(account: dict) -> Optional[AccountUsage]:
     """Build AccountUsage from account dict if usage data exists."""
-    if account.get("cached_usage_5h") is None and account.get("cached_usage_7d") is None:
-        return None
-    return AccountUsage(
-        five_hour=account.get("cached_usage_5h", 0) or 0,
-        seven_day=account.get("cached_usage_7d", 0) or 0,
-        five_hour_resets_at=account.get("cached_5h_resets_at"),
-        seven_day_resets_at=account.get("cached_7d_resets_at"),
-    )
+    return _build_account_usage(account)
 
 
 # ============================================================================
@@ -513,6 +569,7 @@ async def add_account(expected_email: Optional[str] = None):
                     seven_day=usage_data["seven_day"],
                     five_hour_resets_at=usage_data.get("five_hour_resets_at"),
                     seven_day_resets_at=usage_data.get("seven_day_resets_at"),
+                    raw=usage_data.get("raw"),
                 )
 
             # Return success with mismatch info if applicable
@@ -723,6 +780,7 @@ async def refresh_account_usage(account_id: int):
         seven_day=usage_data["seven_day"],
         five_hour_resets_at=usage_data.get("five_hour_resets_at"),
         seven_day_resets_at=usage_data.get("seven_day_resets_at"),
+        raw=usage_data.get("raw"),
     )
 
     return {"success": True, "usage": usage_data}
@@ -796,6 +854,7 @@ async def refresh_all_accounts_usage():
                 seven_day=usage_data["seven_day"],
                 five_hour_resets_at=usage_data.get("five_hour_resets_at"),
                 seven_day_resets_at=usage_data.get("seven_day_resets_at"),
+                raw=usage_data.get("raw"),
             )
             results["refreshed"] += 1
             results["accounts"].append({"id": account["id"], "email": account["email"], "success": True})

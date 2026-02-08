@@ -25,7 +25,7 @@ from ralphx.core.workspace import get_backups_path, get_database_path
 # Schema version for migrations
 # NOTE: When the initial schema is updated, also update this version and ensure
 # migrations are idempotent (use IF EXISTS / IF NOT EXISTS clauses).
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 13
 
 # SQL schema
 SCHEMA_SQL = """
@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     cached_usage_7d REAL,
     cached_5h_resets_at TEXT,  -- ISO timestamp string
     cached_7d_resets_at TEXT,  -- ISO timestamp string
+    cached_usage_raw TEXT,     -- Full JSON response from usage API
     usage_cached_at INTEGER,   -- Unix timestamp when cache was updated
     -- Error tracking
     last_error TEXT,
@@ -1516,7 +1517,7 @@ class Database:
         "display_name", "access_token", "refresh_token", "expires_at",
         "scopes", "subscription_type", "rate_limit_tier", "is_active",
         "last_used_at", "cached_usage_5h", "cached_usage_7d",
-        "cached_5h_resets_at", "cached_7d_resets_at", "usage_cached_at",
+        "cached_5h_resets_at", "cached_7d_resets_at", "cached_usage_raw", "usage_cached_at",
         "last_error", "last_error_at", "consecutive_failures",
         "last_validated_at", "validation_status", "priority",
     })
@@ -1862,6 +1863,7 @@ class Database:
         seven_day: Optional[float] = None,
         five_hour_resets_at: Optional[str] = None,
         seven_day_resets_at: Optional[str] = None,
+        raw: Optional[dict] = None,
     ) -> bool:
         """Update the cached usage data for an account.
 
@@ -1871,10 +1873,12 @@ class Database:
             seven_day: 7-day utilization percentage (0-100)
             five_hour_resets_at: ISO timestamp when 5h limit resets
             seven_day_resets_at: ISO timestamp when 7d limit resets
+            raw: Full API response dict to store as JSON
 
         Returns:
             True if updated, False otherwise
         """
+        import json
         import time
 
         updates = {"usage_cached_at": int(time.time())}
@@ -1886,6 +1890,10 @@ class Database:
             updates["cached_5h_resets_at"] = five_hour_resets_at
         if seven_day_resets_at is not None:
             updates["cached_7d_resets_at"] = seven_day_resets_at
+        if raw is not None:
+            raw_str = json.dumps(raw)
+            if len(raw_str) <= 10240:  # 10KB guard
+                updates["cached_usage_raw"] = raw_str
 
         return self.update_account(account_id, **updates)
 
@@ -2344,6 +2352,7 @@ class Database:
                     cached_usage_7d REAL,
                     cached_5h_resets_at TEXT,
                     cached_7d_resets_at TEXT,
+                    cached_usage_raw TEXT,
                     usage_cached_at INTEGER,
                     last_error TEXT,
                     last_error_at TIMESTAMP,
@@ -2391,6 +2400,10 @@ class Database:
             # Migration to v12: Align priority with is_default, make priority authoritative
             # (Python-based migration runs after SQL loop)
             (12, """SELECT 1;"""),
+            # Migration to v13: Add raw usage JSON column for per-model breakdowns
+            (13, """
+                ALTER TABLE accounts ADD COLUMN cached_usage_raw TEXT;
+            """),
         ]
 
         with self._writer() as conn:

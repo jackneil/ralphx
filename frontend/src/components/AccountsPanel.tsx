@@ -26,6 +26,7 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
   const [draggedId, setDraggedId] = useState<number | null>(null)
   const [dragOverId, setDragOverId] = useState<number | null>(null)
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
   const [now, setNow] = useState(Date.now())
   const pollRef = useRef<number | null>(null)
   const timeoutRef = useRef<number | null>(null)
@@ -322,6 +323,7 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
 
   const handleDragStart = (e: React.DragEvent, accountId: number) => {
     setDraggedId(accountId)
+    setExpandedIds(new Set())
     e.dataTransfer.effectAllowed = 'move'
   }
 
@@ -707,6 +709,96 @@ export default function AccountsPanel({ onAccountChange }: AccountsPanelProps) {
                   </>
                 ) : (
                   <span className="text-gray-500 text-xs">Usage data not available</span>
+                )}
+
+                {/* Expandable details section — only when per_model or extra_usage exists */}
+                {account.usage && (account.usage.per_model || account.usage.extra_usage) && (
+                  <div className="mt-2">
+                    <button
+                      onClick={() => setExpandedIds(prev => { const next = new Set(prev); if (next.has(account.id)) next.delete(account.id); else next.add(account.id); return next })}
+                      className="flex items-center gap-1 text-gray-500 hover:text-gray-300 text-xs transition-colors"
+                    >
+                      <svg
+                        className={`w-3 h-3 transition-transform ${expandedIds.has(account.id) ? 'rotate-90' : ''}`}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                      </svg>
+                      Details
+                    </button>
+
+                    {expandedIds.has(account.id) && (
+                      <div className="mt-2 space-y-3">
+                        {/* Per-model 7-day breakdowns */}
+                        {account.usage.per_model && Object.keys(account.usage.per_model).length > 0 && (
+                          <div>
+                            <p className="text-gray-500 text-xs font-medium mb-1.5">7-day by model</p>
+                            <div className="space-y-1.5">
+                              {Object.entries(account.usage.per_model).map(([model, data]) => (
+                                <div key={model} className="flex items-center gap-2">
+                                  <span className="text-gray-400 text-xs w-20 capitalize truncate">{model.replace('_', ' ')}</span>
+                                  <div className="flex-1 h-1.5 bg-gray-600 rounded-full overflow-hidden relative">
+                                    <div
+                                      className={`h-full rounded-full ${getUsageBarColor(data.utilization)}`}
+                                      style={{ width: `${Math.min(100, data.utilization)}%` }}
+                                    />
+                                    {(() => {
+                                      const pct = getElapsedPct(account.usage?.seven_day_resets_at, 168)
+                                      return pct != null ? <div className="absolute top-0 bottom-0 w-0.5 bg-white/70 pointer-events-none" style={{ left: `${pct}%` }} /> : null
+                                    })()}
+                                  </div>
+                                  <span className={`text-xs w-10 text-right ${getUsageTextColor(data.utilization)}`}>
+                                    {Math.round(data.utilization)}%
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Extra usage credits */}
+                        {account.usage.extra_usage && (
+                          <div>
+                            <p className="text-gray-500 text-xs font-medium mb-1">Extra usage</p>
+                            {!account.usage.extra_usage.is_enabled ? (
+                              <span className="text-gray-500 text-xs">Not enabled</span>
+                            ) : (() => {
+                              const eu = account.usage!.extra_usage!
+                              const pct = eu.utilization != null
+                                ? eu.utilization
+                                : (eu.used_credits != null && eu.monthly_limit)
+                                  ? (eu.used_credits / eu.monthly_limit) * 100
+                                  : null
+                              return pct != null ? (
+                                <div className="space-y-1">
+                                  <div className="flex items-center gap-2">
+                                    <div className="flex-1 h-1.5 bg-gray-600 rounded-full overflow-hidden">
+                                      <div
+                                        className={`h-full rounded-full ${getUsageBarColor(pct)}`}
+                                        style={{ width: `${Math.min(100, pct)}%` }}
+                                      />
+                                    </div>
+                                    <span className={`text-xs ${getUsageTextColor(pct)}`}>
+                                      {Math.round(pct)}%
+                                    </span>
+                                  </div>
+                                  {eu.used_credits != null && eu.monthly_limit != null && (
+                                    <p className="text-gray-400 text-xs">
+                                      ${(eu.used_credits / 100).toFixed(2)} / ${(eu.monthly_limit / 100).toFixed(2)}
+                                    </p>
+                                  )}
+                                </div>
+                              ) : (
+                                <span className="text-gray-500 text-xs">Enabled (no data yet)</span>
+                              )
+                            })()}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
             )}

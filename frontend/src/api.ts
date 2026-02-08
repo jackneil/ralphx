@@ -1259,11 +1259,25 @@ export async function getUsage(projectPath?: string): Promise<UsageData> {
 // Multi-Account Management API
 // ============================================================================
 
+export interface ModelUsage {
+  utilization: number            // percentage 0-100
+  resets_at?: string             // ISO timestamp
+}
+
+export interface ExtraUsage {
+  is_enabled: boolean
+  monthly_limit?: number
+  used_credits?: number
+  utilization?: number           // percentage 0-100
+}
+
 export interface AccountUsage {
   five_hour: number              // percentage 0-100
   seven_day: number              // percentage 0-100
   five_hour_resets_at?: string   // ISO timestamp
   seven_day_resets_at?: string   // ISO timestamp
+  per_model?: Record<string, ModelUsage>
+  extra_usage?: ExtraUsage
 }
 
 export interface Account {
