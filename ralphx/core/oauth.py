@@ -98,7 +98,8 @@ class OAuthFlow:
         """Handle OAuth callback."""
         import logging
         logger = logging.getLogger("ralphx.oauth")
-        logger.info(f"OAuth callback received! Query params: {dict(request.query)}")
+        # Log parameter names only: the query carries the authorization code.
+        logger.info(f"OAuth callback received, query params: {sorted(request.query.keys())}")
 
         code = request.query.get("code")
         state = request.query.get("state")

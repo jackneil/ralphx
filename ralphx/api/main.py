@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -9,9 +10,28 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request, status
+from pydantic import BaseModel
+
+from ralphx.core.workspace import get_workspace_path
+
+
+def _private_log_file() -> Path:
+    """Return the server log path in the workspace, created owner-only (0600).
+
+    The log used to live in /tmp, where every local user can read it.
+    """
+    log_dir = get_workspace_path() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "server.log"
+    fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.close(fd)
+    if os.name == "posix":
+        os.chmod(log_file, 0o600)
+    return log_file
+
 
 # Configure logging to file and console
-LOG_FILE = Path("/tmp/ralphx-server.log")
+LOG_FILE = _private_log_file()
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -22,12 +42,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logger.info(f"RalphX API server starting - logging to {LOG_FILE}")
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ralphx import __version__
 from ralphx.api.routes import auth, config, export_import, files, filesystem, imports, items, logs, loops, planning, projects, resources, runs, stream, templates, workflows
+from ralphx.api.security import SESSION_COOKIE, LocalAccessGuard
+from ralphx.core.api_auth import get_api_token, token_matches
 from ralphx.core.auth import restore_orphaned_backup
 from ralphx.core.workspace import ensure_workspace
 
@@ -128,6 +149,11 @@ async def lifespan(app: FastAPI):
     # Startup
     ensure_workspace()
 
+    # Boot guard: refuse to start without a usable API token. This raises
+    # APITokenError when RALPHX_API_TOKEN is too short or the token file
+    # cannot be created or read.
+    get_api_token()
+
     # Create sample project on first run
     try:
         ensure_sample_project_created()
@@ -177,14 +203,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Access guard: Host check (DNS rebinding), Origin check (cross-site pages)
+# and the API token on every /api route. There is no CORS middleware: the
+# dashboard is served from the same origin, so no cross-origin page may read
+# an API response.
+app.add_middleware(LocalAccessGuard)
 
 
 # Error response model
@@ -256,6 +279,52 @@ async def general_exception_handler(request: Request, exc: Exception):
             code="internal_error",
         ).to_dict(),
     )
+
+
+# Dashboard session (exchanges the API token for an HttpOnly cookie)
+SESSION_MAX_AGE = 30 * 24 * 3600
+
+
+class SessionRequest(BaseModel):
+    """Body of POST /api/session."""
+
+    token: str
+
+
+@app.post("/api/session")
+async def create_session(body: SessionRequest, request: Request):
+    """Log the dashboard in: check the API token and set the session cookie."""
+    if not token_matches(body.token):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content=ErrorResponse("Invalid token", code="unauthorized").to_dict(),
+        )
+    response = JSONResponse({"authenticated": True})
+    response.set_cookie(
+        SESSION_COOKIE,
+        body.token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite="strict",
+        secure=request.url.scheme == "https",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/api/session")
+async def get_session():
+    """Return 200 when the request is authenticated (the guard returns 401 otherwise)."""
+    return {"authenticated": True}
+
+
+@app.delete("/api/session")
+async def delete_session():
+    """Log the dashboard out: clear the session cookie."""
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    return response
 
 
 # Health check endpoint

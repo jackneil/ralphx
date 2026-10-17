@@ -1,4 +1,10 @@
+import { randomBytes } from 'node:crypto'
 import { defineConfig, devices } from '@playwright/test'
+
+// The API requires the local access token. The test server gets this token
+// from RALPHX_API_TOKEN, and every browser and API request sends it.
+const apiToken = process.env.RALPHX_API_TOKEN ?? randomBytes(32).toString('base64url')
+process.env.RALPHX_API_TOKEN = apiToken
 
 export default defineConfig({
   testDir: './e2e',
@@ -11,6 +17,7 @@ export default defineConfig({
 
   use: {
     baseURL: 'http://localhost:8765',
+    extraHTTPHeaders: { Authorization: `Bearer ${apiToken}` },
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },
@@ -23,7 +30,8 @@ export default defineConfig({
   ],
 
   webServer: {
-    command: 'cd .. && python -m uvicorn ralphx.api.main:app --host 0.0.0.0 --port 8765',
+    command: 'cd .. && python -m uvicorn ralphx.api.main:app --host 127.0.0.1 --port 8765',
+    env: { RALPHX_API_TOKEN: apiToken },
     url: 'http://localhost:8765/api/health',
     reuseExistingServer: !process.env.CI,
     timeout: 30000,

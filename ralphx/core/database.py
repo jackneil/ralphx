@@ -240,7 +240,9 @@ class Database:
 
         # Create database with proper permissions if it doesn't exist
         if db_path != ":memory:" and not Path(db_path).exists():
-            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+            # Owner-only directory: SQLite creates the -wal and -shm files
+            # (which hold token data) with the default umask.
+            Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             # Create file with 0600 permissions
             Path(db_path).touch(mode=0o600)
 

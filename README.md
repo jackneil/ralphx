@@ -97,7 +97,17 @@ Or if you have a design doc:
 
 > "Register this project and create a planning workflow from my README"
 
-Open `http://localhost:8765` to monitor progress.
+Open the dashboard login link to monitor progress. `ralphx serve` prints the link (`http://127.0.0.1:8765/?token=...`). To show the link again, run `ralphx dashboard-url`.
+
+### Dashboard access
+
+The dashboard and its API control your Claude accounts and your project files. Thus every API request must have the local access token.
+
+- RalphX creates the token at first start and keeps it in `~/.ralphx/api_token`. Only your user account can read this file.
+- Open the login link one time. The browser then keeps an HttpOnly session cookie for 30 days.
+- To use a different token, set `RALPHX_API_TOKEN` (32 characters or more). The server does not start with a shorter token.
+- The server accepts requests only for `127.0.0.1`, `localhost` and `::1`. Other web sites cannot read the API.
+- Do not expose the server to the network unless you must. `ralphx serve --host 0.0.0.0` stops with an error. To continue, add `--allow-remote --allowed-host <name>`. The traffic is plain HTTP.
 
 ![Dashboard](https://raw.githubusercontent.com/jackneil/ralphx/main/docs/images/dashboard-overview.png)
 
@@ -239,6 +249,7 @@ Connect multiple Claude accounts and assign them per project:
 ralphx add <path>                          # Register a project
 ralphx remove <slug>                       # Unregister a project
 ralphx serve                               # Start dashboard (default port 8765)
+ralphx dashboard-url                       # Print the dashboard login link
 ralphx run <loop> --project <slug>         # Run a loop from the CLI
 ralphx doctor                              # Check system prerequisites
 ralphx diagnose --project <slug>           # Run project-specific diagnostics

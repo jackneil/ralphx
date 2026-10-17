@@ -7,6 +7,33 @@ import pytest
 
 from ralphx.core.project_db import ProjectDatabase
 
+# Fixed API token for tests. The autouse fixture below puts it in
+# RALPHX_API_TOKEN, so the API guard accepts it whatever RALPHX_HOME is.
+TEST_API_TOKEN = "test-api-token-0123456789abcdefghijklmnop"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_workspace(monkeypatch, tmp_path_factory):
+    """Keep every test away from the real ~/.ralphx workspace.
+
+    Tests that need their own workspace still set RALPHX_HOME themselves.
+    """
+    monkeypatch.setenv("RALPHX_HOME", str(tmp_path_factory.mktemp("ralphx-home")))
+    monkeypatch.setenv("RALPHX_API_TOKEN", TEST_API_TOKEN)
+    monkeypatch.delenv("RALPHX_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("RALPHX_ALLOWED_ORIGINS", raising=False)
+
+
+def make_api_client(**kwargs):
+    """Return a TestClient that talks to the API as the local, logged-in user."""
+    from fastapi.testclient import TestClient
+
+    from ralphx.api.main import app
+
+    headers = {"Authorization": f"Bearer {TEST_API_TOKEN}"}
+    headers.update(kwargs.pop("headers", {}))
+    return TestClient(app, base_url="http://127.0.0.1", headers=headers, **kwargs)
+
 
 @pytest.fixture
 def temp_dir():

@@ -589,19 +589,91 @@ def run_loop(
 # =============================================================================
 
 
+_LOOPBACK_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_WILDCARD_BIND_HOSTS = {"0.0.0.0", "::", ""}
+
+
+def _check_bind_host(host: str, allow_remote: bool, allowed_hosts: list[str]) -> list[str]:
+    """Validate the bind address and return the extra allowed Host names.
+
+    A loopback address needs nothing extra. Any other address exposes the API
+    (which can read the stored Claude tokens and project files) to the
+    network, so it needs --allow-remote. A wildcard address also needs at
+    least one --allowed-host, because the server cannot know which name the
+    clients will use.
+
+    Raises:
+        typer.BadParameter: The bind address is not allowed.
+    """
+    host_l = host.strip().lower().strip("[]")
+    extra = [h.strip().lower() for h in allowed_hosts if h.strip()]
+    if host_l in _LOOPBACK_BIND_HOSTS:
+        return extra
+    if not allow_remote:
+        raise typer.BadParameter(
+            f"Refusing to bind to non-loopback address {host!r}. The RalphX API "
+            "controls your Claude accounts and project files. Pass --allow-remote "
+            "to expose it to the network (the API token is still required).",
+            param_hint="--host",
+        )
+    if host_l in _WILDCARD_BIND_HOSTS:
+        if not extra:
+            raise typer.BadParameter(
+                "Binding to all interfaces needs at least one --allowed-host "
+                "(the host name or IP address that clients will use).",
+                param_hint="--allowed-host",
+            )
+        return extra
+    return extra + [host_l]
+
+
 @app.command("serve")
 def serve(
     host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host to bind to"),
     port: int = typer.Option(8765, "--port", "-p", help="Port to bind to"),
     reload: bool = typer.Option(False, "--reload", help="Enable auto-reload for development"),
+    allow_remote: bool = typer.Option(
+        False,
+        "--allow-remote",
+        help="Allow a non-loopback --host. The API token is still required.",
+    ),
+    allowed_host: list[str] = typer.Option(
+        [],
+        "--allowed-host",
+        help="Extra Host header value to accept (repeatable). Needed with --host 0.0.0.0.",
+    ),
 ) -> None:
     """Start the RalphX API server."""
+    import os
+
     import uvicorn
 
+    from ralphx.core.api_auth import APITokenError, dashboard_login_url
+    from ralphx.core.workspace import ensure_workspace
+
+    extra_hosts = _check_bind_host(host, allow_remote, allowed_host)
+    if extra_hosts:
+        existing = os.environ.get("RALPHX_ALLOWED_HOSTS", "")
+        os.environ["RALPHX_ALLOWED_HOSTS"] = ",".join(
+            [h for h in existing.split(",") if h.strip()] + extra_hosts
+        )
+
+    ensure_workspace()
+    try:
+        login_url = dashboard_login_url(host, port)
+    except APITokenError as exc:
+        console.print(f"[red]Cannot start:[/red] {exc}")
+        raise typer.Exit(1)
+
     console.print(f"[bold]Starting RalphX server[/bold]")
-    console.print(f"  URL: http://{host}:{port}")
-    console.print(f"  API docs: http://{host}:{port}/docs")
+    console.print(f"  Dashboard login: {login_url}", soft_wrap=True)
+    console.print(f"  API docs: http://{host}:{port}/docs (log in first)")
     console.print(f"  Health: http://{host}:{port}/api/health")
+    if host.strip().lower().strip("[]") not in _LOOPBACK_BIND_HOSTS:
+        console.print(
+            "[yellow]  Warning: the server is reachable from the network over plain HTTP. "
+            "Anyone who can see the traffic can read the API token.[/yellow]"
+        )
     console.print()
 
     uvicorn.run(
@@ -611,6 +683,23 @@ def serve(
         reload=reload,
         log_level="info",
     )
+
+
+@app.command("dashboard-url")
+def dashboard_url(
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host the server listens on"),
+    port: int = typer.Option(8765, "--port", "-p", help="Port the server listens on"),
+) -> None:
+    """Print the dashboard login link (it contains the local API token)."""
+    from ralphx.core.api_auth import APITokenError, dashboard_login_url
+    from ralphx.core.workspace import ensure_workspace
+
+    ensure_workspace()
+    try:
+        typer.echo(dashboard_login_url(host, port))
+    except APITokenError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
 
 
 # =============================================================================

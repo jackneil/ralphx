@@ -76,6 +76,23 @@ def _signal_handler(signum, frame):
     os.kill(os.getpid(), signum)
 
 
+def _write_private_file(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` with owner-only permissions (0600).
+
+    The mode is set before any byte is written, so the OAuth tokens are never
+    readable by other users, not even for a moment.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fd = -1
+            fh.write(text)
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
 def restore_orphaned_backup():
     """Check for and restore orphaned credential backups on startup.
 
@@ -356,8 +373,7 @@ def swap_credentials_for_account(
                 }
             }
             CLAUDE_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CLAUDE_CREDENTIALS_PATH.write_text(json.dumps(creds_data, indent=2))
-            os.chmod(CLAUDE_CREDENTIALS_PATH, 0o600)  # Restrict to owner-only read/write
+            _write_private_file(CLAUDE_CREDENTIALS_PATH, json.dumps(creds_data, indent=2))
             has_creds = True
 
             # Update last_used_at for the account
@@ -996,8 +1012,7 @@ def swap_credentials_for_loop(
                 }
             }
             CLAUDE_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CLAUDE_CREDENTIALS_PATH.write_text(json.dumps(creds_data, indent=2))
-            os.chmod(CLAUDE_CREDENTIALS_PATH, 0o600)  # Restrict to owner-only read/write
+            _write_private_file(CLAUDE_CREDENTIALS_PATH, json.dumps(creds_data, indent=2))
             has_creds = True
 
         try:

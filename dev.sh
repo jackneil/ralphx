@@ -50,8 +50,16 @@ cleanup() {
 
 trap cleanup SIGINT SIGTERM SIGHUP
 
-uvicorn ralphx.api.main:app --reload --reload-dir=ralphx --port $BACKEND_PORT &
+# The browser talks to the Vite dev server, which proxies /api to the backend.
+# Allow the Vite origin through the backend's Origin check.
+export RALPHX_ALLOWED_ORIGINS="http://localhost:$FRONTEND_PORT,http://127.0.0.1:$FRONTEND_PORT"
+
+uvicorn ralphx.api.main:app --reload --reload-dir=ralphx --host 127.0.0.1 --port $BACKEND_PORT &
 BACKEND_PID=$!
+
+echo ""
+echo "Dashboard login: $(python -m ralphx.cli dashboard-url --host localhost --port $FRONTEND_PORT)"
+echo ""
 
 cd frontend && npm run dev &
 FRONTEND_PID=$!

@@ -11,13 +11,52 @@ class APIError extends Error {
   }
 }
 
+/** Fired on window when the API answers 401 (missing or expired session). */
+export const UNAUTHORIZED_EVENT = 'ralphx:unauthorized'
+
+/**
+ * fetch() for API calls. Same-origin requests send the HttpOnly session
+ * cookie automatically. A 401 tells the AuthGate to show the login screen.
+ */
+export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const response = await fetch(input, init)
+  if (response.status === 401) {
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+  }
+  return response
+}
+
+/** Exchange the local API token for the session cookie. Returns true on success. */
+export async function createSession(token: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+/** Return true when the browser has a valid session cookie. */
+export async function checkSession(): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/session`)
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
 async function request<T>(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<T> {
   const url = `${API_BASE}${endpoint}`
 
-  const response = await fetch(url, {
+  const response = await apiFetch(url, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
@@ -702,7 +741,7 @@ export async function uploadLoopInput(
   const formData = new FormData()
   formData.append('file', file)
 
-  const response = await fetch(
+  const response = await apiFetch(
     `${API_BASE}/projects/${slug}/loops/${loopName}/inputs/upload`,
     {
       method: 'POST',
@@ -1201,29 +1240,6 @@ export async function refreshAuthToken(req: LoginRequest): Promise<{ success: bo
     method: 'POST',
     body: JSON.stringify(req),
   })
-}
-
-export interface CredentialsExport {
-  success: boolean
-  error?: string
-  scope?: string
-  email?: string
-  credentials?: {
-    claudeAiOauth: {
-      accessToken: string
-      refreshToken: string
-      expiresAt: number
-    }
-  }
-}
-
-export async function exportCredentials(
-  scope: 'project' | 'global' = 'global',
-  projectPath?: string
-): Promise<CredentialsExport> {
-  const params = new URLSearchParams({ scope })
-  if (projectPath) params.set('project_path', projectPath)
-  return request<CredentialsExport>(`/auth/credentials/export?${params}`)
 }
 
 export interface AuthValidationResult {
@@ -2714,7 +2730,7 @@ export async function importJsonlToWorkflow(
   })
   if (loopName) params.set('loop_name', loopName)
 
-  const response = await fetch(
+  const response = await apiFetch(
     `${API_BASE}/projects/${slug}/import-jsonl?${params}`,
     {
       method: 'POST',
@@ -2813,7 +2829,7 @@ export async function exportWorkflow(
   workflowId: string,
   options: ExportOptions = {}
 ): Promise<Blob> {
-  const response = await fetch(
+  const response = await apiFetch(
     `${API_BASE}/projects/${slug}/workflows/${workflowId}/export`,
     {
       method: 'POST',
@@ -2885,7 +2901,7 @@ export async function getWorkflowImportPreview(
   const formData = new FormData()
   formData.append('file', file)
 
-  const response = await fetch(
+  const response = await apiFetch(
     `${API_BASE}/projects/${slug}/workflows/import/preview`,
     {
       method: 'POST',
@@ -2930,7 +2946,7 @@ export async function importWorkflow(
   if (options.selected_steps?.length) params.set('selected_steps', options.selected_steps.join(','))
   if (options.selected_resource_ids?.length) params.set('selected_resource_ids', options.selected_resource_ids.join(','))
 
-  const response = await fetch(
+  const response = await apiFetch(
     `${API_BASE}/projects/${slug}/workflows/import?${params}`,
     {
       method: 'POST',

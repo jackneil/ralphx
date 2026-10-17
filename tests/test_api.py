@@ -6,13 +6,15 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import make_api_client
+
 from ralphx.api.main import app
 
 
 @pytest.fixture
 def client():
     """Create a test client."""
-    return TestClient(app)
+    return make_api_client()
 
 
 @pytest.fixture

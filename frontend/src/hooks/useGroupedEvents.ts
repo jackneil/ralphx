@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useSSE, type SSEEvent } from './useSSE'
+import { apiFetch } from '../api'
 
 export interface SessionEvent {
   id: number
@@ -84,7 +85,7 @@ export function useGroupedEvents({
     if (!enabled) return
 
     try {
-      const response = await fetch(
+      const response = await apiFetch(
         `/api/projects/${projectSlug}/loops/${loopName}/events/grouped`
       )
 

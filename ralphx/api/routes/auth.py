@@ -280,7 +280,7 @@ def _build_usage_from_account(account: dict) -> Optional[AccountUsage]:
 
 
 # ============================================================================
-# Legacy Frontend Endpoints (backwards compatibility with AuthPanel.tsx)
+# Legacy Frontend Endpoints (single-account status, login and refresh)
 # These endpoints adapt the new accounts system to the frontend's expectations
 # ============================================================================
 
@@ -373,6 +373,20 @@ async def start_login(request: LoginRequest):
     }
 
 
+def _public_flow_result(result):
+    """Return the flow result without OAuth secrets.
+
+    OAuthFlow.start() returns the raw token response under "tokens". The tokens
+    are already stored in the database, so the API never sends them out.
+    """
+    if not isinstance(result, dict):
+        return result
+    return {k: v for k, v in result.items() if k not in _SECRET_RESULT_KEYS}
+
+
+_SECRET_RESULT_KEYS = frozenset({"tokens", "access_token", "refresh_token", "id_token", "api_key"})
+
+
 @router.get("/flow/{flow_id}")
 async def get_flow_status(flow_id: str):
     """Check status of an OAuth flow."""
@@ -384,7 +398,7 @@ async def get_flow_status(flow_id: str):
         try:
             result = task.result()
             del _active_flows[flow_id]
-            return {"status": "completed", "result": result}
+            return {"status": "completed", "result": _public_flow_result(result)}
         except Exception as e:
             del _active_flows[flow_id]
             return {"status": "error", "error": str(e)}
@@ -964,81 +978,3 @@ async def get_effective_project_account(project_id: str):
         return None
 
     return _build_account_response(account, db)
-
-
-# ============================================================================
-# Credentials Export Endpoint (for CLI usage)
-# ============================================================================
-
-
-class CredentialsExportResponse(BaseModel):
-    """Response for credentials export."""
-
-    success: bool
-    error: Optional[str] = None
-    scope: Optional[str] = None
-    email: Optional[str] = None
-    credentials: Optional[dict] = None
-
-
-@router.get("/credentials/export", response_model=CredentialsExportResponse)
-async def export_credentials(
-    scope: str = Query("global", description="Scope: 'global' or 'project'"),
-    project_path: Optional[str] = Query(None, description="Project path for project scope"),
-):
-    """Export credentials in Claude CLI format for manual use.
-
-    Returns credentials in the format expected by ~/.claude/.credentials.json
-    """
-    import json
-
-    db = Database()
-
-    # Determine project_id if project scope
-    project_id = None
-    if scope == "project" and project_path:
-        # Find project by path
-        projects = db.list_projects()
-        for p in projects:
-            if p.get("path") == project_path:
-                project_id = p.get("id")
-                break
-
-    # Get effective account
-    account = db.get_effective_account(project_id)
-
-    if not account:
-        return CredentialsExportResponse(
-            success=False,
-            error="No account found. Please login first.",
-            scope=scope,
-        )
-
-    # Build credentials in Claude CLI format
-    default_scopes = ["user:inference", "user:profile", "user:sessions:claude_code"]
-    stored_scopes = account.get("scopes")
-    if stored_scopes:
-        try:
-            scopes = json.loads(stored_scopes) if isinstance(stored_scopes, str) else stored_scopes
-        except (json.JSONDecodeError, TypeError):
-            scopes = default_scopes
-    else:
-        scopes = default_scopes
-
-    credentials = {
-        "claudeAiOauth": {
-            "accessToken": account["access_token"],
-            "refreshToken": account.get("refresh_token"),
-            "expiresAt": account.get("expires_at", 0) * 1000,  # Convert to milliseconds
-            "scopes": scopes,
-            "subscriptionType": account.get("subscription_type") or "max",
-            "rateLimitTier": account.get("rate_limit_tier") or "default_claude_max_20x",
-        }
-    }
-
-    return CredentialsExportResponse(
-        success=True,
-        scope=scope,
-        email=account.get("email"),
-        credentials=credentials,
-    )

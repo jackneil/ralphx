@@ -51,8 +51,12 @@ def ensure_workspace() -> Path:
     """
     workspace = get_workspace_path()
 
-    # Create main workspace directory
+    # Create main workspace directory. It holds the API token and the
+    # database with the stored Claude OAuth tokens (plus its WAL files, which
+    # SQLite creates with the default umask), so only the owner may enter it.
     workspace.mkdir(parents=True, exist_ok=True)
+    if os.name == "posix":
+        os.chmod(workspace, 0o700)
 
     # Create subdirectories
     subdirs = [

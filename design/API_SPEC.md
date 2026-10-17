@@ -4,11 +4,25 @@ Base URL: `http://localhost:8765/api`
 
 ## Authentication
 
-For local development, no authentication required. Production deployments can enable API key authentication via the `RALPHX_API_KEY` environment variable.
+Every route under `/api` (and `/docs`, `/openapi.json`) needs the local API token. The exceptions are `GET /api/health`, `POST /api/session` and `DELETE /api/session`.
+
+The token is in `~/.ralphx/api_token` (mode 0600). `RALPHX_API_TOKEN` overrides the file and must have 32 characters or more.
+
+Send the token in one of these forms:
 
 ```
-Authorization: Bearer <api_key>
+Authorization: Bearer <token>
+X-RalphX-Token: <token>
+Cookie: ralphx_token=<token>        (set by POST /api/session)
 ```
+
+`POST /api/session` with `{"token": "<token>"}` sets the HttpOnly, SameSite=Strict session cookie. `GET /api/session` returns 200 when the request is authenticated. `DELETE /api/session` clears the cookie.
+
+The server also refuses:
+
+- a Host header that is not `127.0.0.1`, `localhost`, `::1` or a name in `RALPHX_ALLOWED_HOSTS` (400 `invalid_host`),
+- an `Origin` header that is not the server's own origin or a name in `RALPHX_ALLOWED_ORIGINS` (403 `invalid_origin`),
+- a cross-site request to a protected path (403 `invalid_origin`).
 
 ---
 

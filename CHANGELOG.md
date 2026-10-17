@@ -2,6 +2,19 @@
 
 All notable changes to RalphX are documented here.
 
+## [Unreleased]
+
+### Security
+- The local API now requires an access token on every `/api` route, `/docs` and `/openapi.json` (issue #2). The token is in `~/.ralphx/api_token` (mode 0600) or `RALPHX_API_TOKEN`. The dashboard logs in with the link that `ralphx serve` prints and keeps an HttpOnly, SameSite=Strict cookie.
+- The server refuses requests whose Host header is not a loopback name (DNS rebinding) and cross-origin requests. The wildcard CORS policy is removed.
+- The server does not start with a token shorter than 32 characters.
+- `ralphx serve` refuses a non-loopback `--host` unless `--allow-remote` is given. A wildcard address also needs `--allowed-host`.
+- Removed `GET /api/auth/credentials/export`, which returned the stored Claude access and refresh tokens. `GET /api/auth/flow/{id}` no longer returns the raw OAuth token response.
+- The workspace directory is now mode 0700. The server log moved from `/tmp/ralphx-server.log` to `~/.ralphx/logs/server.log` (mode 0600). Swapped Claude credential files are created with mode 0600 before any data is written. The OAuth callback no longer logs the authorization code.
+
+### Added
+- `ralphx dashboard-url` prints the dashboard login link.
+
 ## [0.4.1] - 2026-02-06
 
 ### Added

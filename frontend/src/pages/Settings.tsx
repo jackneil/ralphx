@@ -246,6 +246,7 @@ export default function Settings() {
                   <li>ralphx list - List projects</li>
                   <li>ralphx run &lt;slug&gt; &lt;loop&gt; - Run a loop</li>
                   <li>ralphx serve - Start the web server</li>
+                  <li>ralphx dashboard-url - Print the dashboard login link</li>
                   <li>ralphx mcp - Start MCP server for Claude Code</li>
                 </ul>
               </div>
